@@ -1,0 +1,16 @@
+.env
+.pytest_cache/
+.ruff_cache/
+.coverage
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+data/
+backups/
+logs/
+.audit-doctor-repro.db
+.venv/
+dist/
+build/
+*.egg-info/

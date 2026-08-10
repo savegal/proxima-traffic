@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proxima-traffic"
+version = "0.1.0"
+description = "Consent-based Telegram campaign coordinator foundation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.21,<1",
+    "aiogram>=3.22,<4",
+    "alembic>=1.13,<2",
+    "cryptography>=44,<47",
+    "fastapi>=0.104,<1",
+    "httpx[socks]>=0.28,<1",
+    # Maintained tdata bridge with Python 3.12 wheels for its AES-IGE backend.
+    "opentele2==1.2.1",
+    "pydantic-settings>=2.1,<3",
+    "python-socks[asyncio]>=2.4,<3",
+    "sqlalchemy[asyncio]>=2.0.23,<3",
+    "telethon==1.44.0",
+    "TgCrypto-pyrofork==1.2.8",
+    "uvicorn[standard]>=0.24,<1",
+]
+
+[project.scripts]
+proxima-bot = "proxima_traffic.bot_main:run"
+proxima-backup = "proxima_traffic.maintenance:backup_command"
+proxima-doctor = "proxima_traffic.maintenance:doctor_command"
+proxima-media-gc = "proxima_traffic.maintenance:media_gc_command"
+proxima-clean-db = "proxima_traffic.maintenance:clean_database_command"
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=9,<10",
+    "pytest-asyncio>=1,<2",
+    "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/proxima_traffic"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "telegram_test_dc: opt-in integration tests against Telegram Test DC only",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

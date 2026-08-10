@@ -41,6 +41,7 @@ from proxima_traffic.bot.keyboards import (
     account_avatar_menu,
     account_details_menu,
     account_generated_names_confirmation,
+    account_import_sources_menu,
     account_name_catalog_menu,
     account_name_confirmation,
     account_session_clear_confirmation,
@@ -94,6 +95,7 @@ from proxima_traffic.bot.keyboards import (
     target_cooldown_picker,
     target_delete_confirmation,
     target_details_menu,
+    target_folder_account_picker,
     target_list_delete_confirmation,
     target_list_details_menu,
     target_list_target_details_menu,
@@ -1513,17 +1515,48 @@ def test_account_name_catalog_ui_has_preview_bulk_action_and_real_change_warning
     assert "teen-profile</b> → Лера М." in preview
     assert "реальное изменение публичных профилей" in preview
     assert "account:names:menu" in list_callbacks
+    source_menu = account_import_sources_menu(page=3)
+    source_callbacks = {
+        button.callback_data
+        for row in source_menu.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert "account:import:menu:0" in list_callbacks
     assert {
-        "account:import:archive",
-        "account:import:tdata",
-        "account:import:telethon",
-        "account:import:pyrogram",
-        "account:import:json",
-    } <= list_callbacks
+        "account:import:archive:3",
+        "account:import:tdata:3",
+        "account:import:session:3",
+        "account:import:json:3",
+        "account:import:string:3",
+        "menu:accounts:3",
+    } <= source_callbacks
+    assert all(len(value.encode("utf-8")) <= 64 for value in source_callbacks)
     assert "account:names:preview:mixed:7:0" in style_callbacks
     assert confirmation.inline_keyboard[0][0].callback_data == "account:names:apply"
     assert "broken &lt;account&gt;" in result
     assert "session &lt;expired&gt;" in result
+
+
+def test_target_folder_account_picker_is_paginated_for_large_account_pools() -> None:
+    accounts = [
+        Account(id=index, label=f"Folder account {index}", status=AccountStatus.ACTIVE)
+        for index in range(1, 26)
+    ]
+
+    menu = target_folder_account_picker(accounts, page=3, page_size=7)
+    callbacks = {
+        button.callback_data
+        for row in menu.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+    assert "target:folder:account:25" in callbacks
+    assert "target:folder:account:1" not in callbacks
+    assert "target:folder:accounts:page:2" in callbacks
+    assert "target:folder:accounts:page:3" in callbacks
+    assert all(len(value.encode("utf-8")) <= 64 for value in callbacks)
 
 
 def test_reworked_bot_ui_is_operator_friendly_and_escapes_values() -> None:

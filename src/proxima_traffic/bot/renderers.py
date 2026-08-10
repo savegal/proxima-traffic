@@ -698,6 +698,17 @@ def account_details_text(
             f"🔁 Общий IP: <b>{shared_proxy_accounts}</b> аккаунта(ов). "
             "Ротация переподключит их все."
         )
+    if _account_source(account) == "none":
+        next_step = "📥 Следующий шаг: импортируйте сессию аккаунта из списка аккаунтов."
+    elif not getattr(account, "authorized", False):
+        next_step = "🔍 Следующий шаг: проверьте сессию. При ошибке соединения назначьте прокси."
+    elif get_settings().account_require_proxy and not proxy_slot:
+        next_step = "🌐 Следующий шаг: назначьте рабочий прокси для этого аккаунта."
+    elif account.status.value != "active":
+        next_step = "▶️ Следующий шаг: включите аккаунт, чтобы использовать его в рассылках."
+    else:
+        next_step = "✅ Аккаунт готов: его можно выбрать при создании рассылки."
+    lines.append(f"\n<b>Следующий шаг</b>\n{next_step}")
     resolved_daily_limit = (
         get_settings().account_daily_limit if daily_limit is None else max(0, daily_limit)
     )

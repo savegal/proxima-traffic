@@ -97,6 +97,7 @@ from proxima_traffic.bot.keyboards import (
     account_details_menu,
     account_generated_names_confirmation,
     account_import_result_menu,
+    account_import_sources_menu,
     account_name_catalog_menu,
     account_name_confirmation,
     account_picker,
@@ -4943,7 +4944,27 @@ async def begin_account_import(
     state: FSMContext,
     settings: Settings,
 ) -> None:
-    kind = (callback.data or "").rsplit(":", 1)[1]
+    parts = (callback.data or "").split(":")
+    if len(parts) not in {3, 4} or parts[:2] != ["account", "import"]:
+        await callback.answer("Неизвестный тип импорта", show_alert=True)
+        return
+    kind = parts[2]
+    try:
+        source_page = max(0, int(parts[3])) if len(parts) == 4 else 0
+    except ValueError:
+        await callback.answer("Не удалось открыть импорт", show_alert=True)
+        return
+    if kind == "menu":
+        await callback.answer()
+        await _edit_callback(
+            callback,
+            "<b>📥 Импорт аккаунта</b>\n\n"
+            "Выберите, что у вас есть. Бот сам распознает формат файла .session; "
+            "исходные сессии и строки после обработки удаляются из чата.",
+            account_import_sources_menu(source_page),
+            answer=False,
+        )
+        return
     if kind not in {"archive", "tdata", "session", "telethon", "pyrogram", "json", "string"}:
         await callback.answer("Неизвестный тип импорта", show_alert=True)
         return
@@ -4956,7 +4977,7 @@ async def begin_account_import(
         return
     await callback.answer()
     await _remember_origin(callback, state)
-    await state.update_data(import_kind=kind)
+    await state.update_data(import_kind=kind, account_import_page=source_page)
     await state.set_state(AccountImportState.payload)
     prompts = {
         "archive": (
@@ -5123,7 +5144,7 @@ async def account_import_payload(
             bot,
             data,
             _account_archive_result_text(archive_result),
-            account_import_result_menu(),
+            account_import_result_menu(int(data.get("account_import_page", 0))),
         )
         return
     if account is None:
@@ -5170,7 +5191,7 @@ async def account_import_payload(
         ),
         account_details_menu(
             account,
-            0,
+            int(data.get("account_import_page", 0)),
             has_proxy=proxy_slot is not None,
             shared_proxy_accounts=shared_proxy_accounts,
         ),
@@ -5569,15 +5590,8 @@ async def import_target_document(
         await _edit_origin(
             bot,
             state,
-            wizard_text(
-                "📚 Импорт папки Telegram",
-                3,
-                3,
-                f"Найдено ссылок на папки: <b>{len(parsed.folders)}</b>.\n\n"
-                "Выберите аккаунт, через который прочитать состав. На этом шаге бот "
-                "никуда не вступает; аккаунт нужен только для MTProto-предпросмотра.",
-            ),
-            target_folder_account_picker(accounts),
+            _target_folder_account_picker_text(len(parsed.folders), len(accounts), page=0),
+            target_folder_account_picker(accounts, page=0, page_size=PAGE_SIZE),
         )
         return
     try:
@@ -5591,6 +5605,46 @@ async def import_target_document(
         )
     except ConflictError as exc:
         await message.answer(str(exc))
+
+
+def _target_folder_account_picker_text(folder_count: int, account_count: int, *, page: int) -> str:
+    pages = max(1, (account_count + PAGE_SIZE - 1) // PAGE_SIZE)
+    active_page = min(max(0, page), pages - 1)
+    return wizard_text(
+        "📚 Импорт папки Telegram",
+        3,
+        3,
+        f"Найдено ссылок на папки: <b>{folder_count}</b>.\n"
+        f"Доступно проверенных аккаунтов: <b>{account_count}</b> · "
+        f"страница <b>{active_page + 1}/{pages}</b>.\n\n"
+        "Выберите аккаунт, через который прочитать состав. На этом шаге бот "
+        "никуда не вступает; аккаунт нужен только для MTProto-предпросмотра.",
+    )
+
+
+@router.callback_query(
+    TargetImportState.folder_account,
+    F.data.regexp(r"^target:folder:accounts:page:\d+$"),
+)
+async def page_target_folder_accounts(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    requested_page = int((callback.data or "").rsplit(":", 1)[1])
+    accounts = await repository.active_owned_accounts(require_authorized_session=True)
+    if not accounts:
+        await callback.answer("Нет доступных аккаунтов. Импорт отменён.", show_alert=True)
+        return
+    page = min(max(0, requested_page), max(0, (len(accounts) - 1) // PAGE_SIZE))
+    data = await state.get_data()
+    folder_count = len([value for value in data.get("target_folder_slugs", []) if value])
+    await _edit_callback(
+        callback,
+        _target_folder_account_picker_text(folder_count, len(accounts), page=page),
+        target_folder_account_picker(accounts, page=page, page_size=PAGE_SIZE),
+        answer=False,
+    )
 
 
 @router.callback_query(

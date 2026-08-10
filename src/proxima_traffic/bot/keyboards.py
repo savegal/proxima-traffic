@@ -1078,23 +1078,9 @@ def accounts_menu(page: Page[Account]) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text="📥 Импорт TData (.zip)",
-            callback_data="account:import:tdata",
+            text="📥 Импортировать аккаунт",
+            callback_data=f"account:import:menu:{page.page}",
         )
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text="📦 Архив аккаунтов (.zip)",
-            callback_data="account:import:archive",
-        )
-    )
-    builder.row(
-        InlineKeyboardButton(text="🗂 .session Telethon", callback_data="account:import:telethon"),
-        InlineKeyboardButton(text="🗂 .session Pyrogram", callback_data="account:import:pyrogram"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="📄 Импорт .json", callback_data="account:import:json"),
-        InlineKeyboardButton(text="🔑 Строка сессии", callback_data="account:import:string"),
     )
     builder.row(InlineKeyboardButton(text="➕ Аккаунт без сессии", callback_data="account:add"))
     _pagination(builder, "accounts", page.page, page.pages)
@@ -1105,16 +1091,66 @@ def accounts_menu(page: Page[Account]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def account_import_result_menu() -> InlineKeyboardMarkup:
+def account_import_sources_menu(page: int = 0) -> InlineKeyboardMarkup:
+    """Present one unambiguous import choice before asking for sensitive data."""
+
+    source_page = max(0, int(page))
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📥 TData из Telegram Desktop (.zip)",
+                    callback_data=f"account:import:tdata:{source_page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗂 Файл .session (Telethon / Pyrogram)",
+                    callback_data=f"account:import:session:{source_page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 ZIP с несколькими аккаунтами",
+                    callback_data=f"account:import:archive:{source_page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📄 JSON сессии",
+                    callback_data=f"account:import:json:{source_page}",
+                ),
+                InlineKeyboardButton(
+                    text="🔑 Строка сессии",
+                    callback_data=f"account:import:string:{source_page}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К аккаунтам",
+                    callback_data=f"menu:accounts:{source_page}",
+                )
+            ],
+        ]
+    )
+
+
+def account_import_result_menu(page: int = 0) -> InlineKeyboardMarkup:
+    source_page = max(0, int(page))
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="📦 Импортировать ещё архив",
-                    callback_data="account:import:archive",
+                    callback_data=f"account:import:archive:{source_page}",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="menu:accounts:0")],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К аккаунтам",
+                    callback_data=f"menu:accounts:{source_page}",
+                )
+            ],
         ]
     )
 
@@ -2832,14 +2868,52 @@ def account_picker(
     return builder.as_markup()
 
 
-def target_folder_account_picker(accounts: list[Account]) -> InlineKeyboardMarkup:
+def target_folder_account_picker(
+    accounts: list[Account],
+    *,
+    page: int = 0,
+    page_size: int = 7,
+) -> InlineKeyboardMarkup:
+    """Choose the account used to preview a shared Telegram folder.
+
+    Archive imports can create large account pools, so the picker must stay below
+    Telegram's practical inline-keyboard limits and remain usable on mobile.
+    """
+
     builder = InlineKeyboardBuilder()
-    for account in accounts:
+    safe_page_size = max(1, int(page_size))
+    pages = max(1, (len(accounts) + safe_page_size - 1) // safe_page_size)
+    active_page = min(max(0, int(page)), pages - 1)
+    start = active_page * safe_page_size
+    for account in accounts[start : start + safe_page_size]:
         builder.button(
             text=f"{_account_icon(account)} {account.label}",
             callback_data=f"target:folder:account:{account.id}",
         )
     builder.adjust(1)
+    if pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if active_page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"target:folder:accounts:page:{active_page - 1}",
+                )
+            )
+        navigation.append(
+            InlineKeyboardButton(
+                text=f"{active_page + 1}/{pages}",
+                callback_data=f"target:folder:accounts:page:{active_page}",
+            )
+        )
+        if active_page + 1 < pages:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"target:folder:accounts:page:{active_page + 1}",
+                )
+            )
+        builder.row(*navigation)
     builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel"))
     return builder.as_markup()
 

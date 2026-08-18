@@ -276,6 +276,15 @@ class ChannelCommentGateway(Protocol):
         after_date: datetime | None = None,
     ) -> ChannelPostScan: ...
 
+    async def recover_channel_comment_membership_gate(
+        self,
+        *,
+        account: Account,
+        channel_ref: str,
+        channel_post_id: int,
+        deleted_message_id: int,
+    ) -> MembershipGateRecovery: ...
+
     async def send_channel_comment(
         self,
         *,
@@ -453,7 +462,11 @@ class DryRunGateway:
             raise PermanentGatewayError("dry-run context is missing persisted identifiers")
         media_without_caption = media_path is not None
         if media_path is not None and media_kind not in {
-            "photo", "video", "document", "voice", "video_note"
+            "photo",
+            "video",
+            "document",
+            "voice",
+            "video_note",
         }:
             raise PermanentGatewayError("unsupported media kind", code="comment_invalid")
         if media_kind == "video_note" and text:
@@ -609,7 +622,11 @@ class DryRunGateway:
             media_path = str(media_items[0].get("path") or "")
             media_kind = str(media_items[0].get("kind") or "")
         if media_path is not None and media_kind not in {
-            "photo", "video", "document", "voice", "video_note"
+            "photo",
+            "video",
+            "document",
+            "voice",
+            "video_note",
         }:
             raise PermanentGatewayError("unsupported media kind")
         try:
@@ -657,7 +674,11 @@ class DryRunGateway:
                 code="recipient_unresolvable",
             )
         if media_path is not None and media_kind not in {
-            "photo", "video", "document", "voice", "video_note"
+            "photo",
+            "video",
+            "document",
+            "voice",
+            "video_note",
         }:
             raise PermanentGatewayError("unsupported media kind", code="content_invalid")
         try:

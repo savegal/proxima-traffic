@@ -15,6 +15,7 @@ from proxima_traffic.gateways import (
     ChannelCommentPreflight,
     ChannelPost,
     ChannelPostScan,
+    MembershipGateRecovery,
     PermanentGatewayError,
     TemporaryGatewayError,
 )
@@ -46,6 +47,8 @@ class RecordingChannelGateway:
         self.preflight_calls: list[tuple[int, str]] = []
         self.reaction_calls: list[dict[str, object]] = []
         self.reaction_errors: dict[int, BaseException] = {}
+        self.membership_gate_recovery: MembershipGateRecovery | None = None
+        self.membership_gate_calls: list[dict[str, object]] = []
         self._message_id = 40_000
         self.participants = (50_001, 50_002, 50_003, 50_004, 50_005, 50_006, 50_007)
 
@@ -119,6 +122,16 @@ class RecordingChannelGateway:
         if error is not None:
             raise error
 
+    async def recover_channel_comment_membership_gate(
+        self,
+        **kwargs: object,
+    ) -> MembershipGateRecovery:
+        self.membership_gate_calls.append(kwargs)
+        return self.membership_gate_recovery or MembershipGateRecovery(
+            detected=False,
+            recovered=False,
+        )
+
 
 class BlockingChannelGateway(RecordingChannelGateway):
     def __init__(self) -> None:
@@ -140,6 +153,43 @@ class HangingScanChannelGateway(RecordingChannelGateway):
         del kwargs
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
+
+
+class FailingBatchPreflightGateway(RecordingChannelGateway):
+    async def preflight_channel_comments(
+        self,
+        *,
+        account: Account,
+        channel_ref: str,
+    ) -> ChannelCommentPreflight:
+        if channel_ref == "@batch_comments_fail":
+            raise PermanentGatewayError("comments unavailable", code="comments_unavailable")
+        return await super().preflight_channel_comments(account=account, channel_ref=channel_ref)
+
+
+class SelectivelyBlockedChannelGateway(RecordingChannelGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocked_account_ids: set[int] = set()
+        self.block_scans = False
+
+    async def scan_channel_posts(self, **kwargs: object) -> ChannelPostScan:
+        account = kwargs["account"]
+        if self.block_scans and int(account.id) in self.blocked_account_ids:
+            raise PermanentGatewayError(
+                "account was banned in discussion",
+                code="account_banned_in_chat",
+            )
+        return await super().scan_channel_posts(**kwargs)
+
+    async def send_channel_comment(self, **kwargs: object) -> ChannelCommentDelivery:
+        account = kwargs["account"]
+        if int(account.id) in self.blocked_account_ids:
+            raise PermanentGatewayError(
+                "account was banned in discussion",
+                code="account_banned_in_chat",
+            )
+        return await super().send_channel_comment(**kwargs)
 
 
 async def _account(app: FastAPI, label: str) -> Account:
@@ -167,12 +217,59 @@ def _service(app: FastAPI, gateway: RecordingChannelGateway) -> ChannelCommentSe
 
 
 @pytest.mark.asyncio
+async def test_batch_rule_creation_reuses_one_flow_for_each_channel(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "batch-comment-account")
+
+    rules = await service.create_rules(
+        name="Вакансии",
+        channel_refs=("@batch_comments_one", "https://t.me/batch_comments_two"),
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Новый комментарий",
+        initial_delay_seconds=30,
+    )
+
+    assert [rule.channel_ref for rule in rules] == [
+        "@batch_comments_one",
+        "@batch_comments_two",
+    ]
+    assert [rule.name for rule in rules] == ["Вакансии · 1", "Вакансии · 2"]
+    assert {rule.primary_text for rule in rules} == {"Новый комментарий"}
+    assert gateway.preflight_calls == [
+        (int(account.id), "@batch_comments_one"),
+        (int(account.id), "@batch_comments_two"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_rule_creation_does_not_write_when_one_channel_fails_preflight(
+    app: FastAPI,
+) -> None:
+    gateway = FailingBatchPreflightGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "batch-comment-failure-account")
+
+    with pytest.raises(ConflictError, match="не прошёл проверку комментариев"):
+        await service.create_rules(
+            name="Пакет с ошибкой",
+            channel_refs=("@batch_comments_ok", "@batch_comments_fail"),
+            mode=ChannelCommentMode.SINGLE,
+            primary_account_id=int(account.id),
+            primary_text="Новый комментарий",
+            initial_delay_seconds=0,
+        )
+
+    async with app.state.database.session_factory() as session:
+        assert await session.scalar(select(func.count(ChannelCommentRule.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_comment_reactions_accept_the_last_step_of_a_long_dialogue(app: FastAPI) -> None:
     gateway = RecordingChannelGateway()
     service = _service(app, gateway)
-    accounts = [
-        await _account(app, f"long-comment-reaction-{index}") for index in range(3)
-    ]
+    accounts = [await _account(app, f"long-comment-reaction-{index}") for index in range(3)]
     steps = [
         DialogueStep(
             account_id=accounts[index % 3].id,
@@ -475,7 +572,8 @@ async def test_channel_comment_hidden_mentions_are_sent_once_on_the_first_commen
     app: FastAPI,
 ) -> None:
     gateway = RecordingChannelGateway()
-    blocked_user_id = 7_588_293_197
+    # Keep the test-specific fixture outside the audited production seed list.
+    blocked_user_id = 8_000_000_000_000_000_001
     gateway.participants = (blocked_user_id, 50_001, 50_002, 50_003, 50_004, 50_005, 50_006)
     service = _service(app, gateway)
     account = await _account(app, "mention-comment-sender")
@@ -538,7 +636,7 @@ async def test_saved_comment_mentions_are_reconciled_with_owned_accounts(
         initial_delay_seconds=0,
     )
     await service.set_rule_hidden_mentions_enabled(rule.id, True)
-    blocked_user_id = 5_993_714_739
+    blocked_user_id = 8_000_000_000_000_000_002
     async with app.state.database.session_factory() as session:
         session.add(
             MentionBlacklistEntry(
@@ -776,7 +874,9 @@ async def test_message_edit_does_not_switch_author_during_initial_send(app: Fast
     await service.scan_rule(rule.id)
 
     processing = asyncio.create_task(service.process_next())
-    await asyncio.wait_for(gateway.started.wait(), timeout=1)
+    # SQLite setup and account-operation fencing can briefly contend on a busy
+    # CI host; this is a delivery-race test, not a one-second benchmark.
+    await asyncio.wait_for(gateway.started.wait(), timeout=3)
     with pytest.raises(ConflictError, match="ожидается редактирование"):
         await service.replace_primary_account(rule.id, second.id)
     gateway.release.set()
@@ -849,6 +949,75 @@ async def test_account_session_failure_disables_comment_sender(app: FastAPI) -> 
     assert run is not None and run.status == ChannelCommentRunStatus.FAILED
     assert run.attempt_count == 1
     assert stored_account is not None and stored_account.status.value == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_auto_replacement_requeues_comment_with_verified_fallback_account(
+    app: FastAPI,
+) -> None:
+    gateway = SelectivelyBlockedChannelGateway()
+    service = _service(app, gateway)
+    first = await _account(app, "auto-replace-primary")
+    fallback = await _account(app, "auto-replace-fallback")
+    rule = await service.create_rule(
+        name="Автозамена отправителя",
+        channel_ref="@auto_replace_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=first.id,
+        primary_text="Комментарий",
+        initial_delay_seconds=0,
+    )
+    updated = await service.set_auto_replace_primary_account(rule.id, True)
+    assert updated.auto_replace_primary_account is True
+    gateway.posts = (ChannelPost(message_id=311, published_at=utc_now()),)
+    await service.scan_rule(rule.id)
+    gateway.blocked_account_ids.add(int(first.id))
+
+    assert await service.process_next() is True
+    view = await service.get_rule_view(rule.id)
+    run = (await service.recent_runs(rule.id))[0]
+
+    assert view.rule.enabled is True
+    assert view.rule.primary_account_id == fallback.id
+    assert run.status == ChannelCommentRunStatus.QUEUED
+    assert run.error_code == "primary_account_auto_replaced"
+    assert (int(fallback.id), "@auto_replace_channel") in gateway.preflight_calls
+
+    assert await service.process_next() is True
+    assert int(gateway.calls[-1]["account"].id) == fallback.id
+    assert (await service.recent_runs(rule.id))[0].status == ChannelCommentRunStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_auto_replacement_resumes_channel_scan_with_fallback_account(
+    app: FastAPI,
+) -> None:
+    gateway = SelectivelyBlockedChannelGateway()
+    service = _service(app, gateway)
+    first = await _account(app, "scan-replace-primary")
+    fallback = await _account(app, "scan-replace-fallback")
+    rule = await service.create_rule(
+        name="Автозамена при проверке",
+        channel_ref="@scan_replace_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=first.id,
+        primary_text="Комментарий",
+        initial_delay_seconds=0,
+    )
+    await service.set_auto_replace_primary_account(rule.id, True)
+    gateway.posts = (ChannelPost(message_id=312, published_at=utc_now()),)
+    gateway.blocked_account_ids.add(int(first.id))
+    gateway.block_scans = True
+
+    await service.scan_rule(rule.id)
+
+    view = await service.get_rule_view(rule.id)
+    runs = await service.recent_runs(rule.id)
+    assert view.rule.enabled is True
+    assert view.rule.primary_account_id == fallback.id
+    assert view.rule.last_seen_post_id == 312
+    assert [run.status for run in runs] == [ChannelCommentRunStatus.QUEUED]
+    assert (int(fallback.id), "@scan_replace_channel") in gateway.preflight_calls
 
 
 @pytest.mark.asyncio
@@ -942,6 +1111,62 @@ async def test_deleted_comment_is_skipped_and_counts_account_workload(
         record for record in caplog.records if "post_deleted_by_moderation" in record.getMessage()
     )
     assert warning.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_deleted_comment_recovers_membership_gate_and_retries_once(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    gateway.delivery_error = PermanentGatewayError(
+        "comment removed by subscription bot",
+        code="post_deleted_by_moderation",
+        external_message_id=41_001,
+    )
+    gateway.membership_gate_recovery = MembershipGateRecovery(
+        detected=True,
+        recovered=True,
+        notice="Подпишитесь на канал",
+        joined_channel_refs=("@required_news",),
+        verification_callback_count=1,
+    )
+    service = _service(app, gateway)
+    account = await _account(app, "gate-commenter")
+    rule = await service.create_rule(
+        name="Подписка перед комментарием",
+        channel_ref="@membership_comment_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=account.id,
+        primary_text="Комментарий",
+        initial_delay_seconds=0,
+    )
+    gateway.posts = (ChannelPost(message_id=33, published_at=utc_now()),)
+    await service.scan_rule(rule.id)
+
+    assert await service.process_next() is True
+    async with app.state.database.session_factory() as session:
+        run = await session.scalar(select(ChannelCommentRun))
+        assert run is not None
+        assert run.status == ChannelCommentRunStatus.QUEUED
+        assert run.membership_gate_retry_count == 1
+        assert run.error_code == "membership_gate_retry"
+        run.scheduled_for = utc_now()
+        await session.commit()
+
+    assert len(gateway.membership_gate_calls) == 1
+    recovery_call = gateway.membership_gate_calls[0]
+    assert int(recovery_call["account"].id) == int(account.id)
+    assert recovery_call["channel_ref"] == "@membership_comment_channel"
+    assert recovery_call["channel_post_id"] == 33
+    assert recovery_call["deleted_message_id"] == 41_001
+    gateway.delivery_error = None
+    assert await service.process_next() is True
+    assert gateway.calls[0]["idempotency_key"] == (
+        f"channel-comment:{run.id}:step:0:membership-gate-retry:1"
+    )
+    async with app.state.database.session_factory() as session:
+        run = await session.scalar(select(ChannelCommentRun))
+        stored_account = await session.get(Account, account.id)
+    assert run is not None and run.status == ChannelCommentRunStatus.SUCCEEDED
+    assert stored_account is not None and stored_account.sent_today == 2
 
 
 @pytest.mark.asyncio

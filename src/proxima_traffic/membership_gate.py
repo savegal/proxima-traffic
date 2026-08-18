@@ -7,6 +7,7 @@ makes it explicit which buttons may cause an account to join a channel.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -35,9 +36,19 @@ _SUBSCRIPTION_MARKERS = (
     "підпис",
     "подпиш",
     "підпиш",
+    "вступ",
+    "присоедин",
+    "приєдна",
+    "участник",
+    "учасник",
     "subscribe",
     "join the channel",
     "join channel",
+    "membership",
+    "become a member",
+    "follow the channel",
+    "follow channel",
+    "join the group",
 )
 _CAPTCHA_OR_MANUAL_MARKERS = (
     "капч",
@@ -53,12 +64,14 @@ _CAPTCHA_OR_MANUAL_MARKERS = (
 )
 _VERIFY_BUTTON_MARKERS = (
     "провер",
+    "подтверд",
     "підтверд",
     "готово",
     "verify",
     "check",
     "done",
 )
+_INVITE_SLUG = re.compile(r"[A-Za-z0-9_-]{5,128}")
 
 
 def parse_membership_gate(text: str, buttons: tuple[InlineButton, ...]) -> MembershipGate | None:
@@ -114,10 +127,15 @@ def telegram_channel_ref(url: str) -> str | None:
     host = parsed.netloc.casefold().removeprefix("www.")
     path = unquote(parsed.path).strip("/")
     if parsed.scheme.casefold() in {"http", "https"} and host in {"t.me", "telegram.me"}:
-        if path.startswith("+") and len(path) > 1:
-            return f"https://t.me/{path}"
-        if path.startswith("joinchat/") and len(path.removeprefix("joinchat/")) > 0:
-            return f"https://t.me/{path}"
+        parts = path.split("/") if path else []
+        if len(parts) == 1 and parts[0].startswith("+") and _INVITE_SLUG.fullmatch(parts[0][1:]):
+            return f"https://t.me/{parts[0]}"
+        if (
+            len(parts) == 2
+            and parts[0].casefold() == "joinchat"
+            and _INVITE_SLUG.fullmatch(parts[1])
+        ):
+            return f"https://t.me/joinchat/{parts[1]}"
         if (
             not path
             or "/" in path

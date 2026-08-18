@@ -12,10 +12,18 @@ from proxima_traffic.models import Base
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Alembic runs in-process during normal startup.  Its default
+    # ``disable_existing_loggers=True`` silently turns off every already
+    # imported application logger after the first schema upgrade.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+configured_database_url = config.attributes.get("database_url")
+database_url = (
+    str(configured_database_url)
+    if configured_database_url is not None
+    else get_settings().database_url
+)
+config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 
 
@@ -51,4 +59,11 @@ async def run_async_migrations() -> None:
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    asyncio.run(run_async_migrations())
+    # Database.create_schema injects its already-open synchronous connection
+    # through Alembic.  This keeps migrations inside the calling async
+    # transaction instead of attempting a forbidden nested ``asyncio.run``.
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        do_run_migrations(supplied_connection)
+    else:
+        asyncio.run(run_async_migrations())

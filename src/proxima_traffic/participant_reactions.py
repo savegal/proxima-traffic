@@ -17,6 +17,7 @@ from datetime import timedelta
 from uuid import uuid4
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -60,6 +61,14 @@ from proxima_traffic.worker_supervision import WorkerIterationReporter
 
 logger = logging.getLogger(__name__)
 _ALLOWED_EMOJI = ORDINARY_REACTION_EMOJI
+
+
+class _ParticipantReactionDeliveryCancelled(RuntimeError):
+    """Stop before Telegram when a rule changed after the task was claimed."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,16 +433,23 @@ class ParticipantReactionService:
         target: Target,
     ) -> bool:
         async with self._session_factory() as session:
+            # Several workers can discover the same newly added chat.  The
+            # cursor is a singleton per rule × target, so create it atomically
+            # and then use the canonical row rather than allowing an
+            # IntegrityError to abort the whole scan iteration.
+            await session.execute(
+                sqlite_insert(ParticipantReactionTargetState)
+                .values(rule_id=rule_id, target_id=target.id)
+                .on_conflict_do_nothing()
+            )
             state = await session.scalar(
                 select(ParticipantReactionTargetState).where(
                     ParticipantReactionTargetState.rule_id == rule_id,
                     ParticipantReactionTargetState.target_id == target.id,
                 )
             )
-            if state is None:
-                state = ParticipantReactionTargetState(rule_id=rule_id, target_id=target.id)
-                session.add(state)
-                await session.flush()
+            if state is None:  # pragma: no cover - defensive against a deleted target race
+                return False
             checkpoint = state.last_seen_message_id
             bootstrap = not state.primed
             # The scanner runs outside this transaction; persist a newly allocated
@@ -470,14 +486,13 @@ class ParticipantReactionService:
                 last_error or RuntimeError("participant scan failed"),
             )
             return False
-        await self._persist_scan(rule_id, target.id, accounts, own_sender_ids, scan.messages)
+        await self._persist_scan(rule_id, target.id, own_sender_ids, scan.messages)
         return True
 
     async def _persist_scan(
         self,
         rule_id: int,
         target_id: int,
-        accounts: list[Account],
         own_sender_ids: set[int],
         messages,
     ) -> None:
@@ -490,7 +505,17 @@ class ParticipantReactionService:
                     ParticipantReactionTargetState.target_id == target_id,
                 )
             )
-            if rule is None or state is None or not rule.enabled:
+            if rule is None or state is None or not rule.enabled or not rule.approved_by_operator:
+                return
+            if not await self._target_is_currently_selected(session, rule, target_id):
+                return
+            # A scan can finish after the operator changes the account selection.
+            # Always use the current rule instead of the scanner's older snapshot.
+            accounts = await self._accounts_for_rule(session, rule)
+            if not accounts:
+                rule.last_error = "no eligible reactor account"
+                rule.last_error_code = "reactor_unavailable"
+                await session.commit()
                 return
             newest_id = max(
                 (item.message_id for item in messages), default=state.last_seen_message_id
@@ -682,17 +707,23 @@ class ParticipantReactionService:
             rule = await session.get(ParticipantReactionRule, task.rule_id)
             account = await session.get(Account, task.reactor_account_id)
             target = await session.get(Target, task.target_id)
-            if task.cancel_requested:
-                terminal = (
-                    ParticipantReactionTaskStatus.CANCELLED,
-                    "cancel requested before reaction",
-                    "cancelled_before_send",
-                )
-            elif rule is None or account is None or target is None:
+            if rule is None or account is None or target is None:
                 terminal = (
                     ParticipantReactionTaskStatus.SKIPPED,
                     "context is missing",
                     "context_missing",
+                )
+            elif int(account.id) not in self._account_ids(rule):
+                terminal = (
+                    ParticipantReactionTaskStatus.CANCELLED,
+                    "reactor was removed from the selected account pool",
+                    "reactor_removed_from_rule",
+                )
+            elif task.cancel_requested:
+                terminal = (
+                    ParticipantReactionTaskStatus.CANCELLED,
+                    "cancel requested before reaction",
+                    "cancelled_before_send",
                 )
             elif not rule.enabled or not rule.approved_by_operator:
                 terminal = (ParticipantReactionTaskStatus.CANCELLED, "rule paused", "rule_paused")
@@ -746,6 +777,9 @@ class ParticipantReactionService:
             return
 
         async def deliver() -> None:
+            cancellation = await self._delivery_cancellation(task_id, token)
+            if cancellation is not None:
+                raise _ParticipantReactionDeliveryCancelled(*cancellation)
             await self._gateway.send_reaction(
                 account=account, target=target, message_id=task.message_id, emoji=task.emoji
             )
@@ -761,6 +795,15 @@ class ParticipantReactionService:
             )
         except AccountSendDeferred as exc:
             await self._defer(task_id, token, exc.resume_at, "account_pacing")
+            return
+        except _ParticipantReactionDeliveryCancelled as exc:
+            await self._finish(
+                task_id,
+                token,
+                ParticipantReactionTaskStatus.CANCELLED,
+                str(exc),
+                exc.code,
+            )
             return
         except Exception as exc:  # noqa: BLE001
             code = failure_code(exc, "participant_reaction_failed")
@@ -867,7 +910,7 @@ class ParticipantReactionService:
                 else:
                     status = ParticipantReactionTaskStatus.CANCELLED
                     error = error or "cancel requested before reaction completed"
-                    code = "cancelled_before_send"
+                    code = code or "cancelled_before_send"
             task.status = status
             task.error = error
             task.error_code = code
@@ -1048,6 +1091,7 @@ class ParticipantReactionService:
                 or task.attempt_count >= task.max_attempts
                 or rule is None
                 or not rule.enabled
+                or not rule.approved_by_operator
             ):
                 return False
             accounts = await self._accounts_for_rule(session, rule)
@@ -1092,6 +1136,31 @@ class ParticipantReactionService:
             )
             await session.commit()
             return True
+
+    async def _delivery_cancellation(
+        self,
+        task_id: int,
+        token: str,
+    ) -> tuple[str, str] | None:
+        """Recheck operator intent at the last safe point before Telegram is called."""
+
+        async with self._session_factory() as session:
+            task = await self._require_running(session, task_id, token)
+            rule = await session.get(ParticipantReactionRule, task.rule_id)
+            if rule is None:
+                return "reaction rule was deleted", "rule_archived"
+            if int(task.reactor_account_id) not in self._account_ids(rule):
+                return (
+                    "reactor was removed from the selected account pool",
+                    "reactor_removed_from_rule",
+                )
+            if task.cancel_requested:
+                return "cancel requested before reaction", "cancelled_before_send"
+            if not rule.enabled or not rule.approved_by_operator:
+                return "rule paused", "rule_paused"
+            if not await self._target_is_currently_selected(session, rule, int(task.target_id)):
+                return "chat was removed from the selected list", "target_removed_from_list"
+        return None
 
     async def _targets_for_rule(
         self, session: AsyncSession, rule: ParticipantReactionRule

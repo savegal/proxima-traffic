@@ -264,6 +264,21 @@ async def test_api_rejects_broken_spintax_in_templates_and_legacy_dialogues(
     )
     assert broken_update.status_code == 422
 
+    broadcast_only = await client.post(
+        "/api/v1/templates",
+        headers=admin_headers,
+        json={"name": "Broadcast only", "primary_text": "Post", "reply_text": ""},
+    )
+    assert broadcast_only.status_code == 201
+    assert broadcast_only.json()["reply_text"] == ""
+    cleared_reply = await client.patch(
+        f"/api/v1/templates/{template.json()['id']}",
+        headers=admin_headers,
+        json={"reply_text": ""},
+    )
+    assert cleared_reply.status_code == 200
+    assert cleared_reply.json()["reply_text"] == ""
+
     primary = await _create_account(client, admin_headers, "spintax-primary", 8611)
     reply = await _create_account(client, admin_headers, "spintax-reply", 8612)
     target = await client.post(
@@ -286,6 +301,49 @@ async def test_api_rejects_broken_spintax_in_templates_and_legacy_dialogues(
         },
     )
     assert broken_dialogue.status_code == 422
+
+
+async def test_api_collection_endpoints_return_page_metadata(
+    client: httpx.AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    await _create_account(client, admin_headers, "paged-api-account", 8699)
+    for endpoint in ("proxies", "runs", "audit"):
+        response = await client.get(
+            f"/api/v1/{endpoint}?page=0&page_size=1",
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["page"] == 0
+        assert payload["page_size"] == 1
+        assert isinstance(payload["items"], list)
+        assert isinstance(payload["total"], int)
+
+
+async def test_targets_expose_per_list_enablement(
+    client: httpx.AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    target_list = await client.post(
+        "/api/v1/target-lists",
+        headers=admin_headers,
+        json={"name": "Per-list target state", "chat_refs": ["@per_list_target"]},
+    )
+    assert target_list.status_code == 201
+    target_list_id = target_list.json()["id"]
+    assert (
+        await client.post(
+            f"/api/v1/target-lists/{target_list_id}/revoke",
+            headers=admin_headers,
+        )
+    ).status_code == 200
+    listed = await client.get(
+        f"/api/v1/targets?target_list_id={target_list_id}",
+        headers=admin_headers,
+    )
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["list_enabled"] is False
 
 
 async def test_dialogue_rejects_broadcast_only_timing(
@@ -948,9 +1006,7 @@ async def test_target_list_members_do_not_pollute_default_target_list(
     assert standalone.status_code == 200
     assert standalone.json()["items"] == []
     assert standalone.json()["total"] == 0
-    assert [item["chat_ref"] for item in all_targets.json()["items"]] == [
-        "@hidden_api_member"
-    ]
+    assert [item["chat_ref"] for item in all_targets.json()["items"]] == ["@hidden_api_member"]
 
     promoted = await client.post(
         "/api/v1/targets",
@@ -960,9 +1016,7 @@ async def test_target_list_members_do_not_pollute_default_target_list(
     assert promoted.status_code == 201
     assert promoted.json()["is_standalone"] is True
     standalone = await client.get("/api/v1/targets", headers=admin_headers)
-    assert [item["chat_ref"] for item in standalone.json()["items"]] == [
-        "@hidden_api_member"
-    ]
+    assert [item["chat_ref"] for item in standalone.json()["items"]] == ["@hidden_api_member"]
 
 
 async def test_launch_archive_api_is_safe_and_reversible(

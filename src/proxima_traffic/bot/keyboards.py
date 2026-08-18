@@ -3,7 +3,14 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from proxima_traffic.bot.repository import LaunchView, Page, TargetListView
+from proxima_traffic.bot.repository import (
+    AccountGroupView,
+    AccountListFilter,
+    LaunchView,
+    Page,
+    TargetListView,
+)
+from proxima_traffic.bot.ui import themed_keyboard
 from proxima_traffic.content import (
     MAX_ALBUM_ITEMS,
     MAX_CONTENT_VARIANTS,
@@ -42,17 +49,17 @@ def main_menu() -> InlineKeyboardMarkup:
                     text="📊 Запуски и результаты",
                     callback_data="menu:runs:0",
                 ),
-                InlineKeyboardButton(text="📣 Мои рассылки", callback_data="menu:campaigns:0"),
+                InlineKeyboardButton(text="🗂 Мои рассылки", callback_data="menu:campaigns:0"),
+            ],
+            [
+                InlineKeyboardButton(text="🎯 Чаты и списки", callback_data="audiences:home"),
+                InlineKeyboardButton(text="👥 Аккаунты", callback_data="menu:accounts:0"),
             ],
             [
                 InlineKeyboardButton(text="💬 Автокомментарии", callback_data="comments:home:0"),
             ],
             [
                 InlineKeyboardButton(text="👍 Авто-реакции в чатах", callback_data="pr:home:0"),
-            ],
-            [
-                InlineKeyboardButton(text="🎯 Чаты и списки", callback_data="audiences:home"),
-                InlineKeyboardButton(text="👥 Аккаунты", callback_data="menu:accounts:0"),
             ],
             [
                 InlineKeyboardButton(text="✉️ Базы подписчиков и ЛС", callback_data="dm:home"),
@@ -548,6 +555,14 @@ def order_audience_source_menu(
                 )
             ]
         )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="📥 Создать новый список",
+                callback_data="order:audience:create-list",
+            )
+        ]
+    )
     rows.append([InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -576,8 +591,12 @@ def order_target_picker(page: Page[Target]) -> InlineKeyboardMarkup:
 def order_target_list_picker(page: Page[TargetListView]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for item in page.items:
+        status = f"{item.approved_count} чатов" if item.approved_count else "нужно включить"
         builder.button(
-            text=f"📚 {_compact_button_label(item.name, 38)} · {item.approved_count} чатов",
+            text=(
+                f"{'📚' if item.approved_count else '⚪'} "
+                f"{_compact_button_label(item.name, 36)} · {status}"
+            ),
             callback_data=f"order:audience:list:{item.id}",
         )
     builder.adjust(1)
@@ -592,6 +611,26 @@ def order_target_list_picker(page: Page[TargetListView]) -> InlineKeyboardMarkup
         InlineKeyboardButton(text="⬅️ К выбору аудитории", callback_data="order:edit:audience")
     )
     return builder.as_markup()
+
+
+def order_target_list_activation_menu(target_list_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="▶️ Включить доступные чаты и выбрать",
+                    callback_data=f"order:audience:list:activate:{target_list_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К выбору аудитории",
+                    callback_data="order:edit:audience",
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back")],
+        ]
+    )
 
 
 def order_audience_search_menu(
@@ -696,7 +735,7 @@ def audiences_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="📥 Импортировать список",
+                    text="📥 Создать / импортировать список",
                     callback_data="target:import",
                 ),
                 InlineKeyboardButton(
@@ -781,7 +820,11 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(
-                text="🔑 Адрес и пароль",
+                text=(
+                    "🔑 Адрес и secret"
+                    if proxy.protocol.value == "mtproto"
+                    else "🔑 Адрес и пароль"
+                ),
                 callback_data=f"proxy:edit:{proxy.id}:{page}",
             ),
             InlineKeyboardButton(
@@ -790,18 +833,19 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
             ),
         ]
     )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="🔁 Сменить IP у всех" if item.assignment_count > 1 else "🔁 Сменить IP",
-                callback_data=f"proxy:rotate:{proxy.id}:{page}",
-            ),
-            InlineKeyboardButton(
-                text="🔗 Ссылка ротации",
-                callback_data=f"proxy:rotation:{proxy.id}:{page}",
-            ),
-        ]
-    )
+    if proxy.protocol.value != "mtproto":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=("🔁 Сменить IP у всех" if item.assignment_count > 1 else "🔁 Сменить IP"),
+                    callback_data=f"proxy:rotate:{proxy.id}:{page}",
+                ),
+                InlineKeyboardButton(
+                    text="🔗 Ссылка ротации",
+                    callback_data=f"proxy:rotation:{proxy.id}:{page}",
+                ),
+            ]
+        )
     if item.assignment_key:
         rows.append(
             [
@@ -1055,39 +1099,546 @@ def proxy_groups_menu(groups: list[ProxyGroup]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def accounts_menu(page: Page[Account]) -> InlineKeyboardMarkup:
+_ACCOUNT_FILTER_BUTTONS: tuple[tuple[AccountListFilter, str], ...] = (
+    (AccountListFilter.ALL, "Все"),
+    (AccountListFilter.READY, "Сессия проверена"),
+    (AccountListFilter.NEEDS_ATTENTION, "Нужно внимание"),
+    (AccountListFilter.PROFILE_INCOMPLETE, "Профиль не оформлен"),
+    (AccountListFilter.PREMIUM, "⭐ Premium"),
+    (AccountListFilter.ORDINARY, "Обычные"),
+    (AccountListFilter.UNKNOWN, "Premium не проверен"),
+    (AccountListFilter.PAUSED, "На паузе"),
+    (AccountListFilter.NO_SESSION, "Без сессии"),
+)
+
+_ACCOUNT_FILTER_CODES = {
+    AccountListFilter.ALL: "a",
+    AccountListFilter.PREMIUM: "p",
+    AccountListFilter.ORDINARY: "o",
+    AccountListFilter.UNKNOWN: "u",
+    AccountListFilter.READY: "r",
+    AccountListFilter.NEEDS_ATTENTION: "n",
+    AccountListFilter.PROFILE_INCOMPLETE: "i",
+    AccountListFilter.PAUSED: "s",
+    AccountListFilter.NO_SESSION: "x",
+}
+
+
+def account_filter_label(account_filter: AccountListFilter | str) -> str:
+    try:
+        normalized = AccountListFilter(account_filter)
+    except ValueError:
+        return "Все"
+    return dict(_ACCOUNT_FILTER_BUTTONS).get(normalized, "Все")
+
+
+def account_filter_callback_code(account_filter: AccountListFilter | str) -> str:
+    return _ACCOUNT_FILTER_CODES[AccountListFilter(account_filter)]
+
+
+def _account_scope_group(group_id: int | None) -> str:
+    return "all" if group_id is None else str(max(0, int(group_id)))
+
+
+def account_browse_data(
+    account_filter: AccountListFilter | str,
+    group_id: int | None,
+    page: int,
+) -> str:
+    return (
+        f"account:browse:{account_filter_callback_code(account_filter)}:"
+        f"{_account_scope_group(group_id)}:{max(0, int(page))}"
+    )
+
+
+def _account_pagination(
+    builder: InlineKeyboardBuilder,
+    page: Page[Account],
+    *,
+    account_filter: AccountListFilter | str,
+    group_id: int | None,
+) -> None:
+    if page.pages <= 1:
+        return
+
+    def callback_for(page_number: int) -> str:
+        return account_browse_data(account_filter, group_id, page_number)
+
+    navigation: list[InlineKeyboardButton] = []
+    if page.page > 0:
+        navigation.append(InlineKeyboardButton(text="‹", callback_data=callback_for(page.page - 1)))
+    navigation.append(
+        InlineKeyboardButton(text=f"{page.page + 1} / {page.pages}", callback_data="noop")
+    )
+    if page.page + 1 < page.pages:
+        navigation.append(InlineKeyboardButton(text="›", callback_data=callback_for(page.page + 1)))
+    builder.row(*navigation)
+    jumps: list[InlineKeyboardButton] = []
+    if page.page > 1:
+        jumps.append(InlineKeyboardButton(text="« В начало", callback_data=callback_for(0)))
+    if page.page > 10:
+        jumps.append(InlineKeyboardButton(text="−10", callback_data=callback_for(page.page - 10)))
+    if page.page + 10 < page.pages - 1:
+        jumps.append(InlineKeyboardButton(text="+10", callback_data=callback_for(page.page + 10)))
+    if page.page < page.pages - 2:
+        jumps.append(
+            InlineKeyboardButton(text="В конец »", callback_data=callback_for(page.pages - 1))
+        )
+    if jumps:
+        builder.row(*jumps)
+
+
+def accounts_menu(
+    page: Page[Account],
+    *,
+    account_filter: AccountListFilter | str = AccountListFilter.ALL,
+    group_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    normalized_filter = AccountListFilter(account_filter)
+    scope = _account_scope_group(group_id)
     builder = InlineKeyboardBuilder()
     for account in page.items:
         icon = _account_icon(account)
         builder.button(
             text=f"{icon} {account.label}",
-            callback_data=f"account:details:{account.id}:{page.page}",
+            callback_data=(
+                f"account:view:{account.id}:{account_filter_callback_code(normalized_filter)}:"
+                f"{scope}:{page.page}"
+            ),
+        )
+    builder.adjust(1)
+    builder.row(
+        InlineKeyboardButton(text="── Навигация ──", callback_data="noop"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🎛 {account_filter_label(normalized_filter)}",
+            callback_data=(
+                f"account:filters:{account_filter_callback_code(normalized_filter)}:"
+                f"{scope}:{page.page}"
+            ),
+        ),
+        InlineKeyboardButton(
+            text="🗂 Группы",
+            callback_data=(
+                f"account:groups:{account_filter_callback_code(normalized_filter)}:"
+                f"{scope}:{page.page}"
+            ),
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(text="── Проверка ──", callback_data="noop"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔍 Проверить сессии",
+            callback_data=f"account:check:all:{page.page}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="── Оформление профиля ──", callback_data="noop"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🎲 Имена",
+            callback_data="account:names:menu",
+        ),
+        InlineKeyboardButton(
+            text="📝 Описания",
+            callback_data="account:about:bulk",
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🖼 Аватары",
+            callback_data="account:avatars:bulk",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="── Добавление ──", callback_data="noop"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📥 Импорт",
+            callback_data=f"account:import:menu:{page.page}",
+        ),
+        InlineKeyboardButton(text="➕ Без сессии", callback_data="account:add"),
+    )
+    _account_pagination(
+        builder,
+        page,
+        account_filter=normalized_filter,
+        group_id=group_id,
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔄 Обновить список",
+            callback_data=account_browse_data(normalized_filter, group_id, page.page),
+        )
+    )
+    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    return builder.as_markup()
+
+
+def account_filters_menu(
+    *,
+    selected_filter: AccountListFilter | str,
+    group_id: int | None,
+    page: int,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(selected_filter)
+    builder = InlineKeyboardBuilder()
+    for account_filter, label in _ACCOUNT_FILTER_BUTTONS:
+        marker = "✓ " if account_filter is normalized else ""
+        builder.button(
+            text=f"{marker}{label}",
+            callback_data=account_browse_data(account_filter, group_id, 0),
+        )
+    builder.adjust(2, 1, 2, 1, 2, 1)
+    builder.row(
+        InlineKeyboardButton(
+            text="← К списку",
+            callback_data=account_browse_data(normalized, group_id, page),
+        )
+    )
+    return builder.as_markup()
+
+
+def account_groups_menu(
+    groups: list[AccountGroupView],
+    *,
+    account_filter: AccountListFilter | str,
+    group_id: int | None,
+    page: int,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(account_filter)
+    scope = _account_scope_group(group_id)
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text=("✓ Все группы" if group_id is None else "Все группы"),
+            callback_data=account_browse_data(normalized, None, 0),
+        ),
+        InlineKeyboardButton(
+            text=("✓ Без группы" if group_id == 0 else "Без группы"),
+            callback_data=account_browse_data(normalized, 0, 0),
+        ),
+    )
+    for item in groups:
+        marker = "✓ " if group_id == item.id else ""
+        icon = "⭐" if item.is_system else "🗂"
+        settings_button = (
+            InlineKeyboardButton(
+                text="ℹ️" if item.is_system else "⚙️",
+                callback_data=(
+                    f"account:group:view:{item.id}:{account_filter_callback_code(normalized)}:"
+                    f"{scope}:{page}"
+                ),
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=(
+                    f"{marker}{icon} {_compact_button_label(item.name, 31)} · {item.account_count}"
+                ),
+                callback_data=account_browse_data(normalized, item.id, 0),
+            ),
+            *settings_button,
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Создать группу",
+            callback_data=(
+                f"account:group:add:list:{account_filter_callback_code(normalized)}:{scope}:{page}"
+            ),
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="← К аккаунтам",
+            callback_data=account_browse_data(normalized, group_id, page),
+        )
+    )
+    return builder.as_markup()
+
+
+def account_group_details_menu(
+    group_id: int,
+    *,
+    account_filter: AccountListFilter | str,
+    group_scope_id: int | None,
+    page: int,
+    is_system: bool = False,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(account_filter)
+    scope = _account_scope_group(group_scope_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if not is_system:
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="👥 Настроить состав",
+                        callback_data=(
+                            f"account:group:members:{group_id}:"
+                            f"{account_filter_callback_code(normalized)}:0"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Название и описание",
+                        callback_data=(
+                            f"account:group:edit:{group_id}:{account_filter_callback_code(normalized)}:"
+                            f"{scope}:{page}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🗑 Удалить только группу",
+                        callback_data=(
+                            f"account:group:delete:ask:{group_id}:"
+                            f"{account_filter_callback_code(normalized)}:{scope}:{page}"
+                        ),
+                    )
+                ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="← К группам",
+                callback_data=(
+                    f"account:groups:{account_filter_callback_code(normalized)}:{scope}:{page}"
+                ),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def account_group_members_menu(
+    group_id: int,
+    page: Page[Account],
+    selected_account_ids: set[int],
+    *,
+    account_filter: AccountListFilter | str,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(account_filter)
+    builder = InlineKeyboardBuilder()
+    for account in page.items:
+        selected = account.id in selected_account_ids
+        builder.button(
+            text=f"{'☑️' if selected else '◻️'} {_compact_button_label(account.label, 37)}",
+            callback_data=(
+                f"account:group:member:toggle:{group_id}:{account.id}:"
+                f"{account_filter_callback_code(normalized)}:{page.page}"
+            ),
         )
     builder.adjust(1)
     builder.row(
         InlineKeyboardButton(
-            text="🎲 Имена для аккаунтов",
-            callback_data="account:names:menu",
+            text="✓ Выбрать страницу",
+            callback_data=(
+                f"account:group:member:page:on:{group_id}:"
+                f"{account_filter_callback_code(normalized)}:{page.page}"
+            ),
+        ),
+        InlineKeyboardButton(
+            text="◻️ Снять страницу",
+            callback_data=(
+                f"account:group:member:page:off:{group_id}:"
+                f"{account_filter_callback_code(normalized)}:{page.page}"
+            ),
+        ),
+    )
+    if page.pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if page.page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="‹",
+                    callback_data=(
+                        f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:"
+                        f"{page.page - 1}"
+                    ),
+                )
+            )
+        navigation.append(
+            InlineKeyboardButton(text=f"{page.page + 1} / {page.pages}", callback_data="noop")
+        )
+        if page.page + 1 < page.pages:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="›",
+                    callback_data=(
+                        f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:"
+                        f"{page.page + 1}"
+                    ),
+                )
+            )
+        builder.row(*navigation)
+    builder.row(
+        InlineKeyboardButton(
+            text="🎛 Фильтр аккаунтов",
+            callback_data=(
+                f"account:group:member:filters:{group_id}:"
+                f"{account_filter_callback_code(normalized)}:{page.page}"
+            ),
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="📝 Описания профилей",
-            callback_data="account:about:bulk",
+            text="← К группе",
+            callback_data=(
+                f"account:group:view:{group_id}:{account_filter_callback_code(normalized)}:all:0"
+            ),
         )
     )
+    return builder.as_markup()
+
+
+def account_group_member_filters_menu(
+    group_id: int,
+    *,
+    selected_filter: AccountListFilter | str,
+    page: int,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(selected_filter)
+    builder = InlineKeyboardBuilder()
+    for account_filter, label in _ACCOUNT_FILTER_BUTTONS:
+        marker = "✓ " if account_filter is normalized else ""
+        builder.button(
+            text=f"{marker}{label}",
+            callback_data=(
+                f"account:group:members:{group_id}:{account_filter_callback_code(account_filter)}:0"
+            ),
+        )
+    builder.adjust(2, 1, 2, 1, 2, 1)
     builder.row(
         InlineKeyboardButton(
-            text="📥 Импортировать аккаунт",
-            callback_data=f"account:import:menu:{page.page}",
+            text="← К составу",
+            callback_data=(
+                f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:{page}"
+            ),
         )
     )
-    builder.row(InlineKeyboardButton(text="➕ Аккаунт без сессии", callback_data="account:add"))
-    _pagination(builder, "accounts", page.page, page.pages)
+    return builder.as_markup()
+
+
+def account_membership_menu(
+    account_id: int,
+    groups: list[AccountGroupView],
+    selected_group_ids: set[int],
+    *,
+    account_filter: AccountListFilter | str,
+    group_scope_id: int | None,
+    page: int,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(account_filter)
+    scope = _account_scope_group(group_scope_id)
+    builder = InlineKeyboardBuilder()
+    for group in groups:
+        if group.is_system:
+            continue
+        selected = group.id in selected_group_ids
+        builder.row(
+            InlineKeyboardButton(
+                text=("☑️ " if selected else "◻️ ") + _compact_button_label(group.name, 42),
+                callback_data=(
+                    f"am:t:{account_id}:{group.id}:{account_filter_callback_code(normalized)}:"
+                    f"{scope}:{page}"
+                ),
+            )
+        )
+    if not groups:
+        builder.row(
+            InlineKeyboardButton(
+                text="➕ Создать первую группу",
+                callback_data=(
+                    f"account:group:add:member:{account_id}:"
+                    f"{account_filter_callback_code(normalized)}:{scope}:{page}"
+                ),
+            )
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(
+                text="➕ Создать группу",
+                callback_data=(
+                    f"account:group:add:member:{account_id}:"
+                    f"{account_filter_callback_code(normalized)}:{scope}:{page}"
+                ),
+            )
+        )
     builder.row(
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"menu:accounts:{page.page}")
+        InlineKeyboardButton(
+            text="← К карточке аккаунта",
+            callback_data=(
+                f"account:view:{account_id}:{account_filter_callback_code(normalized)}:"
+                f"{scope}:{page}"
+            ),
+        )
     )
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    return builder.as_markup()
+
+
+def account_group_delete_confirmation(
+    group_id: int,
+    *,
+    account_filter: AccountListFilter | str,
+    group_scope_id: int | None,
+    page: int,
+) -> InlineKeyboardMarkup:
+    normalized = AccountListFilter(account_filter)
+    scope = _account_scope_group(group_scope_id)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Да, удалить группу",
+                    callback_data=(
+                        f"account:group:delete:confirm:{group_id}:"
+                        f"{account_filter_callback_code(normalized)}:"
+                        f"{scope}:{page}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="← Оставить группу",
+                    callback_data=(
+                        f"account:group:view:{group_id}:{account_filter_callback_code(normalized)}:"
+                        f"{scope}:{page}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+def account_bulk_check_menu(
+    revoked_accounts: list[tuple[int, str]],
+    *,
+    page: int,
+) -> InlineKeyboardMarkup:
+    """Offer a deliberate per-account deletion after a batch session check."""
+    builder = InlineKeyboardBuilder()
+    for account_id, label in revoked_accounts[:12]:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🗑 Удалить · {_compact_button_label(label, 34)}",
+                callback_data=f"account:delete:ask:{account_id}:{page}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔁 Повторить быструю проверку",
+            callback_data=f"account:check:all:{page}",
+        )
+    )
+    builder.row(InlineKeyboardButton(text="← К аккаунтам", callback_data=f"menu:accounts:{page}"))
     return builder.as_markup()
 
 
@@ -1165,7 +1716,10 @@ def account_details_menu(
     page: int,
     *,
     has_proxy: bool,
+    can_rotate_proxy: bool = False,
     shared_proxy_accounts: int = 0,
+    back_callback: str | None = None,
+    groups_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     has_session = _account_source_value(account) != "none"
@@ -1175,10 +1729,17 @@ def account_details_menu(
             callback_data=f"account:label:edit:{account.id}:{page}",
         )
     )
+    if groups_callback is not None:
+        builder.row(
+            InlineKeyboardButton(
+                text="🗂 Группы аккаунта",
+                callback_data=groups_callback,
+            )
+        )
     if has_session:
         builder.row(
             InlineKeyboardButton(
-                text="🔍 Проверить сессию",
+                text="🩺 Проверить сессию + @SpamBot",
                 callback_data=f"account:check:{account.id}:{page}",
             )
         )
@@ -1202,21 +1763,22 @@ def account_details_menu(
                 callback_data=f"account:about:edit:{account.id}:{page}",
             ),
         )
-    builder.row(
-        InlineKeyboardButton(
-            text="⏸ Пауза" if account.status.value == "active" else "▶️ Включить",
-            callback_data=f"account:toggle:{account.id}:{page}",
-        ),
-        InlineKeyboardButton(
-            text="🔓 Убрать прокси" if has_proxy else "🌐 Назначить прокси",
-            callback_data=(
-                f"account:proxy:release:{account.id}:{page}"
-                if has_proxy
-                else f"account:proxy:auto:{account.id}:{page}"
+    if has_session:
+        builder.row(
+            InlineKeyboardButton(
+                text="⏸ Пауза" if account.status.value == "active" else "▶️ Включить",
+                callback_data=f"account:toggle:{account.id}:{page}",
             ),
-        ),
-    )
-    if has_proxy:
+            InlineKeyboardButton(
+                text="🔓 Убрать прокси" if has_proxy else "🌐 Назначить прокси",
+                callback_data=(
+                    f"account:proxy:release:{account.id}:{page}"
+                    if has_proxy
+                    else f"account:proxy:auto:{account.id}:{page}"
+                ),
+            ),
+        )
+    if has_proxy and can_rotate_proxy:
         builder.row(
             InlineKeyboardButton(
                 text=(
@@ -1239,7 +1801,12 @@ def account_details_menu(
             text="🗑 Удалить запись", callback_data=f"account:delete:ask:{account.id}:{page}"
         )
     )
-    builder.row(InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data=f"menu:accounts:{page}"))
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ К аккаунтам",
+            callback_data=back_callback or f"menu:accounts:{page}",
+        )
+    )
     return builder.as_markup()
 
 
@@ -1255,6 +1822,20 @@ def account_delete_confirmation(account_id: int, page: int) -> InlineKeyboardMar
             [
                 InlineKeyboardButton(
                     text="⬅️ Нет, оставить",
+                    callback_data=f"account:details:{account_id}:{page}",
+                )
+            ],
+        ]
+    )
+
+
+def account_delete_blocked_menu(account_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 К запускам", callback_data="menu:runs:0")],
+            [
+                InlineKeyboardButton(
+                    text="← К аккаунту",
                     callback_data=f"account:details:{account_id}:{page}",
                 )
             ],
@@ -1309,17 +1890,42 @@ def account_about_confirmation(account_id: int, page: int) -> InlineKeyboardMark
     )
 
 
-def account_about_bulk_menu() -> InlineKeyboardMarkup:
+def account_about_bulk_menu(
+    *,
+    scope_label: str | None = None,
+    back_callback: str = "menu:accounts:0",
+) -> InlineKeyboardMarkup:
+    target = f" · {_compact_button_label(scope_label, 22)}" if scope_label else ""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✍️ Установить всем", callback_data="account:about:bulk:set"
+                    text=f"✍️ Установить{target}", callback_data="account:about:bulk:set"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🧹 Очистить все", callback_data="account:about:bulk:clear:ask"
+                    text=f"🧹 Очистить{target}", callback_data="account:about:bulk:clear:ask"
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Выбрать область", callback_data=back_callback)],
+        ]
+    )
+
+
+def account_about_bulk_result_menu() -> InlineKeyboardMarkup:
+    """Safe terminal actions after a scoped bulk description operation.
+
+    The frozen scope belongs to the completed FSM draft.  Exposing ``set`` or
+    ``clear`` after that draft is cleared could make a stale callback act on a
+    fallback set of accounts.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📝 Изменить описания ещё раз",
+                    callback_data="account:about:bulk",
                 )
             ],
             [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="menu:accounts:0")],
@@ -1327,8 +1933,13 @@ def account_about_bulk_menu() -> InlineKeyboardMarkup:
     )
 
 
-def account_about_bulk_confirmation(*, clear: bool = False) -> InlineKeyboardMarkup:
-    label = "🧹 Да, очистить у всех" if clear else "✅ Установить всем"
+def account_about_bulk_confirmation(
+    *,
+    clear: bool = False,
+    scope_label: str | None = None,
+) -> InlineKeyboardMarkup:
+    target = f" · {_compact_button_label(scope_label, 22)}" if scope_label else " у всех"
+    label = ("🧹 Да, очистить" if clear else "✅ Установить") + target
     action = "clear" if clear else "apply"
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1342,13 +1953,69 @@ def account_about_bulk_confirmation(*, clear: bool = False) -> InlineKeyboardMar
     )
 
 
+def _profile_scope_callback(operation: str, scope: str) -> str:
+    """Build a compact, handler-safe callback for a profile batch scope."""
+
+    normalized_operation = operation.strip()
+    if (
+        not 1 <= len(normalized_operation) <= 24
+        or not normalized_operation.replace("_", "").isalnum()
+        or not normalized_operation.isascii()
+    ):
+        raise ValueError("operation must be a short ASCII callback token")
+    return f"account:profile:scope:{normalized_operation}:{scope}"
+
+
+def account_profile_scope_menu(
+    groups: list[AccountGroupView],
+    *,
+    operation: str,
+    ready_count: int,
+    back_callback: str = "menu:accounts:0",
+) -> InlineKeyboardMarkup:
+    """Choose a deliberately limited account set before a bulk profile edit.
+
+    The handler receives either ``...:all`` or ``...:group:<id>`` and must
+    still resolve the current ready members itself.  Empty groups are omitted:
+    presenting a button which cannot produce an edit preview is misleading.
+    """
+
+    builder = InlineKeyboardBuilder()
+    normalized_ready_count = max(0, int(ready_count))
+    builder.row(
+        InlineKeyboardButton(
+            text=f"👥 Все готовые · {normalized_ready_count}",
+            callback_data=_profile_scope_callback(operation, "all"),
+        )
+    )
+    for group in groups:
+        if group.ready_count <= 0:
+            continue
+        icon = "⭐" if group.is_system else "🗂"
+        builder.row(
+            InlineKeyboardButton(
+                text=(
+                    f"{icon} {_compact_button_label(group.name, 30)} · готово {group.ready_count}"
+                ),
+                callback_data=_profile_scope_callback(operation, f"group:{group.id}"),
+            )
+        )
+    builder.row(InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data=back_callback))
+    return builder.as_markup()
+
+
 def account_name_catalog_menu(
     *,
     account_id: int = 0,
     page: int = 0,
+    scope_label: str | None = None,
+    back_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     suffix = f":{account_id}:{page}"
-    back = f"account:details:{account_id}:{page}" if account_id else f"menu:accounts:{page}"
+    back = back_callback or (
+        f"account:details:{account_id}:{page}" if account_id else f"menu:accounts:{page}"
+    )
+    back_label = f"⬅️ {_compact_button_label(scope_label, 34)}" if scope_label else "⬅️ Назад"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1367,7 +2034,7 @@ def account_name_catalog_menu(
                     callback_data=f"account:names:preview:en{suffix}",
                 ),
             ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back)],
+            [InlineKeyboardButton(text=back_label, callback_data=back)],
         ]
     )
 
@@ -1377,7 +2044,13 @@ def account_generated_names_confirmation(
     locale: str,
     account_id: int,
     page: int,
+    scope_label: str | None = None,
+    back_callback: str | None = None,
+    retry_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
+    retry = retry_callback or f"account:names:preview:{locale}:{account_id}:{page}"
+    back = back_callback or "fsm:cancel"
+    back_label = f"⬅️ {_compact_button_label(scope_label, 34)}" if scope_label else "✖️ Отмена"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1389,10 +2062,10 @@ def account_generated_names_confirmation(
             [
                 InlineKeyboardButton(
                     text="🎲 Другие варианты",
-                    callback_data=(f"account:names:preview:{locale}:{account_id}:{page}"),
+                    callback_data=retry,
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text=back_label, callback_data=back)],
         ]
     )
 
@@ -1449,12 +2122,70 @@ def account_avatar_delete_confirmation(account_id: int, page: int) -> InlineKeyb
     )
 
 
+def account_bulk_avatar_upload_menu() -> InlineKeyboardMarkup:
+    """Leave a pending bulk-avatar upload without losing the accounts screen."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✖️ Отмена",
+                    callback_data="account:avatars:bulk:cancel",
+                )
+            ]
+        ]
+    )
+
+
+def account_bulk_avatar_confirmation(*, count: int) -> InlineKeyboardMarkup:
+    """Explicit irreversible confirmation for the frozen avatar target set."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Установить на {max(0, int(count))} аккаунтов",
+                    callback_data="account:avatars:bulk:apply",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✖️ Отмена",
+                    callback_data="account:avatars:bulk:cancel",
+                )
+            ],
+        ]
+    )
+
+
+def account_bulk_avatar_result_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🖼 Ещё аватары",
+                    callback_data="account:avatars:bulk",
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="menu:accounts:0")],
+        ]
+    )
+
+
 def _account_icon(account: Account) -> str:
     if account.status.value != "active":
         return "⏸"
     if _account_source_value(account) == "none":
         return "📄"
-    return "🟢" if getattr(account, "authorized", False) else "🟡"
+    if not getattr(account, "authorized", False):
+        return "🟡"
+    if (
+        not (getattr(account, "first_name", None) or "").strip()
+        or not getattr(account, "has_profile_photo", False)
+        or not (getattr(account, "about", None) or "").strip()
+    ):
+        return "🧩"
+    return "🟢"
 
 
 def proxy_group_delete_confirmation(group_id: int) -> InlineKeyboardMarkup:
@@ -2123,7 +2854,7 @@ def target_lists_menu(page: Page[TargetListView]) -> InlineKeyboardMarkup:
     builder.adjust(1)
     _pagination(builder, "targetlists", page.page, page.pages)
     builder.row(
-        InlineKeyboardButton(text="📄 Создать из TXT", callback_data="target:import"),
+        InlineKeyboardButton(text="📥 Создать / импортировать", callback_data="target:import"),
         InlineKeyboardButton(text="🔎 Найти", callback_data="search:start:targetlists"),
     )
     builder.row(
@@ -3385,7 +4116,7 @@ def campaign_run_confirmation(campaign_id: int, page: int) -> InlineKeyboardMark
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🚀 Да, поставить в очередь",
+                    text="🩺 Проверить и поставить в очередь",
                     callback_data=f"campaign:run:confirm:{campaign_id}:{page}",
                 )
             ],
@@ -3523,3 +4254,15 @@ def _launch_icon(launch: LaunchView) -> str:
     if launch.cancelled == launch.total:
         return "🚫"
     return "🟠"
+
+
+# All keyboard factories share the same navigation vocabulary. Applying this at
+# the module boundary also covers rarely opened maintenance screens without
+# changing callback identifiers or the underlying workflow.
+for _factory_name, _factory in tuple(globals().items()):
+    if (
+        not _factory_name.startswith("_")
+        and callable(_factory)
+        and _factory_name.endswith(("menu", "picker", "confirmation", "presets", "cancel", "back"))
+    ):
+        globals()[_factory_name] = themed_keyboard(_factory)

@@ -5,13 +5,16 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from proxima_traffic.accounts import AccountBulkCheckSummary
 from proxima_traffic.bot.repository import (
+    AccountGroupView,
     DashboardStats,
     LaunchView,
     Page,
     TargetListView,
     TargetTimingView,
 )
+from proxima_traffic.bot.ui import screen_title, section
 from proxima_traffic.config import Settings, get_settings
 from proxima_traffic.content import (
     BroadcastContentVariant,
@@ -41,23 +44,23 @@ from proxima_traffic.scheduling import BROADCAST_PROFILES, detect_broadcast_prof
 from proxima_traffic.worker_supervision import WorkerHealthSnapshot
 
 
-def campaign_preflight_text(summary: CampaignPreflightSummary) -> str:
+def _campaign_preflight_state(summary: CampaignPreflightSummary) -> str:
     if summary.target_count == 0:
-        state = "🔴 Нет включённых чатов"
-    elif summary.routable_targets == summary.target_count:
-        state = "🟢 Всё готово к отправке"
-    elif summary.routable_targets:
-        state = "🟡 Готова только часть аудитории"
-    else:
-        state = "🔴 Нет готовых маршрутов"
+        return "🔴 Нет включённых чатов"
+    if summary.routable_targets == summary.target_count:
+        return "🟢 Всё готово к отправке"
+    if summary.routable_targets:
+        return "🟡 Готова только часть аудитории"
+    return "🔴 Нет готовых маршрутов"
+
+
+def _campaign_preflight_details(summary: CampaignPreflightSummary) -> str:
     checked_label = (
         summary.newest_checked_at.astimezone(UTC).strftime("%d.%m.%Y %H:%M UTC")
         if summary.newest_checked_at is not None
         else "ещё не выполнялась"
     )
     return (
-        "<b>🩺 Готовность рассылки</b>\n"
-        f"Состояние: <b>{state}</b>\n\n"
         f"👥 Аккаунты: <b>{summary.account_count}</b>\n"
         f"🎯 Чаты: <b>{summary.target_count}</b>\n"
         f"🔎 Проверено пар: <b>{summary.checked_pairs}</b>\n"
@@ -71,6 +74,37 @@ def campaign_preflight_text(summary: CampaignPreflightSummary) -> str:
         f"❌ Недоступны: <b>{summary.unavailable_targets}</b>\n"
         f"❔ Без готового маршрута: <b>{summary.uncovered_targets}</b>\n\n"
         "<i>Проверка ничего не отправляет и не вступает в группы.</i>"
+    )
+
+
+def campaign_preflight_text(summary: CampaignPreflightSummary) -> str:
+    return (
+        screen_title("Готовность рассылки", _campaign_preflight_state(summary))
+        + "\n\n"
+        + _campaign_preflight_details(summary)
+    )
+
+
+def campaign_launch_not_ready_text(summary: CampaignPreflightSummary) -> str:
+    """Explain an automatic LIVE preflight without exposing a technical alert."""
+
+    return (
+        screen_title(
+            "Отправка пока не началась",
+            "Проверка перед запуском выполнена автоматически; ничего не отправлено.",
+        )
+        + "\n\n"
+        + section("Что произошло")
+        + "\nНи один готовый маршрут до выбранных чатов сейчас не найден. "
+        "Очередь не создана, чтобы не тратить аккаунты на заведомо недоступную отправку."
+        + "\n\n"
+        + section("Результат проверки")
+        + "\n"
+        + _campaign_preflight_details(summary)
+        + "\n\n"
+        + section("Что делать")
+        + "\nОткройте «Проверить перед отправкой», посмотрите состояние чатов и аккаунтов, "
+        "исправьте доступ или выберите другой чат — затем просто нажмите «Запустить» снова."
     )
 
 
@@ -101,7 +135,32 @@ def dashboard_text(
         next_steps.append(f"🌐 Назначьте рабочий прокси ещё {missing} аккаунт(ам)")
     if stats.standalone_targets_approved + stats.audience_enabled_count == 0:
         next_steps.append("🎯 Добавьте и включите хотя бы один чат")
-    active_runs = stats.queued_runs + stats.running_runs
+    campaign_active_runs = stats.queued_runs + stats.running_runs
+    queued_work = (
+        stats.queued_runs
+        + stats.direct_queued_tasks
+        + stats.subscriber_invite_queued_tasks
+        + stats.campaign_reaction_queued_tasks
+        + stats.channel_comment_queued_runs
+        + stats.participant_reaction_queued_tasks
+    )
+    running_work = (
+        stats.running_runs
+        + stats.direct_running_tasks
+        + stats.subscriber_invite_running_tasks
+        + stats.campaign_reaction_running_tasks
+        + stats.channel_comment_running_runs
+        + stats.participant_reaction_running_tasks
+    )
+    active_launches = (
+        stats.active_launches
+        + stats.direct_active_launches
+        + stats.subscriber_invite_active_launches
+    )
+    automated_comments = stats.channel_comment_queued_runs + stats.channel_comment_running_runs
+    automated_participant_reactions = (
+        stats.participant_reaction_queued_tasks + stats.participant_reaction_running_tasks
+    )
     next_send = (
         f"<code>{_date_time(stats.next_scheduled_at)}</code>"
         if stats.next_scheduled_at is not None
@@ -109,10 +168,10 @@ def dashboard_text(
     )
     if next_steps:
         operation_state = "🟡 Нужно закончить настройку"
-    elif stats.running_runs:
+    elif running_work:
         operation_state = "🔵 Идёт отправка"
-    elif stats.queued_runs:
-        operation_state = "🕒 Посты стоят в очереди"
+    elif queued_work:
+        operation_state = "🕒 Отправки стоят в очереди"
     else:
         operation_state = "🟢 Всё готово к отправке"
     manual_total = stats.standalone_targets_total
@@ -133,25 +192,32 @@ def dashboard_text(
     )
     worker_block = _worker_health_block(worker_health)
     return (
-        "<b>PROXIMA · Центр управления</b>\n"
-        "<i>Рассылки, автокомментарии, реакции и работа с базами</i>\n"
-        f"<i>{mode}</i>\n\n"
+        screen_title("PROXIMA", "Операционный центр") + "\n"
+        f"<code>{mode}</code>\n\n"
         f"<b>{operation_state}</b>\n\n"
-        "<b>Сейчас</b>\n"
-        f"📣 Активных рассылок: <b>{stats.active_launches}</b>\n"
-        f"📨 В очереди: <b>{active_runs}</b> · отправляется: <b>{stats.running_runs}</b>\n"
-        f"⏭ Ближайший пост: {next_send}\n\n"
-        "<b>Сегодня</b>\n"
-        f"✅ Опубликовано: <b>{stats.sent_messages_24h}</b>"
+        f"{section('Сейчас')}\n"
+        f"🚀 Активных запусков: <b>{active_launches}</b>\n"
+        f"📨 Всего в очереди: <b>{queued_work}</b> · выполняется: <b>{running_work}</b>\n"
+        f"📣 Чаты: <b>{campaign_active_runs}</b> · реакции: "
+        f"<b>{stats.campaign_reaction_queued_tasks + stats.campaign_reaction_running_tasks}</b>\n"
+        f"💬 ЛС: <b>{stats.direct_queued_tasks}</b> в очереди · "
+        f"<b>{stats.direct_running_tasks}</b> выполняется\n"
+        f"✉️ Приглашения: <b>{stats.subscriber_invite_queued_tasks}</b> в очереди · "
+        f"<b>{stats.subscriber_invite_running_tasks}</b> выполняется\n"
+        f"⚙️ Автоматизация: комментарии <b>{automated_comments}</b> "
+        f"· реакции участников <b>{automated_participant_reactions}</b>\n"
+        f"⏭ Ближайший пост в чате: {next_send}\n\n"
+        f"{section('Сегодня')}\n"
+        f"✅ Публикаций в чатах: <b>{stats.sent_messages_24h}</b>"
         f" · ❌ не отправилось: <b>{stats.failed_messages_24h}</b>\n\n"
-        "<b>Готовность к работе</b>\n"
+        f"{section('Готовность к работе')}\n"
         f"👥 Аккаунты: <b>{account_ready}/{stats.accounts_total}</b> готовы\n"
         f"🎯 Чаты: <b>{audience_active}/{audience_total}</b> включены"
         f" · списков: <b>{stats.target_lists_total}</b>"
         f"{proxy_line}"
         f"{next_action_block}"
         f"{worker_block}\n\n"
-        "<b>За всё время</b>\n"
+        f"{section('За всё время')}\n"
         f"✅ Завершено: <b>{stats.succeeded_runs}</b>"
         f" · ❌ проблем: <b>{stats.failed_runs}</b>"
     )
@@ -182,18 +248,18 @@ def _worker_health_block(worker_health: tuple[WorkerHealthSnapshot, ...]) -> str
 
 def guide_text() -> str:
     return (
-        "<b>❓ Как начать</b>\n"
-        "<i>Четыре понятных шага до первой рассылки и её контроля.</i>\n\n"
-        "<b>1 · Добавьте аккаунты</b>\n"
+        screen_title("Как начать", "Четыре понятных шага до первой рассылки и её контроля.")
+        + "\n\n"
+        "<b>01 — Подготовьте аккаунты</b>\n"
         "Импортируйте сессии, при необходимости назначьте прокси "
         "и проверьте, что аккаунты готовы.\n\n"
-        "<b>2 · Соберите чаты</b>\n"
+        "<b>02 — Соберите аудиторию</b>\n"
         "Создайте список и добавьте в него чаты. Сервис сам ведёт "
         "список неподходящих чатов отдельно.\n\n"
-        "<b>3 · Создайте и проверьте рассылку</b>\n"
+        "<b>03 — Настройте и проверьте рассылку</b>\n"
         "Выберите пост, чаты и частоту. Перед отправкой можно открыть "
         "предпросмотр и выполнить проверку.\n\n"
-        "<b>4 · Контролируйте результат</b>\n"
+        "<b>04 — Контролируйте результат</b>\n"
         "В «Запусках и результатах» видны прогресс, причины пропусков и результат по "
         "каждому чату.\n\n"
         "<i>Каждый запуск можно безопасно остановить; сохранённые рассылки остаются "
@@ -203,8 +269,8 @@ def guide_text() -> str:
 
 def order_type_text() -> str:
     return (
-        "<b>🚀 Создать новую рассылку</b>\n"
-        "<i>Выберите формат — дальше сервис проведёт по шагам.</i>\n\n"
+        screen_title("Создание рассылки", "Выберите формат — дальше сервис проведёт по шагам.")
+        + "\n\n"
         "<b>📢 Рассылка</b>\n"
         "Один пост в выбранных чатах. Можно оставить разовую отправку или включить "
         "автоматические повторы.\n\n"
@@ -551,10 +617,14 @@ def audiences_text(stats: DashboardStats) -> str:
     else:
         next_step = "🚀 Аудитория готова: её можно выбрать при создании рассылки."
     return (
-        "<b>🎯 Чаты и списки</b>\n"
-        "<i>Собирайте чаты в списки, проверяйте их состояние и используйте в рассылках.</i>\n\n"
-        "<b>Следующий шаг</b>\n"
+        screen_title(
+            "Чаты и списки",
+            "Собирайте чаты в списки, проверяйте их состояние и используйте в рассылках.",
+        )
+        + "\n\n"
+        f"{section('Следующий шаг')}\n"
         f"{next_step}\n\n"
+        f"{section('Аудитория')}\n"
         f"📚 Списков чатов: <b>{stats.target_lists_total}</b>"
         f" · включено/всего: <b>{stats.audience_enabled_count}/"
         f"{stats.audience_member_count}</b>\n"
@@ -602,12 +672,38 @@ def _account_daily_load(
     return used, remaining, reset_at
 
 
-def accounts_text(page: Page[Account]) -> str:
+def _profile_missing_parts(account: Account) -> tuple[str, ...]:
+    """Return the profile fields that are still meaningful to prepare."""
+
+    missing: list[str] = []
+    if not (getattr(account, "first_name", None) or "").strip():
+        missing.append("имя")
+    if not getattr(account, "has_profile_photo", False):
+        missing.append("аватар")
+    if not (getattr(account, "about", None) or "").strip():
+        missing.append("описание")
+    return tuple(missing)
+
+
+def accounts_text(
+    page: Page[Account],
+    *,
+    filter_label: str | None = None,
+    group_id: int | None = None,
+) -> str:
     live = sum(_account_source(account) != "none" for account in page.items)
     daily_limit = get_settings().account_daily_limit
+    scope = filter_label or "Все аккаунты"
+    if group_id == 0:
+        scope += " · без группы"
+    elif group_id is not None:
+        scope += " · выбранная группа"
     lines = [
-        "<b>👥 Аккаунты</b>",
-        f"<i>Всего {page.total} · с подключённой сессией на этой странице {live}</i>\n",
+        screen_title(
+            "Аккаунты",
+            f"{scope} · найдено {page.total} · сессий на странице {live}",
+        ),
+        "",
     ]
     for account in page.items:
         status = {"active": "🟢", "paused": "⏸", "disabled": "🔴"}[account.status.value]
@@ -616,7 +712,7 @@ def accounts_text(page: Page[Account]) -> str:
         if source_value == "none":
             session_note = "📄 без сессии, для рабочей отправки не используется"
         elif getattr(account, "authorized", False):
-            session_note = f"🔓 готов к работе · {source_label}"
+            session_note = f"🔓 сессия подтверждена · {source_label}"
         else:
             session_note = f"🟡 сессия загружена, нужна проверка · {source_label}"
         used, remaining, _ = _account_daily_load(account, daily_limit)
@@ -627,9 +723,24 @@ def accounts_text(page: Page[Account]) -> str:
         )
         handle = f" · @{escape(account.username)}" if account.username else ""
         user_id = f" · <code>{account.telegram_user_id}</code>" if account.telegram_user_id else ""
-        lines.append(
-            f"{status} <b>{escape(account.label)}</b>{handle}{user_id}\n└ {session_note}{load_note}"
+        premium_value = getattr(account, "is_premium", None)
+        premium_note = (
+            " · ⭐ Premium"
+            if premium_value is True
+            else " · обычный"
+            if premium_value is False
+            else " · Premium не проверен"
         )
+        lines.append(
+            f"{status} <b>{escape(account.label)}</b>{handle}{user_id}{premium_note}\n"
+            f"└ {session_note}{load_note}"
+        )
+        if getattr(account, "authorized", False):
+            missing = _profile_missing_parts(account)
+            profile_note = (
+                f"🧩 профиль: нужно {', '.join(missing)}" if missing else "👤 профиль: оформлен"
+            )
+            lines.append(f"  {profile_note}")
     if not page.items:
         lines.append(
             "<b>С чего начать</b>\nИмпортируйте один аккаунт как <b>TData</b>, "
@@ -639,9 +750,46 @@ def accounts_text(page: Page[Account]) -> str:
     else:
         lines.append(
             "\n<b>Что можно сделать</b>\n"
-            "Откройте аккаунт, чтобы проверить сессию, назначить прокси, сменить IP "
-            "или отредактировать профиль Telegram."
+            "Откройте аккаунт, чтобы проверить сессию, назначить прокси, сменить IP, "
+            "отредактировать профиль Telegram или распределить его по своим группам."
         )
+    return "\n".join(lines)
+
+
+def account_bulk_check_text(summary: AccountBulkCheckSummary) -> str:
+    lines = [
+        screen_title(
+            "Быстрая проверка сессий",
+            "Проверяет подключение через маршрут аккаунта; @SpamBot не запрашивается.",
+        ),
+        "",
+        section("Итог"),
+        f"Проверено: <b>{len(summary.entries)}</b>",
+        f"✅ Готовы к работе: <b>{len(summary.ready)}</b>",
+        f"🔴 Сессия недействительна: <b>{len(summary.session_revoked)}</b>",
+        f"⚠️ Нужна повторная проверка: <b>{len(summary.issues)}</b>",
+    ]
+    if not summary.entries:
+        lines.append("\nНет аккаунтов с загруженной Telegram-сессией.")
+        return "\n".join(lines)
+    if summary.session_revoked:
+        lines.extend(["\n" + section("Недействительные сессии")])
+        for entry in summary.session_revoked[:12]:
+            lines.append(f"• 🔴 <b>{escape(entry.label)}</b>")
+        if len(summary.session_revoked) > 12:
+            lines.append(f"• …и ещё <b>{len(summary.session_revoked) - 12}</b> в списке аккаунтов")
+        lines.append(
+            "\nМожно удалить ненужную запись кнопкой ниже. Для аккаунтов с историей "
+            "бот предложит безопасно стереть только доступ."
+        )
+    if summary.issues:
+        lines.extend(["\n" + section("Не удалять автоматически")])
+        for entry in summary.issues[:6]:
+            reason = escape(entry.error or "состояние сессии требует повторной проверки")
+            lines.append(f"• ⚠️ <b>{escape(entry.label)}</b> · {reason}")
+        if len(summary.issues) > 6:
+            lines.append(f"• …и ещё <b>{len(summary.issues) - 6}</b>")
+        lines.append("Эти случаи обычно связаны с сетью, прокси или данными импорта.")
     return "\n".join(lines)
 
 
@@ -649,14 +797,16 @@ def account_details_text(
     account: Account,
     *,
     proxy_slot: str | None,
+    proxy_view: ProxyView | None = None,
     shared_proxy_accounts: int = 0,
     daily_limit: int | None = None,
 ) -> str:
     status_names = {"active": "🟢 Активен", "paused": "⏸ На паузе", "disabled": "🔴 Отключён"}
     source = _ACCOUNT_SOURCE_LABELS[_account_source(account)]
     lines = [
-        f"<b>👤 {escape(account.label)}</b>",
-        f"<b>{status_names[account.status.value]}</b>\n",
+        screen_title(escape(account.label), status_names[account.status.value]),
+        "",
+        section("Подключение"),
         f"Источник сессии: <b>{source}</b>",
     ]
     if _account_source(account) != "none":
@@ -690,30 +840,81 @@ def account_details_text(
         lines.append(f"Username: <b>@{escape(account.username)}</b>")
     if account.phone:
         lines.append(f"Телефон: <code>{escape(account.phone)}</code>")
-    lines.append(
-        f"Прокси: <code>{escape(proxy_slot)}</code>" if proxy_slot else "Прокси: <i>не назначен</i>"
-    )
+    premium_value = getattr(account, "is_premium", None)
+    if premium_value is True:
+        lines.append("Telegram Premium: <b>⭐ есть</b>")
+    elif premium_value is False:
+        lines.append("Telegram Premium: <b>обычный аккаунт</b>")
+    else:
+        lines.append("Telegram Premium: <i>не определён — проверьте сессию</i>")
+    if proxy_slot:
+        proxy_status_names = {
+            "unknown": "⚪️ нужна проверка",
+            "healthy": "🟢 рабочий",
+            "unhealthy": "🔴 не работает",
+            "quarantined": "🟠 не работает · карантин",
+            "disabled": "⏸ выключен",
+        }
+        proxy_status = (
+            proxy_status_names.get(proxy_view.proxy.status.value, "⚪️ нужна проверка")
+            if proxy_view is not None
+            else "⚪️ статус неизвестен"
+        )
+        lines.append(f"Прокси: <code>{escape(proxy_slot)}</code> · <b>{proxy_status}</b>")
+        if proxy_view is not None and proxy_view.proxy.last_checked_at is not None:
+            lines.append(
+                f"Прокси проверен: <code>{_date_time(proxy_view.proxy.last_checked_at)}</code>"
+            )
+        if proxy_view is not None and proxy_view.proxy.status.value in {
+            "unhealthy",
+            "quarantined",
+            "disabled",
+        }:
+            lines.append(
+                "🔁 При следующем подключении автозамена проверит все включённые прокси "
+                "и назначит рабочий."
+            )
+    else:
+        lines.append("Прокси: <i>не назначен</i>")
     if shared_proxy_accounts > 1:
         lines.append(
             f"🔁 Общий IP: <b>{shared_proxy_accounts}</b> аккаунта(ов). "
             "Ротация переподключит их все."
         )
     if _account_source(account) == "none":
-        next_step = "📥 Следующий шаг: импортируйте сессию аккаунта из списка аккаунтов."
+        next_step = (
+            "📥 Следующий шаг: импортируйте сессию этого Telegram-аккаунта ещё раз. "
+            "Карточка, группы и история запусков сохранятся."
+        )
     elif not getattr(account, "authorized", False):
         next_step = "🔍 Следующий шаг: проверьте сессию. При ошибке соединения назначьте прокси."
     elif get_settings().account_require_proxy and not proxy_slot:
         next_step = "🌐 Следующий шаг: назначьте рабочий прокси для этого аккаунта."
+    elif proxy_view is not None and proxy_view.proxy.status.value in {
+        "unhealthy",
+        "quarantined",
+        "disabled",
+    }:
+        next_step = (
+            "🌐 Следующий шаг: добавьте хотя бы один рабочий прокси. При запуске "
+            "автозамена проверит пул и переключит аккаунт сама."
+        )
     elif account.status.value != "active":
         next_step = "▶️ Следующий шаг: включите аккаунт, чтобы использовать его в рассылках."
+    elif missing_profile := _profile_missing_parts(account):
+        next_step = (
+            "🧩 Сессия подтверждена. Перед первой рассылкой оформите профиль: "
+            + ", ".join(missing_profile)
+            + "."
+        )
     else:
         next_step = "✅ Аккаунт готов: его можно выбрать при создании рассылки."
-    lines.append(f"\n<b>Следующий шаг</b>\n{next_step}")
+    lines.append(f"\n{section('Следующий шаг')}\n{next_step}")
     resolved_daily_limit = (
         get_settings().account_daily_limit if daily_limit is None else max(0, daily_limit)
     )
     used, remaining, reset_at = _account_daily_load(account, resolved_daily_limit)
-    lines.append("\n<b>Нагрузка аккаунта</b>")
+    lines.append("\n" + section("Нагрузка аккаунта"))
     if resolved_daily_limit > 0 and remaining is not None:
         lines.append(
             f"За 24 часа: <b>{used}/{resolved_daily_limit}</b> отправок · "
@@ -783,11 +984,16 @@ def account_name_catalog_text(
     accounts: list[Account],
     *,
     single_account: Account | None = None,
+    scope_label: str | None = None,
 ) -> str:
     scope = (
         f"АККАУНТ #{single_account.id} · {escape(single_account.label)}"
         if single_account is not None
-        else f"МАССОВО · ДОСТУПНО {len(accounts)} АККАУНТОВ"
+        else (
+            f"ОБЛАСТЬ · {escape(scope_label)} · ДОСТУПНО {len(accounts)} АККАУНТОВ"
+            if scope_label
+            else f"МАССОВО · ДОСТУПНО {len(accounts)} АККАУНТОВ"
+        )
     )
     return (
         "<b>🎲 Молодые имена Telegram</b>\n"
@@ -809,15 +1015,17 @@ def account_generated_names_preview_text(
     assignments: list[dict[str, object]],
     *,
     locale: NameLocale,
+    scope_label: str | None = None,
 ) -> str:
     locale_label = {
         "mixed": "🎲 смешанные",
         "ru": "🇷🇺 русские",
         "en": "🌍 латиницей",
     }[locale]
+    scope = f" · {escape(scope_label)}" if scope_label else ""
     lines = [
         "<b>👀 Проверка имён перед применением</b>",
-        f"<code>{locale_label.upper()} · АККАУНТОВ {len(assignments)}</code>\n",
+        f"<code>{locale_label.upper()}{scope} · АККАУНТОВ {len(assignments)}</code>\n",
     ]
     for assignment in assignments[:12]:
         label = escape(str(assignment["label"]))
@@ -837,6 +1045,38 @@ def account_generated_names_preview_text(
         ]
     )
     return "\n".join(lines)
+
+
+def account_profile_scope_text(
+    groups: list[AccountGroupView],
+    *,
+    operation_label: str,
+    ready_count: int,
+) -> str:
+    """Explain the exact account set a future bulk profile edit may use."""
+
+    available_groups = [group for group in groups if group.ready_count > 0]
+    group_hint = (
+        "\n".join(
+            f"• {('⭐' if group.is_system else '🗂')} <b>{escape(group.name)}</b> "
+            f"· готово {group.ready_count} из {group.account_count}"
+            for group in available_groups[:8]
+        )
+        if available_groups
+        else "Подходящих групп пока нет."
+    )
+    more_groups = (
+        f"\n• …ещё групп: {len(available_groups) - 8}" if len(available_groups) > 8 else ""
+    )
+    return (
+        f"<b>🧭 Выберите область: {escape(operation_label)}</b>\n\n"
+        "Изменения затронут только аккаунты с готовой Telegram-сессией на момент "
+        "создания превью. Сначала будет показан точный список; без подтверждения "
+        "профили Telegram не меняются.\n\n"
+        f"<b>Все готовые:</b> {max(0, int(ready_count))}\n\n"
+        "<b>Группы с готовыми аккаунтами</b>\n"
+        f"{group_hint}{more_groups}"
+    )
 
 
 def account_names_result_text(
@@ -872,8 +1112,8 @@ def account_avatar_text(account: Account) -> str:
 def targets_text(page: Page[Target]) -> str:
     approved = sum(target.approved_by_operator for target in page.items)
     lines = [
-        "<b>📌 Отдельные чаты</b>",
-        f"<i>Добавлено вручную: {page.total} · включено: {approved}</i>\n",
+        screen_title("Отдельные чаты", f"Добавлено вручную: {page.total} · включено: {approved}"),
+        "",
     ]
     for target in page.items:
         status = (
@@ -901,8 +1141,8 @@ def targets_text(page: Page[Target]) -> str:
 
 def bad_targets_text(page: Page[Target]) -> str:
     lines = [
-        "<b>🚫 Исключённые чаты</b>",
-        f"<code>АВТОМАТИЧЕСКИ ИСКЛЮЧЕНО · {page.total}</code>\n",
+        screen_title("Исключённые чаты", f"Автоматически исключено: {page.total}"),
+        "",
         "Сюда попадают чаты с повторными подтверждёнными проблемами. "
         "Сетевые ошибки, прокси и общий FLOOD_WAIT рейтинг чата не портят.\n",
     ]
@@ -935,7 +1175,8 @@ def target_details_text(
         else "⚪️ Не используется"
     )
     lines = [
-        f"<b>🎯 {escape(target.title)}</b>\n<b>{status}</b>\n",
+        screen_title(escape(target.title), status),
+        "",
         f"Адрес: <code>{escape(target.chat_ref)}</code>",
     ]
     if target.chat_type:
@@ -969,7 +1210,7 @@ def target_details_text(
     }.get(target.quality_status, target.quality_status)
     lines.extend(
         [
-            "\n<b>Рейтинг чата</b>",
+            "\n" + section("Рейтинг чата"),
             f"Состояние: <b>{quality_label}</b> · балл <b>{target.quality_score}/100</b>",
             f"Попыток: <b>{target.quality_attempts}</b> · успешно: "
             f"<b>{target.quality_successes}</b> · целевых ошибок: "
@@ -1067,9 +1308,11 @@ def target_details_text(
 
 def campaigns_text(page: Page[Campaign]) -> str:
     lines = [
-        "<b>📣 Рассылки</b>",
-        f"<i>Сохраните настройки один раз и запускайте, когда нужно.</i>\n"
-        f"<i>Всего: {page.total}</i>\n",
+        screen_title(
+            "Рассылки",
+            f"Сохраните настройки один раз и запускайте, когда нужно · всего: {page.total}",
+        ),
+        "",
     ]
     for campaign in page.items:
         status = "🟢 включена" if campaign.enabled else "⏸ выключена"
@@ -1142,9 +1385,9 @@ def campaign_details_text(campaign: Campaign, sender_ids: list[int]) -> str:
     )
     status = "🟢 Готова" if campaign.enabled else "⏸ Остановлена"
     lines = [
-        f"<b>{'📢' if campaign.mode == CampaignMode.BROADCAST else '💬'} "
-        f"{escape(campaign.name)}</b>",
-        f"<b>{status}</b>\n",
+        screen_title(escape(campaign.name), status),
+        "",
+        section("Настройки сценария"),
         f"🎯 {target}",
     ]
     if campaign.mode == CampaignMode.BROADCAST:
@@ -1549,9 +1792,9 @@ def target_lists_text(page: Page[TargetListView]) -> str:
     first_item = page.page * page.page_size + 1 if page.total else 0
     last_item = min(page.total, (page.page + 1) * page.page_size)
     lines = [
-        "<b>📚 Списки чатов</b>",
-        f"<code>ВСЕГО {page.total} · СТРАНИЦА {page.page + 1}/{page.pages} · "
-        f"{first_item}–{last_item}</code>\n",
+        screen_title("Списки чатов"),
+        f"<i>Всего: {page.total} · страница {page.page + 1}/{page.pages} · "
+        f"показано: {first_item}–{last_item}</i>\n",
     ]
     for item in page.items:
         lines.append(
@@ -1572,8 +1815,7 @@ def target_lists_text(page: Page[TargetListView]) -> str:
 
 def target_list_details_text(item: TargetListView) -> str:
     return (
-        f"<b>📚 {escape(item.name)}</b>\n"
-        f"<code>СПИСОК #{item.id}</code>\n\n"
+        screen_title(escape(item.name), f"Список #{item.id}") + "\n\n"
         f"Всего       <b>{item.item_count}</b>\n"
         f"🟢 Открыто   <b>{item.approved_count}</b>\n"
         f"⚪️ Закрыто   <b>{item.disabled_count}</b>\n"
@@ -1600,10 +1842,10 @@ def target_list_targets_text(
     first_item = page.page * page.page_size + 1 if page.total else 0
     last_item = min(page.total, (page.page + 1) * page.page_size)
     lines = [
-        f"<b>📚 {escape(item.name)} · чаты</b>",
-        f"<code>ФИЛЬТР: {filter_label.upper()} · {page.total}</code>",
-        f"Страница <b>{page.page + 1}/{page.pages}</b> · показано "
-        f"<b>{first_item}–{last_item}</b>\n",
+        screen_title(escape(item.name), "Чаты списка"),
+        f"<code>ФИЛЬТР: {filter_label.upper()}</code>\n"
+        f"Всего: <b>{page.total}</b> · Страница <b>{page.page + 1}/{page.pages}</b> · "
+        f"показано <b>{first_item}–{last_item}</b>\n",
     ]
     for target in page.items:
         status = (
@@ -1628,7 +1870,7 @@ def target_list_targets_text(
 
 
 def templates_text(page: Page[MessageTemplate]) -> str:
-    lines = ["<b>📝 Шаблоны сообщений</b>", f"<i>Всего: {page.total}</i>\n"]
+    lines = [screen_title("Шаблоны сообщений", f"Всего: {page.total}"), ""]
     for template in page.items:
         status = "🟢" if template.enabled else "⏸"
         reply_preview = _preview(template.reply_text) if template.reply_text else "<i>не задан</i>"
@@ -1655,8 +1897,7 @@ def template_details_text(template: MessageTemplate) -> str:
     status = "🟢 Активен" if template.enabled else "⏸ На паузе"
     reply_text = _text_preview(template.reply_text, 1400) if template.reply_text else "не задан"
     return (
-        f"<b>📝 {escape(template.name)}</b>\n"
-        f"<code>ШАБЛОН #{template.id}</code> · {status}\n\n"
+        screen_title(escape(template.name), f"Шаблон #{template.id} · {status}") + "\n\n"
         f"<b>1 · Первое сообщение</b>\n"
         f"<blockquote>{_text_preview(template.primary_text, 1400)}</blockquote>\n"
         f"<b>2 · Адресный ответ</b>\n"
@@ -1685,13 +1926,13 @@ def launches_text(
     *,
     archived: bool = False,
 ) -> str:
-    title = "🗄 Архив результатов" if archived else "📊 Работа и результаты"
+    title = "Архив результатов" if archived else "Работа и результаты"
     subtitle = (
         "Здесь лежат завершённые рассылки. Их можно вернуть в основной список."
         if archived
         else "Откройте рассылку, чтобы увидеть, что отправлено, что ждёт и где есть проблемы."
     )
-    lines = [f"<b>{title}</b>", f"<i>{subtitle}</i>\n", f"<i>Всего: {page.total}</i>\n"]
+    lines = [screen_title(title, subtitle), f"<i>Всего: {page.total}</i>\n"]
     for launch in page.items:
         icon = _launch_icon(launch)
         name = _preview(launch.campaign_name, 64)
@@ -2090,13 +2331,16 @@ def _smart_launch_details_text(
             )
             next_target_send = datetime.max.replace(tzinfo=UTC)
             if active and not running:
-                next_target_send = min(run.scheduled_for for run in active)
+                # SQLite returns legacy DATETIME values without tzinfo, while newly
+                # created runs are UTC-aware.  Always normalize before comparing so
+                # opening a live launch report cannot fail on a mixed dataset.
+                next_target_send = min(_as_utc(run.scheduled_for) for run in active)
                 state_text = (
                     f"следующая <code>{_date_time(next_target_send)}</code> · "
                     f"{_schedule_distance(next_target_send)}"
                 )
             elif running:
-                next_target_send = min(run.scheduled_for for run in active)
+                next_target_send = min(_as_utc(run.scheduled_for) for run in active)
             issue_count = failed + blocked + (1 if skipped_before_launch is not None else 0)
             if skipped_before_launch is not None:
                 marker = "⏭"
@@ -2505,7 +2749,7 @@ def run_details_text(
 
 
 def audit_text(page: Page[AuditEvent]) -> str:
-    lines = ["<b>📜 Системный аудит</b>", f"<code>СОБЫТИЙ · {page.total}</code>\n"]
+    lines = [screen_title("Системный аудит", f"Событий: {page.total}"), ""]
     for event in page.items:
         entity = f" #{event.entity_id}" if event.entity_id else ""
         lines.append(
@@ -2530,27 +2774,30 @@ def settings_text(settings: Settings, stats: DashboardStats) -> str:
             f"{settings.account_typing_min_seconds:g}–{settings.account_typing_max_seconds:g} сек."
         )
     return (
-        "<b>⚙️ Настройки и сервис</b>\n"
-        f"<i>{'Тестовый режим' if settings.dry_run else 'Рабочий режим'}</i>\n\n"
-        "<b>Очередь отправок</b>\n"
+        screen_title(
+            "Настройки и сервис",
+            "Тестовый режим" if settings.dry_run else "Рабочий режим",
+        )
+        + "\n\n"
+        f"{section('Очередь отправок')}\n"
         f"Состояние: <b>{'🟢 включён' if settings.worker_enabled else '⏸ выключен'}</b>\n"
         f"Одновременных операций: <b>{settings.worker_concurrency}</b>\n"
         f"Повторов при ошибке: <b>{settings.worker_max_attempts}</b>\n"
         f"Активных операций: <b>{stats.queued_runs + stats.running_runs}</b>\n\n"
-        "<b>Нагрузка аккаунтов</b>\n"
+        f"{section('Нагрузка аккаунтов')}\n"
         f"Суточный предел: <b>{settings.account_daily_limit or 'без лимита'}</b> "
         "успешных отправок на аккаунт\n"
         f"Подача перед сообщением: <b>{typing_status}</b>\n"
         "После достижения предела очередь использует другой свободный аккаунт или "
         "переносит задание на новое 24-часовое окно.\n\n"
-        "<b>Проверка прокси</b>\n"
+        f"{section('Проверка прокси')}\n"
         f"Адрес: <code>{escape(settings.proxy_check_url)}</code>\n"
         f"Ожидание ответа: <b>{settings.proxy_check_timeout_seconds} сек.</b> · карантин после "
         f"<b>{settings.proxy_quarantine_after_failures}</b> ошибок\n\n"
-        "<b>Уведомления</b>\n"
+        f"{section('Уведомления')}\n"
         f"Лог-чат: {log_chat}\n"
         f"Время в интерфейсе: <b>{escape(settings.timezone)}</b>\n\n"
-        "<b>Быстрые действия</b>\n"
+        f"{section('Быстрые действия')}\n"
         "• 🩺 «Диагностика» проверяет базу и не меняет данные.\n"
         "• 💾 «Резервная копия» создаёт проверяемую копию базы.\n"
         "• 📜 «Журнал действий» показывает важные изменения.\n"
@@ -2570,10 +2817,10 @@ def proxies_text(page: ProxyPage) -> str:
         "free": "без аккаунтов",
     }
     lines = [
-        "<b>🌐 Прокси для аккаунтов</b>",
-        f"<code>ФИЛЬТР · {filter_names[page.filter_name.value].upper()}</code>\n",
-        f"🟢 Рабочие <b>{page.pool_healthy}</b>  ·  🔴 ошибки <b>{page.pool_problem}</b>",
-        f"⚪️ Новые <b>{page.pool_unknown}</b>  ·  "
+        screen_title("Прокси для аккаунтов", f"Фильтр: {filter_names[page.filter_name.value]}"),
+        "",
+        f"🟢 Рабочие <b>{page.pool_healthy}</b>  ·  🔴 не работают <b>{page.pool_problem}</b>",
+        f"⚪️ Не проверены <b>{page.pool_unknown}</b>  ·  "
         f"👥 назначений аккаунтам <b>{page.pool_assigned}</b>",
         f"Всего прокси <b>{page.pool_total}</b> · показано <b>{page.total}</b>\n",
     ]
@@ -2586,10 +2833,17 @@ def proxies_text(page: ProxyPage) -> str:
     }
     for item in page.items:
         proxy = item.proxy
-        latency = f"{proxy.latency_ms} мс" if proxy.latency_ms is not None else "не проверен"
+        latency = f"{proxy.latency_ms} мс" if proxy.latency_ms is not None else "—"
+        status_names = {
+            "unknown": "не проверен",
+            "healthy": "рабочий",
+            "unhealthy": "не работает",
+            "quarantined": "не работает · карантин",
+            "disabled": "выключен",
+        }
         entry = (
             f"{icons[proxy.status.value]} <b>#{proxy.id} · {escape(proxy.label)}</b>\n"
-            f"├ задержка: {latency}\n"
+            f"├ состояние: <b>{status_names[proxy.status.value]}</b> · задержка: {latency}\n"
             f"└ <code>{escape(item.masked_endpoint)}</code>"
         )
         if item.group_name:
@@ -2602,11 +2856,14 @@ def proxies_text(page: ProxyPage) -> str:
             lines.append("По этому фильтру ничего нет. Выберите другой фильтр.")
         else:
             lines.append(
-                "<b>С чего начать</b>\nДобавьте мобильный SOCKS5/HTTP-прокси или импортируйте TXT."
+                "<b>С чего начать</b>\nДобавьте SOCKS5/HTTP или MTProto-прокси, "
+                "либо импортируйте TXT."
             )
     lines.append(
-        "\n🔐 <i>Пароли и ссылки ротации зашифрованы и не показываются обратно. "
-        "Кнопка «Проверить все» не отправляет сообщений в Telegram.</i>"
+        "\n🔐 <i>«Рабочий» означает: последняя проверка успешно установила соединение "
+        "через этот прокси. HTTP(S)/SOCKS5 проверяются через сеть, MTProto — "
+        "подключением к Telegram без отправки сообщений. Пароли, secret и ссылки "
+        "ротации зашифрованы и не показываются обратно.</i>"
     )
     return "\n".join(lines)
 
@@ -2615,18 +2872,28 @@ def proxy_details_text(item: ProxyView) -> str:
     proxy = item.proxy
     status_names = {
         "unknown": "⚪️ Не проверен",
-        "healthy": "🟢 Исправен",
-        "unhealthy": "🔴 Ошибка",
-        "quarantined": "🟠 Карантин",
+        "healthy": "🟢 Рабочий",
+        "unhealthy": "🔴 Не работает",
+        "quarantined": "🟠 Не работает · карантин",
         "disabled": "⏸ Выключен",
     }
     latency = f"{proxy.latency_ms} мс" if proxy.latency_ms is not None else "—"
+    is_mtproto = proxy.protocol.value == "mtproto"
+    connection_line = (
+        f"Задержка Telegram: <b>{latency}</b> · внешний IP <i>MTProto не раскрывает</i>"
+        if is_mtproto
+        else f"Задержка: <b>{latency}</b> · IP <code>{escape(proxy.observed_ip or '—')}</code>"
+    )
     lines = [
-        f"<b>🌐 {escape(proxy.label)}</b>",
-        f"<code>ПРОКСИ #{proxy.id}</code> · <b>{status_names[proxy.status.value]}</b>\n",
+        screen_title(
+            escape(proxy.label),
+            f"Прокси #{proxy.id} · {status_names[proxy.status.value]}",
+        ),
+        "",
         f"<code>{escape(item.masked_endpoint)}</code>\n",
         "<b>Подключение</b>",
-        f"Задержка: <b>{latency}</b> · IP <code>{escape(proxy.observed_ip or '—')}</code>",
+        "Тип: <b>Telegram MTProto</b>" if is_mtproto else "Тип: <b>HTTP/SOCKS5</b>",
+        connection_line,
         f"Проверки: ✅ {proxy.success_count} · ❌ {proxy.failure_count} "
         f"· подряд {proxy.consecutive_failures}",
     ]
@@ -2634,12 +2901,15 @@ def proxy_details_text(item: ProxyView) -> str:
         lines.append(f"Папка: <b>{escape(item.group_name)}</b>")
     if proxy.last_checked_at is not None:
         lines.append(f"Последняя проверка: <code>{_date_time(proxy.last_checked_at)}</code>")
-    rotation = "есть" if item.has_rotation_url else "не задана"
-    lines.append(f"Ротация IP: <b>{rotation}</b>")
+    if is_mtproto:
+        lines.append("Ротация IP: <i>недоступна для MTProto</i>")
+    else:
+        rotation = "есть" if item.has_rotation_url else "не задана"
+        lines.append(f"Ротация IP: <b>{rotation}</b>")
     if proxy.last_rotated_at is not None:
         lines.append(f"Последняя ротация: <code>{_date_time(proxy.last_rotated_at)}</code>")
     if proxy.last_error:
-        lines.append(f"\n❌ <b>Последняя ошибка</b>\n<code>{escape(proxy.last_error)}</code>")
+        lines.append(f"\n❌ <b>Почему не работает</b>\n<code>{escape(proxy.last_error)}</code>")
     if item.assignment_count:
         lines.extend(
             [
@@ -2700,7 +2970,7 @@ def _account_id_from_assignment(key: str) -> int | None:
 
 
 def proxy_groups_text(groups: list[ProxyGroup]) -> str:
-    lines = ["<b>🗂 Группы прокси</b>", f"<i>Всего: {len(groups)}</i>\n"]
+    lines = [screen_title("Группы прокси", f"Всего: {len(groups)}"), ""]
     for group in groups:
         lines.append(
             f"<b>#{group.id} · {escape(group.name)}</b>\n"
@@ -2781,7 +3051,8 @@ def campaign_run_confirmation_text(
         f"<b>🚀 Начать «{escape(campaign.name)}»?</b>\n\n"
         f"Куда: <b>{target}</b>\n"
         f"{mode_block}\n\n"
-        f"После подтверждения начнётся отправка.{warning}"
+        "После подтверждения бот автоматически проверит доступ к чатам и аккаунтам. "
+        f"Если всё готово — отправка начнётся без дополнительных действий.{warning}"
     )
 
 
@@ -3065,7 +3336,7 @@ def _report_text(lines: list[str], limit: int = 4096) -> str:
     text = "\n".join(lines)
     if len(text) <= limit:
         return text
-    footer = "\n<i>Часть подробностей скрыта из-за лимита Telegram.</i>"
+    footer = "\n<i>Часть подробностей скрыта из‑за лимита Telegram.</i>"
     compact = list(lines)
     while len(compact) > 5 and len("\n".join(compact) + footer) > limit:
         compact.pop()
@@ -3182,8 +3453,7 @@ def wizard_text(
     hint: str = "Команда /cancel отменяет ввод без сохранения.",
 ) -> str:
     return (
-        f"<b>{escape(title)}</b>\n"
-        f"<i>Шаг {step} из {total}</i>\n\n"
+        screen_title(escape(title), f"Шаг {step} из {total}") + "\n\n"
         f"{body}\n\n"
-        f"<i>💡 {escape(hint)}</i>"
+        f"<i>Подсказка: {escape(hint)}</i>"
     )

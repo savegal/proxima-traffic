@@ -22,6 +22,20 @@ def test_subscription_gate_extracts_telegram_channels_and_safe_verify_callback()
     assert gate.verification_callbacks == (b"verify-subscriptions",)
 
 
+def test_subscription_gate_recognises_membership_wording_beyond_subscribe() -> None:
+    gate = parse_membership_gate(
+        "Чтобы комментировать, станьте участником канала и подтвердите доступ.",
+        (
+            InlineButton(text="Вступить", url="https://t.me/required_news"),
+            InlineButton(text="Подтвердить", callback_data=b"confirm-membership"),
+        ),
+    )
+
+    assert gate is not None
+    assert gate.channel_refs == ("@required_news",)
+    assert gate.verification_callbacks == (b"confirm-membership",)
+
+
 def test_subscription_gate_rejects_captcha_and_web_app_buttons() -> None:
     assert (
         parse_membership_gate(
@@ -67,7 +81,11 @@ def test_subscription_gate_rejects_captcha_and_web_app_buttons() -> None:
 
 def test_only_supported_telegram_channel_links_are_normalized() -> None:
     assert telegram_channel_ref("https://t.me/+privateInvite") == "https://t.me/+privateInvite"
-    assert telegram_channel_ref("https://t.me/joinchat/oldInvite") == "https://t.me/joinchat/oldInvite"
+    assert (
+        telegram_channel_ref("https://t.me/joinchat/oldInvite") == "https://t.me/joinchat/oldInvite"
+    )
+    assert telegram_channel_ref("https://t.me/+privateInvite/extra") is None
+    assert telegram_channel_ref("https://t.me/joinchat/oldInvite/extra") is None
     assert telegram_channel_ref("https://t.me/c/123/45") is None
     assert telegram_channel_ref("https://t.me/addlist/folder") is None
     assert telegram_channel_ref("https://example.org/required_news") is None

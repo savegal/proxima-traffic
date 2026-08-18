@@ -13,19 +13,27 @@ from collections.abc import AsyncIterator, Iterator
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from telethon.crypto import AuthKey  # noqa: E402
 from telethon.sessions import StringSession  # noqa: E402
 
 from proxima_traffic.accounts import (  # noqa: E402
     AccountArchiveEntry,
+    AccountCheckResult,
     AccountImportError,
+    AccountProfileError,
     AccountService,
     _ConvertedSession,
     _safe_extract_zip,
 )
 from proxima_traffic.config import Settings  # noqa: E402
 from proxima_traffic.db import Database  # noqa: E402
-from proxima_traffic.models import Account, AccountSessionSource, AccountStatus  # noqa: E402
+from proxima_traffic.models import (  # noqa: E402
+    Account,
+    AccountGroupMember,
+    AccountSessionSource,
+    AccountStatus,
+)
 from proxima_traffic.services import ConflictError  # noqa: E402
 
 TEST_USER_ID = 123456789
@@ -198,6 +206,50 @@ async def test_import_rejects_zip_without_tdata(service: AccountService) -> None
         await service.import_tdata(label="Empty", archive_bytes=buffer.getvalue())
 
 
+async def test_bulk_profile_photo_updates_are_bounded_and_continue_after_failure(
+    service: AccountService,
+) -> None:
+    active = 0
+    peak_active = 0
+
+    async def update_photo(
+        account_id: int,
+        *,
+        photo_bytes: bytes,
+        file_name: str,
+        actor: str = "control-bot",
+    ) -> Account:
+        nonlocal active, peak_active
+        assert photo_bytes == b"photo"
+        assert file_name == "avatar.jpg"
+        assert actor == "test"
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            if account_id == 3:
+                raise AccountProfileError("session expired")
+            return Account(id=account_id, label=f"Account {account_id}")
+        finally:
+            active -= 1
+
+    service.update_profile_photo = update_photo  # type: ignore[method-assign]
+
+    result = await service.bulk_update_profile_photos(
+        [1, 2, 3, 4, 4],
+        photo_bytes=b"photo",
+        file_name="avatar.jpg",
+        concurrency=2,
+        actor="test",
+    )
+
+    assert peak_active == 2
+    assert [account.id for account in result.updated] == [1, 2, 4]
+    assert [(failure.account_id, failure.error) for failure in result.failures] == [
+        (3, "session expired")
+    ]
+
+
 def test_safe_extract_rejects_sibling_prefix_traversal(tmp_path: pathlib.Path) -> None:
     destination = tmp_path / "extract"
     destination.mkdir()
@@ -258,6 +310,31 @@ async def test_automatic_label_gets_suffix_when_profile_name_exists(
     account = await service.import_session_string(session_string=source.save())
 
     assert account.label == "Alice Example (2)"
+
+
+async def test_archive_import_group_contains_only_its_imported_accounts(
+    service: AccountService,
+) -> None:
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        first = Account(label="archive first", ownership_confirmed=True)
+        second = Account(label="archive second", ownership_confirmed=True)
+        session.add_all([first, second])
+        await session.commit()
+        first_id, second_id = first.id, second.id
+
+    group = await service.create_archive_import_group([second_id, first_id, first_id])
+    duplicate_group = await service.create_archive_import_group([first_id, second_id])
+
+    assert group.name.startswith("ZIP-импорт · ")
+    assert group.name != duplicate_group.name
+    assert group.description.endswith("аккаунтов: 2")
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        member_ids = set(
+            await session.scalars(
+                select(AccountGroupMember.account_id).where(AccountGroupMember.group_id == group.id)
+            )
+        )
+    assert member_ids == {first_id, second_id}
 
 
 async def test_private_label_rename_does_not_change_telegram_name(
@@ -651,3 +728,137 @@ async def test_account_check_disables_a_definitively_revoked_session(
     assert stored is not None and stored.authorized is False
     assert stored.status == AccountStatus.DISABLED
     assert stored.cooldown_reason == "account_dead"
+
+
+async def test_bulk_session_check_separates_revoked_sessions_from_other_issues(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        accounts = [
+            Account(
+                label="ready-session",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            ),
+            Account(
+                label="revoked-session",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            ),
+            Account(
+                label="broken-import",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            ),
+            Account(label="metadata-only", ownership_confirmed=True),
+        ]
+        session.add_all(accounts)
+        await session.commit()
+        account_ids = {account.label: int(account.id) for account in accounts}
+
+    async def fake_check(account_id: int, *, actor: str = "control-bot") -> AccountCheckResult:
+        del actor
+        if account_id == account_ids["broken-import"]:
+            raise AccountImportError("encrypted session cannot be read")
+        revoked = account_id == account_ids["revoked-session"]
+        return AccountCheckResult(
+            account_id=account_id,
+            authorized=not revoked,
+            telegram_user_id=None,
+            phone=None,
+            username=None,
+            error="session revoked" if revoked else None,
+            failure_code="account_dead" if revoked else None,
+        )
+
+    monkeypatch.setattr(service, "check_account", fake_check)
+
+    summary = await service.check_all_sessions()
+
+    assert [entry.label for entry in summary.entries] == [
+        "ready-session",
+        "revoked-session",
+        "broken-import",
+    ]
+    assert [entry.label for entry in summary.ready] == ["ready-session"]
+    assert [entry.label for entry in summary.session_revoked] == ["revoked-session"]
+    assert [entry.label for entry in summary.issues] == ["broken-import"]
+
+
+async def test_bulk_session_check_never_marks_unknown_authorization_for_deletion(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed proxy must not make an unverified bought session look revoked."""
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        account = Account(
+            label="network-unknown",
+            ownership_confirmed=True,
+            session_source=AccountSessionSource.SESSION_STRING,
+            authorized=False,
+        )
+        session.add(account)
+        await session.commit()
+
+    async def failed_route(account_id: int, *, actor: str = "control-bot") -> AccountCheckResult:
+        del actor
+        return AccountCheckResult(
+            account_id=account_id,
+            authorized=False,
+            telegram_user_id=None,
+            phone=None,
+            username=None,
+            error="proxy unavailable",
+            failure_code="proxy_unavailable",
+        )
+
+    monkeypatch.setattr(service, "check_account", failed_route)
+
+    summary = await service.check_all_sessions()
+
+    assert [entry.label for entry in summary.session_revoked] == []
+    assert [entry.label for entry in summary.issues] == ["network-unknown"]
+
+
+async def test_bulk_session_check_runs_a_bounded_parallel_batch(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        accounts = [
+            Account(
+                label=f"parallel-{index}",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            )
+            for index in range(6)
+        ]
+        session.add_all(accounts)
+        await session.commit()
+
+    active = 0
+    peak = 0
+
+    async def fake_check(account_id: int, *, actor: str = "control-bot") -> AccountCheckResult:
+        nonlocal active, peak
+        del actor
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return AccountCheckResult(
+            account_id=account_id,
+            authorized=True,
+            telegram_user_id=None,
+            phone=None,
+            username=None,
+            error=None,
+        )
+
+    monkeypatch.setattr(service, "check_account", fake_check)
+
+    summary = await service.check_all_sessions(concurrency=3)
+
+    assert [entry.label for entry in summary.entries] == [f"parallel-{index}" for index in range(6)]
+    assert peak == 3

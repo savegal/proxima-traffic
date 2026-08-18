@@ -7,6 +7,7 @@ from math import ceil
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from proxima_traffic.bot.ui import screen_title, section, themed_keyboard
 from proxima_traffic.failure_policy import failure_hint, failure_label
 from proxima_traffic.models import (
     Account,
@@ -23,12 +24,15 @@ from proxima_traffic.subscriber_invites import (
 
 def subscriber_invites_home_text() -> str:
     return (
-        "<b>👥 Приглашения в свой канал или группу</b>\n"
-        "<i>Отдельный инструмент для вашей базы подписчиков.</i>\n\n"
-        "<b>Как это работает</b>\n"
-        "1. Выберите базу и сегмент.\n"
-        "2. Укажите свою цель и аккаунты-администраторы.\n"
-        "3. Перед запуском сервис заново проверит права и доступность.\n\n"
+        screen_title(
+            "Приглашения в канал или группу",
+            "Отдельный инструмент для вашей базы подписчиков.",
+        )
+        + "\n\n"
+        f"{section('Как это работает')}\n"
+        "01 — Выберите базу и сегмент.\n"
+        "02 — Укажите свою цель и аккаунты-администраторы.\n"
+        "03 — Перед запуском сервис заново проверит права и доступность.\n\n"
         "Он приглашает только там, где Telegram разрешает это выбранному администратору. "
         "Приватность человека, стоп-лист и «не писать» всегда сильнее запуска.\n\n"
         "• не добавляет людей в контакты и не обходит ограничения;\n"
@@ -47,19 +51,24 @@ def subscriber_invites_home_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📝 Заготовки", callback_data="inv:campaigns:0"),
                 InlineKeyboardButton(text="📊 Запуски", callback_data="inv:launches:0"),
             ],
-            [InlineKeyboardButton(text="✉️ Личные сообщения", callback_data="dm:home")],
+            [InlineKeyboardButton(text="🚫 Стоп-лист приглашений", callback_data="inv:blacklist")],
+            [InlineKeyboardButton(text="✉️ Вернуться к личным сообщениям", callback_data="dm:home")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="inv:home")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home")],
         ]
     )
 
 
+def _invite_wizard_title(step: int) -> str:
+    return screen_title("Новое приглашение", f"Шаг {step} из 6")
+
+
 def invite_destination_prompt_text() -> str:
     return (
-        "<b>➕ Новое приглашение</b>\n\n"
+        _invite_wizard_title(1) + "\n\n"
         "Отправьте <b>@username</b> своего канала/супергруппы или публичную ссылку "
         "<code>https://t.me/name</code>.\n\n"
-        "Для закрытой цели укажи её invite-ссылку только если выбранные аккаунты уже "
+        "Для закрытой цели укажите invite-ссылку только если выбранные аккаунты уже "
         "являются администраторами. Перед запуском сервис всё равно проверит права."
     )
 
@@ -73,9 +82,10 @@ def invite_cancel_menu() -> InlineKeyboardMarkup:
 def invite_list_picker_text(total: int, page: int, page_size: int) -> str:
     pages = max(1, ceil(total / page_size))
     return (
-        "<b>📂 Выбери базу подписчиков</b>\n\n"
+        _invite_wizard_title(2) + "\n\n"
+        f"{section('Выберите базу подписчиков')}\n"
         f"Готовых баз: <b>{total:,}</b> · страница <b>{page + 1}/{pages}</b>\n\n"
-        "Используй только базу людей, которые согласились получать приглашения."
+        "Используйте только базу людей, которые согласились получать приглашения."
     )
 
 
@@ -115,7 +125,8 @@ def invite_list_picker(
 
 def invite_segment_text(item: SubscriberList) -> str:
     return (
-        f"<b>📂 {escape(item.name)}</b>\n\n"
+        _invite_wizard_title(3) + "\n\n"
+        f"База: <b>{escape(item.name)}</b>\n\n"
         "Выберите получателей приглашения. Стоп-лист, отписавшиеся, недавние и занятые "
         "другим запуском будут исключены автоматически.\n\n"
         f"👤 Все: <b>{item.member_count:,}</b>\n"
@@ -148,7 +159,8 @@ def invite_limit_prompt_text(segment: SubscriberSegment) -> str:
         SubscriberSegment.NON_PREMIUM: "обычным подписчикам",
     }[segment]
     return (
-        f"<b>🔢 Сколько пригласить {title}?</b>\n\n"
+        _invite_wizard_title(4) + "\n\n"
+        f"{section(f'Сколько пригласить {title}?')}\n"
         "Отправьте число от 1 до 1 000 000 либо слово <code>все</code>.\n"
         "Очередь будет сформирована только из доступных людей."
     )
@@ -156,7 +168,8 @@ def invite_limit_prompt_text(segment: SubscriberSegment) -> str:
 
 def invite_cooldown_text() -> str:
     return (
-        "<b>🛡 Защита от повторного приглашения</b>\n\n"
+        _invite_wizard_title(5) + "\n\n"
+        f"{section('Защита от повторного приглашения')}\n"
         "Сколько дней не пытаться пригласить этого человека повторно в любой из ваших "
         "каналов или групп? Рекомендуется 90 дней."
     )
@@ -181,7 +194,8 @@ def invite_cooldown_menu() -> InlineKeyboardMarkup:
 def invite_account_picker_text(selected_count: int, total: int, page: int, page_size: int) -> str:
     pages = max(1, ceil(total / page_size))
     return (
-        "<b>👤 Выберите аккаунты-администраторы</b>\n\n"
+        _invite_wizard_title(6) + "\n\n"
+        f"{section('Выберите аккаунты-администраторы')}\n"
         f"Выбрано: <b>{selected_count}</b> из <b>{total}</b>\n"
         f"Страница <b>{page + 1}/{pages}</b>\n\n"
         "До запуска каждый аккаунт проверяется на доступ и право приглашать в эту цель. "
@@ -238,7 +252,7 @@ def invite_campaign_text(view: SubscriberInviteCampaignView, *, confirm: bool = 
         else "Можно запустить после подтверждения согласия и прав на цель."
     )
     return (
-        f"<b>👥 {escape(campaign.name)}</b>\n\n"
+        screen_title(escape(campaign.name), "Проверьте параметры приглашения") + "\n\n"
         f"🎯 Цель: <code>{escape(campaign.destination_ref)}</code>\n"
         f"📂 База: <b>{escape(view.list_name)}</b>\n"
         f"👤 Сегмент: <b>{escape(campaign.segment.value)}</b>\n"
@@ -284,8 +298,8 @@ def invite_campaigns_text(
 ) -> str:
     pages = max(1, ceil(total / page_size))
     lines = [
-        "<b>📝 Заготовки приглашений</b>",
-        f"Всего: <b>{total:,}</b> · страница <b>{page + 1}/{pages}</b>\n",
+        screen_title("Заготовки приглашений", f"Всего: {total:,} · страница {page + 1}/{pages}"),
+        "",
     ]
     for view in items:
         lines.append(
@@ -370,11 +384,11 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
         if view.last_error:
             problem += f"\nТехнически: <code>{escape(view.last_error)}</code>"
     return (
-        f"<b>📊 Приглашение #{launch.id}</b>\n"
-        f"Статус: <b>{status}</b>\n\n"
+        screen_title(f"Приглашение #{launch.id}", f"Статус: {status}") + "\n\n"
         f"🎯 Цель: <code>{escape(launch.destination_ref_snapshot)}</code>\n"
         f"📂 База: <b>{escape(view.list_name)}</b>\n"
         f"📝 Заготовка: <b>{escape(view.campaign_name)}</b>\n\n"
+        f"{section('Результат')}\n"
         f"✅ Приглашено: <b>{view.invited:,}</b>\n"
         f"ℹ️ Уже участники: <b>{view.already_participant:,}</b>\n"
         f"⏳ В очереди: <b>{view.queued:,}</b> · выполняется: <b>{view.running:,}</b>\n"
@@ -388,8 +402,8 @@ def invite_launches_text(
 ) -> str:
     pages = max(1, ceil(total / page_size))
     lines = [
-        "<b>📊 Запуски приглашений</b>",
-        f"Всего: <b>{total:,}</b> · страница <b>{page + 1}/{pages}</b>\n",
+        screen_title("Запуски приглашений", f"Всего: {total:,} · страница {page + 1}/{pages}"),
+        "",
     ]
     for view in items:
         lines.append(
@@ -468,3 +482,12 @@ def invite_launch_cancel_menu(launch_id: int, page: int) -> InlineKeyboardMarkup
             ],
         ]
     )
+
+
+for _factory_name, _factory in tuple(globals().items()):
+    if (
+        not _factory_name.startswith("_")
+        and callable(_factory)
+        and _factory_name.endswith(("menu", "picker", "confirmation", "cancel"))
+    ):
+        globals()[_factory_name] = themed_keyboard(_factory)

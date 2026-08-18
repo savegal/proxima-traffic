@@ -4,7 +4,13 @@ import pytest
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Chat, Message
 
-from proxima_traffic.accounts import AccountArchiveEntry, AccountImportError
+from proxima_traffic.accounts import (
+    AccountArchiveEntry,
+    AccountBulkCheckEntry,
+    AccountBulkCheckSummary,
+    AccountCheckResult,
+    AccountImportError,
+)
 from proxima_traffic.bot.app import create_dispatcher
 from proxima_traffic.bot.channel_comment_ui import (
     channel_comment_account_picker,
@@ -14,6 +20,7 @@ from proxima_traffic.bot.channel_comment_ui import (
     channel_comment_mode_menu,
     channel_comment_reactions_menu,
     channel_comment_reactions_text,
+    channel_comment_runs_text,
     channel_comments_text,
 )
 from proxima_traffic.bot.direct_message_ui import (
@@ -21,6 +28,8 @@ from proxima_traffic.bot.direct_message_ui import (
     direct_account_picker_text,
     direct_blacklist_menu,
     direct_cooldown_menu,
+    direct_launch_details_menu,
+    direct_launch_details_text,
     direct_list_picker,
     direct_list_picker_text,
     direct_messages_home_menu,
@@ -33,12 +42,14 @@ from proxima_traffic.bot.handlers import (
     AccountArchiveImportResult,
     AccountArchiveWarning,
     _account_archive_result_text,
+    _campaign_reaction_step_count,
     _delete_sensitive_import_message,
     _import_account_archive_message,
 )
 from proxima_traffic.bot.keyboards import (
     account_avatar_delete_confirmation,
     account_avatar_menu,
+    account_bulk_check_menu,
     account_details_menu,
     account_generated_names_confirmation,
     account_import_sources_menu,
@@ -84,6 +95,7 @@ from proxima_traffic.bot.keyboards import (
     order_launch_confirmation,
     order_sender_picker,
     order_spread_presets,
+    order_target_list_activation_menu,
     order_target_list_picker,
     order_target_picker,
     order_type_menu,
@@ -113,6 +125,7 @@ from proxima_traffic.bot.participant_reaction_ui import (
 )
 from proxima_traffic.bot.renderers import (
     account_avatar_text,
+    account_bulk_check_text,
     account_details_text,
     account_generated_names_preview_text,
     account_name_catalog_text,
@@ -120,6 +133,7 @@ from proxima_traffic.bot.renderers import (
     bad_targets_text,
     campaign_confirmation_text,
     campaign_details_text,
+    campaign_launch_not_ready_text,
     campaign_reactions_text,
     campaign_run_confirmation_text,
     campaign_variant_text,
@@ -154,11 +168,11 @@ from proxima_traffic.bot.subscriber_invite_ui import (
     subscriber_invites_home_menu,
     subscriber_invites_home_text,
 )
-from proxima_traffic.channel_comments import ChannelCommentRuleView
+from proxima_traffic.channel_comments import ChannelCommentReactionSummary, ChannelCommentRuleView
 from proxima_traffic.config import Settings
 from proxima_traffic.content import BroadcastContentVariant, StoredContact, StoredMedia
 from proxima_traffic.dialogues import DialogueStep, serialize_dialogue_steps
-from proxima_traffic.direct_messages import DirectMessageDashboard
+from proxima_traffic.direct_messages import DirectLaunchView, DirectMessageDashboard
 from proxima_traffic.models import (
     Account,
     AccountSessionSource,
@@ -172,6 +186,11 @@ from proxima_traffic.models import (
     CampaignRun,
     ChannelCommentMode,
     ChannelCommentRule,
+    ChannelCommentRun,
+    ChannelCommentRunStatus,
+    DirectLaunch,
+    DirectLaunchStatus,
+    DirectMessageTaskStatus,
     MessageTemplate,
     ParticipantReactionRule,
     ProxyEndpoint,
@@ -181,9 +200,11 @@ from proxima_traffic.models import (
     RunStep,
     SubscriberList,
     SubscriberListStatus,
+    SubscriberSegment,
     Target,
 )
 from proxima_traffic.participant_reactions import ParticipantReactionRuleView
+from proxima_traffic.preflight import CampaignPreflightSummary
 from proxima_traffic.proxies import ProxyPage, ProxyView
 from proxima_traffic.worker_supervision import WorkerHealthSnapshot
 
@@ -211,6 +232,12 @@ def test_direct_message_section_is_reachable_and_callbacks_fit_telegram_limit() 
             main_menu(),
             direct_messages_home_menu(),
             direct_blacklist_menu(),
+            subscriber_invites_home_menu(),
+            direct_blacklist_menu(
+                add_callback="inv:blacklist:add",
+                back_callback="inv:home",
+                back_text="⬅️ К приглашениям",
+            ),
             direct_cooldown_menu(),
         )
         for row in menu.inline_keyboard
@@ -221,6 +248,8 @@ def test_direct_message_section_is_reachable_and_callbacks_fit_telegram_limit() 
     assert "dm:home" in callbacks
     assert "dm:new" in callbacks
     assert "dm:blacklist:add" in callbacks
+    assert "inv:blacklist" in callbacks
+    assert "inv:blacklist:add" in callbacks
     assert "dm:new:cooldown:30" in callbacks
     assert all(len(value.encode("utf-8")) <= 64 for value in callbacks)
 
@@ -367,6 +396,8 @@ async def test_account_archive_import_continues_after_one_broken_account() -> No
     shared_route = object()
 
     class ArchiveAccountService:
+        grouped_account_ids: list[list[int]] = []
+
         @staticmethod
         def read_account_archive(payload: bytes):
             assert payload == b"archive"
@@ -380,6 +411,10 @@ async def test_account_archive_import_continues_after_one_broken_account() -> No
             if entry.source_name == "broken":
                 raise AccountImportError("damaged session")
             return Account(id=101, label="Imported", ownership_confirmed=True)
+
+        async def create_archive_import_group(self, account_ids):
+            self.grouped_account_ids.append(account_ids)
+            return type("Group", (), {"name": "ZIP-импорт · #101"})()
 
     class ArchiveProxyService:
         allocated: list[str] = []
@@ -400,10 +435,11 @@ async def test_account_archive_import_continues_after_one_broken_account() -> No
             self.released.append(key)
 
     proxy_service = ArchiveProxyService()
+    account_service = ArchiveAccountService()
     result = await _import_account_archive_message(  # type: ignore[arg-type]
         ArchiveMessage(),
         ArchiveBot(),
-        ArchiveAccountService(),
+        account_service,
         proxy_service,
         Settings(account_require_proxy=True),
         origin_data={},
@@ -416,6 +452,24 @@ async def test_account_archive_import_continues_after_one_broken_account() -> No
     assert len(proxy_service.allocated) == 2
     assert proxy_service.moved[0][1] == "account:101"
     assert len(proxy_service.released) == 1
+    assert account_service.grouped_account_ids == [[101]]
+    assert result.group_name == "ZIP-импорт · #101"
+
+
+def test_account_archive_report_keeps_imported_accounts_when_group_creation_failed() -> None:
+    result = AccountArchiveImportResult(
+        total=1,
+        imported=(Account(id=101, label="Imported", ownership_confirmed=True),),
+        failures=(),
+        warnings=(),
+        group_error="database is locked",
+    )
+
+    text = _account_archive_result_text(result)
+
+    assert "Группа импорта не создана" in text
+    assert "Аккаунты сохранены" in text
+    assert "Imported" in text
 
 
 def test_account_archive_report_stays_within_telegram_message_limit() -> None:
@@ -505,7 +559,9 @@ def test_channel_comment_card_has_check_and_account_replacement_actions() -> Non
 
     assert "comments:check:91:2" in callbacks
     assert "comments:account:replace:91:2" in callbacks
+    assert "comments:autoreplace:91:2" in callbacks
     assert "comments:mentions:cooldown:91:2" in callbacks
+    assert "Автозамена первого аккаунта: <b>выключена</b>" in details
     assert "Проверка Telegram" in details
     assert "ещё не было" in details
 
@@ -552,6 +608,75 @@ def test_broadcast_card_exposes_per_chat_mention_rotation() -> None:
     }
     assert "campaign:mentions:days:93:2:30" in cooldown_callbacks
     assert "campaign:mentions:custom:93:2" in cooldown_callbacks
+
+
+def test_broadcast_reactions_do_not_require_a_dialogue_reply_account() -> None:
+    campaign = Campaign(
+        id=94,
+        name="Broadcast reactions",
+        mode=CampaignMode.BROADCAST,
+        primary_account_id=7,
+        target_id=4,
+        primary_text="Post",
+        reply_text="",
+        reply_account_id=None,
+    )
+
+    assert _campaign_reaction_step_count(campaign) == 1
+
+
+def test_channel_comment_report_links_to_the_post_and_latest_comment() -> None:
+    delivered = ChannelCommentRun(
+        id=94,
+        rule_id=7,
+        source_post_id=515,
+        status=ChannelCommentRunStatus.SUCCEEDED,
+        sent_steps=2,
+        last_comment_message_id=84_003,
+        attempt_count=0,
+        hidden_mentions_enabled_snapshot=True,
+        hidden_mention_resolved_count=6,
+    )
+    pending = ChannelCommentRun(
+        id=95,
+        rule_id=7,
+        source_post_id=516,
+        status=ChannelCommentRunStatus.QUEUED,
+        attempt_count=0,
+    )
+
+    text = channel_comment_runs_text(
+        [delivered, pending],
+        channel_ref="@proxima_channel",
+        reaction_summaries={
+            94: ChannelCommentReactionSummary(succeeded=1),
+            95: ChannelCommentReactionSummary(queued=1, cancelled=1),
+        },
+    )
+
+    assert 'href="https://t.me/proxima_channel/515"' in text
+    assert 'href="https://t.me/proxima_channel/515?comment=84003"' in text
+    assert 'href="https://t.me/proxima_channel/516"' in text
+    assert "Открыть последний комментарий" in text
+    assert "Отметки: добавлено <b>6</b>" in text
+    assert "Реакции: готово: <b>1</b>" in text
+    assert "Реакции: ожидают: <b>1</b> · отменено: <b>1</b>" in text
+
+
+def test_channel_comment_report_hides_legacy_album_diagnostic() -> None:
+    album_item = ChannelCommentRun(
+        id=96,
+        rule_id=7,
+        source_post_id=517,
+        status=ChannelCommentRunStatus.SKIPPED,
+        error_code="album_duplicate",
+        error="??????? ?????-??????? ?????????? ????? ????? ????????????",
+    )
+
+    text = channel_comment_runs_text([album_item], channel_ref="@proxima_channel")
+
+    assert "элемент альбома обработан общим комментарием" in text
+    assert "????" not in text
 
 
 def test_message_edit_comment_card_and_mode_picker_show_both_texts() -> None:
@@ -642,6 +767,8 @@ def test_participant_reaction_card_is_clear_and_hides_empty_error() -> None:
     overview = participant_reactions_text([view], 1)
 
     assert "примерно 1 из 10 новых сообщений" in details
+    assert "Только эти аккаунты" in details
+    assert "строго из выбранного набора" in overview
     assert "Последняя ошибка" not in details
     assert "Авто-реакции в чатах" in overview
 
@@ -892,8 +1019,18 @@ def test_inline_callback_contracts_fit_telegram_limit() -> None:
         ),
         order_sender_picker([account], {account.id}),
         order_audience_source_menu(standalone_count=1, list_count=1),
+        order_audience_source_menu(standalone_count=0, list_count=0),
         order_target_picker(Page([target], 0, 7, 1)),
         order_target_list_picker(Page([target_list], 0, 7, 1)),
+        order_target_list_picker(
+            Page(
+                [TargetListView(id=334, name="Disabled list", item_count=1, approved_count=0)],
+                0,
+                7,
+                1,
+            )
+        ),
+        order_target_list_activation_menu(target_list.id),
         order_audience_search_menu("chats", [("Owned", f"order:audience:target:{target.id}")]),
         accounts_menu(Page([account], 0, 7, 1)),
         account_details_menu(account, 0, has_proxy=True),
@@ -987,6 +1124,22 @@ def test_inline_callback_contracts_fit_telegram_limit() -> None:
     ]
     assert all(not label.startswith("‹ ") for label in button_labels)
     assert not ({"Отмена", "Отменить", "Назад", "Обновить"} & set(button_labels))
+
+
+def test_order_audience_always_offers_safe_list_creation() -> None:
+    markup = order_audience_source_menu(standalone_count=0, list_count=0)
+    callbacks = {
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+    assert "order:audience:create-list" in callbacks
+    assert "order:back" in callbacks
+
+    activation = order_target_list_activation_menu(123)
+    assert activation.inline_keyboard[0][0].callback_data == "order:audience:list:activate:123"
 
 
 def test_bad_target_card_explains_rating_and_manual_restore() -> None:
@@ -1438,9 +1591,21 @@ def test_account_profile_card_shows_telegram_name_and_avatar() -> None:
         day_window_start=datetime.now(UTC),
     )
 
+    proxy = ProxyEndpoint(
+        id=17,
+        label="Account route",
+        protocol=ProxyProtocol.SOCKS5,
+        host="proxy.example",
+        port=1080,
+        fingerprint="f" * 64,
+        status=ProxyStatus.HEALTHY,
+        latency_ms=51,
+        last_checked_at=datetime.now(UTC),
+    )
     details = account_details_text(
         account,
         proxy_slot="socks5://proxy.example:1080",
+        proxy_view=ProxyView(proxy, None),
         daily_limit=200,
     )
     avatar = account_avatar_text(account)
@@ -1449,6 +1614,8 @@ def test_account_profile_card_shows_telegram_name_and_avatar() -> None:
     assert "Аватар Telegram: <b>установлен</b>" in details
     assert "За 24 часа: <b>143/200</b>" in details
     assert "осталось <b>57</b>" in details
+    assert "🟢 рабочий" in details
+    assert "Прокси проверен:" in details
     assert "Текущий аватар: <b>🟢 установлен</b>" in avatar
     callbacks = {
         button.callback_data
@@ -1460,6 +1627,52 @@ def test_account_profile_card_shows_telegram_name_and_avatar() -> None:
         "account:name:edit:7:0",
         "account:avatar:menu:7:0",
     } <= callbacks
+
+
+def test_bulk_account_session_check_ui_offers_delete_only_for_revoked_sessions() -> None:
+    ready = AccountBulkCheckEntry(
+        account_id=7,
+        label="ready-account",
+        result=AccountCheckResult(7, True, None, None, None, None),
+    )
+    revoked = AccountBulkCheckEntry(
+        account_id=8,
+        label="revoked-account",
+        result=AccountCheckResult(8, False, None, None, None, "session revoked", "account_dead"),
+        error="session revoked",
+    )
+    unavailable = AccountBulkCheckEntry(
+        account_id=9,
+        label="network-account",
+        result=AccountCheckResult(9, True, None, None, None, "network timeout"),
+        error="network timeout",
+    )
+    summary = AccountBulkCheckSummary((ready, revoked, unavailable))
+    account = Account(
+        id=7,
+        label="ready-account",
+        ownership_confirmed=True,
+        status=AccountStatus.ACTIVE,
+    )
+    callbacks = {
+        button.callback_data
+        for row in accounts_menu(Page([account], 0, 7, 1)).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    result_callbacks = {
+        button.callback_data
+        for row in account_bulk_check_menu([(8, "revoked-account")], page=2).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    text = account_bulk_check_text(summary)
+
+    assert "account:check:all:0" in callbacks
+    assert "account:delete:ask:8:2" in result_callbacks
+    assert "account:delete:ask:9:2" not in result_callbacks
+    assert "Сессия недействительна: <b>1</b>" in text
+    assert "Не удалять автоматически" in text
 
 
 def test_account_name_catalog_ui_has_preview_bulk_action_and_real_change_warning() -> None:
@@ -1686,6 +1899,93 @@ def test_campaign_run_confirmation_text_matches_mode() -> None:
     assert "💬 диалог" in dialogue_text
     assert "90 сек." in dialogue_text
     assert "окно отправки" not in dialogue_text
+    assert "автоматически проверит доступ" in broadcast_text
+
+
+def test_campaign_launch_not_ready_text_explains_result_without_technical_guard() -> None:
+    checked_at = datetime(2026, 8, 13, 11, 30, tzinfo=UTC)
+    text = campaign_launch_not_ready_text(
+        CampaignPreflightSummary(
+            campaign_id=1,
+            account_count=2,
+            target_count=1,
+            checked_pairs=2,
+            ready_pairs=0,
+            member_targets=0,
+            joinable_targets=0,
+            blocked_targets=1,
+            unavailable_targets=0,
+            oldest_checked_at=checked_at,
+            newest_checked_at=checked_at,
+        )
+    )
+    buttons = [
+        button.text for row in campaign_run_confirmation(1, 0).inline_keyboard for button in row
+    ]
+
+    assert "Отправка пока не началась" in text
+    assert "Проверка перед запуском выполнена автоматически" in text
+    assert "LIVE-запуском" not in text
+    assert any("Проверить и поставить в очередь" in button for button in buttons)
+
+
+def test_direct_launch_screen_treats_pacing_as_normal_and_surfaces_proxy_action() -> None:
+    launch = DirectLaunch(
+        id=31,
+        campaign_id=7,
+        subscriber_list_id=8,
+        status=DirectLaunchStatus.RUNNING,
+        segment_snapshot=SubscriberSegment.ALL,
+        recipient_limit_snapshot=20,
+        contact_cooldown_days_snapshot=30,
+        account_ids_snapshot_json="[29]",
+        primary_text_snapshot="Hello",
+        consent_confirmed_at=datetime(2026, 8, 13, tzinfo=UTC),
+        total_tasks=20,
+        excluded_recent=4,
+        excluded_reserved=1,
+    )
+    pacing_view = DirectLaunchView(
+        launch=launch,
+        campaign_name="join accounts all · ЛС",
+        list_name="join accounts all",
+        queued=20,
+        running=0,
+        succeeded=0,
+        failed=0,
+        skipped=0,
+        cancelled=0,
+        last_error_code="account_pacing",
+        last_error_status=DirectMessageTaskStatus.QUEUED,
+    )
+    proxy_view = DirectLaunchView(
+        launch=launch,
+        campaign_name="join accounts all · ЛС",
+        list_name="join accounts all",
+        queued=0,
+        running=0,
+        succeeded=0,
+        failed=20,
+        skipped=0,
+        cancelled=0,
+        last_error_code="proxy_unavailable",
+        last_error_status=DirectMessageTaskStatus.FAILED,
+        last_error_account_label="Doris Cunningham",
+    )
+
+    pacing_text = direct_launch_details_text(pacing_view)
+    proxy_callbacks = {
+        button.callback_data
+        for row in direct_launch_details_menu(proxy_view, 0).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+    assert "штатная пауза" in pacing_text
+    assert "Последняя ситуация" not in pacing_text
+    assert "Технически:" not in pacing_text
+    assert "При старте не включены" in pacing_text
+    assert "menu:proxies:0" in proxy_callbacks
 
 
 def test_smart_dialogue_has_complete_schedule_controls() -> None:
@@ -2218,4 +2518,84 @@ def test_large_launch_report_keeps_summary_and_respects_telegram_limit() -> None
     assert len(report) <= 4096
     assert "Статус:" in report
     assert "<b>Итог</b>" in report
-    assert "Часть подробностей скрыта из-за лимита Telegram" in report
+    assert "Часть подробностей скрыта из‑за лимита Telegram" in report
+
+
+def test_smart_launch_report_normalizes_legacy_naive_schedule_values() -> None:
+    now = datetime(2026, 7, 10, 10, 0, tzinfo=UTC)
+    launch = LaunchView(
+        anchor_run_id=2,
+        campaign_id=9,
+        campaign_name="Legacy time zone values",
+        mode=CampaignMode.BROADCAST,
+        total=2,
+        queued=2,
+        running=0,
+        succeeded=0,
+        failed=0,
+        cancelled=0,
+        created_at=now,
+        first_scheduled_for=now,
+        last_scheduled_for=now + timedelta(minutes=5),
+        smart_timer_mode=True,
+        next_scheduled_for=now,
+        target_count=1,
+    )
+    runs = [
+        CampaignRun(
+            id=1,
+            campaign_id=9,
+            target_id=1,
+            request_key="legacy-naive",
+            status=RunStatus.QUEUED,
+            next_step=RunStep.PRIMARY,
+            attempt_count=0,
+            max_attempts=5,
+            cycle_index=0,
+            created_at=now,
+            scheduled_for=now.replace(tzinfo=None),
+        ),
+        CampaignRun(
+            id=2,
+            campaign_id=9,
+            target_id=1,
+            request_key="utc-aware",
+            status=RunStatus.QUEUED,
+            next_step=RunStep.PRIMARY,
+            attempt_count=0,
+            max_attempts=5,
+            cycle_index=0,
+            created_at=now,
+            scheduled_for=now + timedelta(minutes=5),
+        ),
+    ]
+
+    report = launch_details_text(
+        runs=runs,
+        launch=launch,
+        targets={1: Target(id=1, chat_ref="@chat", title="Legacy target")},
+    )
+
+    assert "Legacy time zone values" in report
+
+
+def test_keyboard_theme_uses_one_navigation_language_across_modules() -> None:
+    main_labels = [button.text for row in main_menu().inline_keyboard for button in row]
+    direct_labels = [
+        button.text for row in direct_messages_home_menu().inline_keyboard for button in row
+    ]
+    invite_labels = [
+        button.text for row in subscriber_invites_home_menu().inline_keyboard for button in row
+    ]
+
+    assert "↻ Обновить данные" in main_labels
+    assert "🎯 Чаты и списки" in main_labels
+    assert "⌂ На главную" in direct_labels
+    assert "⌂ На главную" in invite_labels
+    assert cancel_menu().inline_keyboard[0][0].text == "✕ Отменить ввод"
+    assert direct_blacklist_menu().inline_keyboard[-1][0].text == "← К личным сообщениям"
+    invite_blacklist = direct_blacklist_menu(
+        add_callback="inv:blacklist:add",
+        back_callback="inv:home",
+    )
+    assert invite_blacklist.inline_keyboard[0][0].callback_data == "inv:blacklist:add"

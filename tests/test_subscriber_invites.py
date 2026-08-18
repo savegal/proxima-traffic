@@ -236,7 +236,7 @@ async def test_subscriber_invite_never_retries_an_uncertain_telegram_outcome(
         destination_ref="@owned_channel",
         segment=SubscriberSegment.ALL,
         recipient_limit=1,
-        contact_cooldown_days=30,
+        contact_cooldown_days=0,
         account_ids=[int(account.id)],
     )
     await service.launch_campaign(int(campaign.id), consent_confirmed=True)
@@ -246,6 +246,8 @@ async def test_subscriber_invite_never_retries_an_uncertain_telegram_outcome(
     assert result.status == DirectMessageTaskStatus.FAILED
     assert result.error_code == "invite_delivery_unconfirmed"
     assert await service.process_next() is None
+    with pytest.raises(ConflictError, match="нет доступных"):
+        await service.launch_campaign(int(campaign.id), consent_confirmed=True)
     await database.dispose()
 
 
@@ -301,6 +303,121 @@ async def test_subscriber_invite_marks_expired_started_request_as_unknown(
         assert subscriber.last_invite_attempt_at is not None
     view = await service.get_launch_view(int(launch.id))
     assert view.launch.status == DirectLaunchStatus.FAILED
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_invite_launch_keeps_running_recipient_reserved(tmp_path: Path) -> None:
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-cancel-reservation.db", DryRunGateway(), records=2
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Invite cancel reservation",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=2,
+        contact_cooldown_days=30,
+        account_ids=[int(account.id)],
+    )
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    running_task = await service._claim_next()
+
+    assert running_task is not None
+    assert await service.cancel_launch(int(launch.id)) == 1
+
+    async with database.session_factory() as session:
+        tasks = list(
+            await session.scalars(
+                select(SubscriberInviteTask)
+                .where(SubscriberInviteTask.launch_id == launch.id)
+                .order_by(SubscriberInviteTask.id)
+            )
+        )
+        active = next(task for task in tasks if task.id == running_task.id)
+        cancelled = next(task for task in tasks if task.id != running_task.id)
+        active_subscriber = await session.get(Subscriber, active.subscriber_id)
+        cancelled_subscriber = await session.get(Subscriber, cancelled.subscriber_id)
+
+    assert active.status == DirectMessageTaskStatus.RUNNING
+    assert active_subscriber is not None
+    assert active_subscriber.reserved_invite_launch_id == launch.id
+    assert cancelled.status == DirectMessageTaskStatus.CANCELLED
+    assert cancelled_subscriber is not None
+    assert cancelled_subscriber.reserved_invite_launch_id is None
+
+    async with database.session_factory() as session:
+        expired = await session.get(SubscriberInviteTask, running_task.id)
+        assert expired is not None
+        expired.lease_until = utc_now() - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.process_next() is None
+    async with database.session_factory() as session:
+        recovered = await session.get(SubscriberInviteTask, running_task.id)
+        recovered_subscriber = await session.get(Subscriber, running_task.subscriber_id)
+    assert recovered is not None
+    assert recovered.status == DirectMessageTaskStatus.CANCELLED
+    assert recovered.error_code == "invite_launch_cancelled"
+    assert recovered_subscriber is not None
+    assert recovered_subscriber.reserved_invite_launch_id is None
+    recovered_launch = await service.get_launch_view(int(launch.id))
+    assert recovered_launch.launch.status == DirectLaunchStatus.CANCELLED
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_global_stop_list_cancels_queued_subscriber_invites(tmp_path: Path) -> None:
+    gateway = DryRunGateway()
+    settings = _settings(tmp_path, "invite-stop-list.db")
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-stop-list.db", gateway, records=1
+    )
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    direct_messages = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct-stop-list",
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Invite global stop list",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=30,
+        account_ids=[int(account.id)],
+    )
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+
+    result = await direct_messages.add_blacklist_entries([700_001])
+    await service.refresh_launches(result.affected_invite_launch_ids)
+
+    assert result.cancelled_tasks == 1
+    assert result.cancelled_invite_tasks == 1
+    assert result.affected_invite_launch_ids == (int(launch.id),)
+    view = await service.get_launch_view(int(launch.id))
+    assert view.launch.status == DirectLaunchStatus.FAILED
+    assert view.skipped == 1
+    async with database.session_factory() as session:
+        task = await session.scalar(select(SubscriberInviteTask))
+        subscriber = await session.scalar(select(Subscriber))
+    assert task is not None
+    assert task.status == DirectMessageTaskStatus.SKIPPED
+    assert subscriber is not None
+    assert subscriber.reserved_invite_launch_id is None
     await database.dispose()
 
 

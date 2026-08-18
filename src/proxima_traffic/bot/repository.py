@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from enum import StrEnum
 
-from sqlalchemy import String, case, cast, delete, func, or_, select, update
+from sqlalchemy import String, and_, case, cast, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from proxima_traffic.account_groups import (
+    PREMIUM_ACCOUNT_GROUP_KEY,
+    PREMIUM_ACCOUNT_GROUP_NAME,
+    sync_premium_account_group,
+)
 from proxima_traffic.content import (
     MAX_ALBUM_ITEMS,
     MAX_CONTENT_VARIANTS,
@@ -28,6 +34,8 @@ from proxima_traffic.dialogues import (
 )
 from proxima_traffic.models import (
     Account,
+    AccountGroup,
+    AccountGroupMember,
     AccountSessionSource,
     AccountStatus,
     ActionLog,
@@ -38,13 +46,23 @@ from proxima_traffic.models import (
     CampaignAccount,
     CampaignMode,
     CampaignRun,
+    ChannelCommentRun,
+    ChannelCommentRunStatus,
+    DirectLaunch,
+    DirectLaunchStatus,
+    DirectMessageTask,
+    DirectMessageTaskStatus,
     MessageTemplate,
+    ParticipantReactionTask,
+    ParticipantReactionTaskStatus,
     ProxyAssignment,
     ProxyEndpoint,
     ProxyStatus,
     ReactionTask,
     ReactionTaskStatus,
     RunStatus,
+    SubscriberInviteLaunch,
+    SubscriberInviteTask,
     Target,
     TargetAccountState,
     TargetList,
@@ -91,6 +109,18 @@ class DashboardStats:
     audience_member_count: int = 0
     audience_enabled_count: int = 0
     bad_targets: int = 0
+    direct_active_launches: int = 0
+    direct_queued_tasks: int = 0
+    direct_running_tasks: int = 0
+    subscriber_invite_active_launches: int = 0
+    subscriber_invite_queued_tasks: int = 0
+    subscriber_invite_running_tasks: int = 0
+    campaign_reaction_queued_tasks: int = 0
+    campaign_reaction_running_tasks: int = 0
+    channel_comment_queued_runs: int = 0
+    channel_comment_running_runs: int = 0
+    participant_reaction_queued_tasks: int = 0
+    participant_reaction_running_tasks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +133,35 @@ class Page[T]:
     @property
     def pages(self) -> int:
         return max(1, (self.total + self.page_size - 1) // self.page_size)
+
+
+class AccountListFilter(StrEnum):
+    """Operator-facing account filters backed by SQL, not by a loaded page."""
+
+    ALL = "all"
+    PREMIUM = "premium"
+    ORDINARY = "ordinary"
+    UNKNOWN = "unknown"
+    READY = "ready"
+    NEEDS_ATTENTION = "needs_attention"
+    PROFILE_INCOMPLETE = "profile_incomplete"
+    PAUSED = "paused"
+    NO_SESSION = "no_session"
+
+
+@dataclass(frozen=True, slots=True)
+class AccountGroupView:
+    id: int
+    name: str
+    description: str
+    account_count: int
+    ready_count: int
+    premium_count: int
+    system_key: str | None = None
+
+    @property
+    def is_system(self) -> bool:
+        return self.system_key is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,16 +458,442 @@ class AdminRepository:
                     Target,
                     Target.quality_status == TARGET_QUALITY_BAD,
                 ),
+                direct_active_launches=await self._count(
+                    session,
+                    DirectLaunch,
+                    DirectLaunch.status.in_(
+                        [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                    ),
+                ),
+                direct_queued_tasks=await self._count(
+                    session,
+                    DirectMessageTask,
+                    DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                ),
+                direct_running_tasks=await self._count(
+                    session,
+                    DirectMessageTask,
+                    DirectMessageTask.status == DirectMessageTaskStatus.RUNNING,
+                ),
+                subscriber_invite_active_launches=await self._count(
+                    session,
+                    SubscriberInviteLaunch,
+                    SubscriberInviteLaunch.status.in_(
+                        [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                    ),
+                ),
+                subscriber_invite_queued_tasks=await self._count(
+                    session,
+                    SubscriberInviteTask,
+                    SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                ),
+                subscriber_invite_running_tasks=await self._count(
+                    session,
+                    SubscriberInviteTask,
+                    SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
+                ),
+                campaign_reaction_queued_tasks=await self._count(
+                    session,
+                    ReactionTask,
+                    ReactionTask.status == ReactionTaskStatus.QUEUED,
+                ),
+                campaign_reaction_running_tasks=await self._count(
+                    session,
+                    ReactionTask,
+                    ReactionTask.status == ReactionTaskStatus.RUNNING,
+                ),
+                channel_comment_queued_runs=await self._count(
+                    session,
+                    ChannelCommentRun,
+                    ChannelCommentRun.status == ChannelCommentRunStatus.QUEUED,
+                ),
+                channel_comment_running_runs=await self._count(
+                    session,
+                    ChannelCommentRun,
+                    ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
+                ),
+                participant_reaction_queued_tasks=await self._count(
+                    session,
+                    ParticipantReactionTask,
+                    ParticipantReactionTask.status == ParticipantReactionTaskStatus.QUEUED,
+                ),
+                participant_reaction_running_tasks=await self._count(
+                    session,
+                    ParticipantReactionTask,
+                    ParticipantReactionTask.status == ParticipantReactionTaskStatus.RUNNING,
+                ),
             )
 
-    async def list_accounts(self, page: int, page_size: int) -> Page[Account]:
-        return await self._page(
-            Account,
-            page,
-            page_size,
-            Account.id,
-            descending=True,
+    async def list_accounts(
+        self,
+        page: int,
+        page_size: int,
+        *,
+        account_filter: AccountListFilter | str = AccountListFilter.ALL,
+        group_id: int | None = None,
+    ) -> Page[Account]:
+        """Return a stable page after applying every filter in the database.
+
+        ``group_id=0`` intentionally means accounts without any custom group;
+        ``None`` means do not constrain the list by group.
+        """
+        conditions = self._account_list_conditions(account_filter, group_id=group_id)
+        normalized_page_size = max(1, page_size)
+        async with self._session_factory() as session:
+            total = int(
+                await session.scalar(select(func.count()).select_from(Account).where(*conditions))
+                or 0
+            )
+            pages = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+            normalized_page = min(max(page, 0), pages - 1)
+            items = list(
+                await session.scalars(
+                    select(Account)
+                    .where(*conditions)
+                    .order_by(Account.id.desc())
+                    .offset(normalized_page * normalized_page_size)
+                    .limit(normalized_page_size)
+                )
+            )
+            return Page(
+                items=items,
+                page=normalized_page,
+                page_size=normalized_page_size,
+                total=total,
+            )
+
+    async def create_account_group(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        actor: str = "control-bot",
+    ) -> AccountGroup:
+        normalized_name = self._normalize_account_group_name(name)
+        if normalized_name == PREMIUM_ACCOUNT_GROUP_NAME:
+            raise ValueError("название «⭐ Premium» зарезервировано для системного раздела")
+        normalized_description = self._normalize_account_group_description(description)
+        async with self._session_factory() as session:
+            group = AccountGroup(name=normalized_name, description=normalized_description)
+            session.add(group)
+            await self._flush_or_conflict(session, "группа аккаунтов с таким названием уже есть")
+            add_audit_event(
+                session,
+                event_type="account_group.created",
+                entity_type="account_group",
+                entity_id=group.id,
+                details={"name": group.name},
+                actor=actor,
+            )
+            await session.commit()
+            await session.refresh(group)
+            return group
+
+    async def get_account_group(self, group_id: int) -> AccountGroup:
+        async with self._session_factory() as session:
+            group = await session.get(AccountGroup, group_id)
+            if group is None:
+                raise NotFoundError("группа аккаунтов не найдена")
+            return group
+
+    async def list_account_group_views(self) -> list[AccountGroupView]:
+        """List custom groups with live membership/readiness counters in one query."""
+        ready_condition = and_(*self._account_ready_conditions())
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(
+                    AccountGroup.id,
+                    AccountGroup.name,
+                    AccountGroup.description,
+                    AccountGroup.system_key,
+                    func.count(AccountGroupMember.account_id).label("account_count"),
+                    func.coalesce(
+                        func.sum(case((ready_condition, 1), else_=0)),
+                        0,
+                    ).label("ready_count"),
+                    func.coalesce(
+                        func.sum(case((Account.is_premium.is_(True), 1), else_=0)),
+                        0,
+                    ).label("premium_count"),
+                )
+                .outerjoin(AccountGroupMember, AccountGroupMember.group_id == AccountGroup.id)
+                .outerjoin(Account, Account.id == AccountGroupMember.account_id)
+                .group_by(
+                    AccountGroup.id,
+                    AccountGroup.name,
+                    AccountGroup.description,
+                    AccountGroup.system_key,
+                )
+                .order_by(
+                    case((AccountGroup.system_key == PREMIUM_ACCOUNT_GROUP_KEY, 0), else_=1),
+                    func.lower(AccountGroup.name),
+                    AccountGroup.id,
+                )
+            )
+            return [
+                AccountGroupView(
+                    id=int(row.id),
+                    name=str(row.name),
+                    description=str(row.description or ""),
+                    account_count=int(row.account_count or 0),
+                    ready_count=int(row.ready_count or 0),
+                    premium_count=int(row.premium_count or 0),
+                    system_key=str(row.system_key) if row.system_key else None,
+                )
+                for row in rows
+            ]
+
+    async def ensure_system_account_groups(self, *, actor: str = "system") -> AccountGroup:
+        """Create and reconcile the automatic Telegram Premium section."""
+
+        async with self._session_factory() as session:
+            group = await sync_premium_account_group(session, actor=actor)
+            await session.commit()
+            await session.refresh(group)
+            return group
+
+    async def update_account_group(
+        self,
+        group_id: int,
+        *,
+        name: str,
+        description: str,
+        actor: str = "control-bot",
+    ) -> AccountGroup:
+        normalized_name = self._normalize_account_group_name(name)
+        normalized_description = self._normalize_account_group_description(description)
+        async with self._session_factory() as session:
+            group = await session.get(AccountGroup, group_id)
+            if group is None:
+                raise NotFoundError("группа аккаунтов не найдена")
+            self._require_operator_group(group)
+            group.name = normalized_name
+            group.description = normalized_description
+            await self._flush_or_conflict(session, "группа аккаунтов с таким названием уже есть")
+            add_audit_event(
+                session,
+                event_type="account_group.updated",
+                entity_type="account_group",
+                entity_id=group_id,
+                details={"name": group.name},
+                actor=actor,
+            )
+            await session.commit()
+            await session.refresh(group)
+            return group
+
+    async def delete_account_group(
+        self,
+        group_id: int,
+        *,
+        actor: str = "control-bot",
+    ) -> None:
+        """Delete only the section; member accounts remain untouched."""
+        async with self._session_factory() as session:
+            group = await session.get(AccountGroup, group_id)
+            if group is None:
+                raise NotFoundError("группа аккаунтов не найдена")
+            self._require_operator_group(group)
+            member_count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(AccountGroupMember)
+                    .where(AccountGroupMember.group_id == group_id)
+                )
+                or 0
+            )
+            add_audit_event(
+                session,
+                event_type="account_group.deleted",
+                entity_type="account_group",
+                entity_id=group_id,
+                details={"name": group.name, "detached_accounts": member_count},
+                actor=actor,
+            )
+            await session.delete(group)
+            await session.commit()
+
+    async def list_account_group_member_ids(self, group_id: int) -> set[int]:
+        async with self._session_factory() as session:
+            if await session.get(AccountGroup, group_id) is None:
+                raise NotFoundError("группа аккаунтов не найдена")
+            return {
+                int(account_id)
+                for account_id in await session.scalars(
+                    select(AccountGroupMember.account_id)
+                    .where(AccountGroupMember.group_id == group_id)
+                    .order_by(AccountGroupMember.account_id)
+                )
+            }
+
+    async def list_account_membership_group_ids(self, account_id: int) -> set[int]:
+        """Return all custom sections containing this one account in one query."""
+        async with self._session_factory() as session:
+            if await session.get(Account, account_id) is None:
+                raise NotFoundError("аккаунт не найден")
+            return {
+                int(group_id)
+                for group_id in await session.scalars(
+                    select(AccountGroupMember.group_id)
+                    .join(AccountGroup, AccountGroup.id == AccountGroupMember.group_id)
+                    .where(
+                        AccountGroupMember.account_id == account_id,
+                        AccountGroup.system_key.is_(None),
+                    )
+                    .order_by(AccountGroupMember.group_id)
+                )
+            }
+
+    async def set_account_group_members(
+        self,
+        group_id: int,
+        account_ids: set[int] | list[int] | tuple[int, ...],
+        *,
+        actor: str = "control-bot",
+    ) -> set[int]:
+        """Atomically replace one group's membership after validating every ID."""
+        normalized_ids = {int(account_id) for account_id in account_ids if int(account_id) > 0}
+        async with self._session_factory() as session:
+            group = await session.get(AccountGroup, group_id)
+            if group is None:
+                raise NotFoundError("группа аккаунтов не найдена")
+            self._require_operator_group(group)
+            if normalized_ids:
+                found_ids = {
+                    int(account_id)
+                    for account_id in await session.scalars(
+                        select(Account.id).where(Account.id.in_(sorted(normalized_ids)))
+                    )
+                }
+                if found_ids != normalized_ids:
+                    raise NotFoundError("один или несколько аккаунтов не найдены")
+            await session.execute(
+                delete(AccountGroupMember).where(AccountGroupMember.group_id == group_id)
+            )
+            session.add_all(
+                [
+                    AccountGroupMember(group_id=group_id, account_id=account_id)
+                    for account_id in sorted(normalized_ids)
+                ]
+            )
+            add_audit_event(
+                session,
+                event_type="account_group.members_replaced",
+                entity_type="account_group",
+                entity_id=group_id,
+                details={"name": group.name, "account_count": len(normalized_ids)},
+                actor=actor,
+            )
+            await session.commit()
+        return normalized_ids
+
+    @staticmethod
+    def _account_ready_conditions() -> tuple[object, ...]:
+        return (
+            Account.status == AccountStatus.ACTIVE,
+            Account.ownership_confirmed.is_(True),
+            Account.session_source != AccountSessionSource.NONE,
+            Account.session_encrypted.is_not(None),
+            Account.api_id.is_not(None),
+            Account.api_hash_encrypted.is_not(None),
+            Account.authorized.is_(True),
         )
+
+    @classmethod
+    def _account_list_conditions(
+        cls,
+        account_filter: AccountListFilter | str,
+        *,
+        group_id: int | None,
+    ) -> tuple[object, ...]:
+        try:
+            normalized_filter = AccountListFilter(account_filter)
+        except ValueError as exc:
+            raise ValueError(f"неизвестный фильтр аккаунтов: {account_filter}") from exc
+
+        ready_conditions = cls._account_ready_conditions()
+        no_session = or_(
+            Account.session_source == AccountSessionSource.NONE,
+            Account.session_encrypted.is_(None),
+            Account.api_id.is_(None),
+            Account.api_hash_encrypted.is_(None),
+        )
+        profile_incomplete = and_(
+            *ready_conditions,
+            or_(
+                Account.first_name.is_(None),
+                Account.first_name == "",
+                Account.has_profile_photo.is_not(True),
+                Account.about.is_(None),
+                Account.about == "",
+            ),
+        )
+        filter_condition: object = Account.id.is_not(None)
+        if normalized_filter is AccountListFilter.PREMIUM:
+            filter_condition = Account.is_premium.is_(True)
+        elif normalized_filter is AccountListFilter.ORDINARY:
+            filter_condition = Account.is_premium.is_(False)
+        elif normalized_filter is AccountListFilter.UNKNOWN:
+            filter_condition = Account.is_premium.is_(None)
+        elif normalized_filter is AccountListFilter.READY:
+            filter_condition = and_(*ready_conditions)
+        elif normalized_filter is AccountListFilter.NEEDS_ATTENTION:
+            filter_condition = or_(
+                Account.status != AccountStatus.ACTIVE,
+                Account.ownership_confirmed.is_not(True),
+                no_session,
+                Account.authorized.is_not(True),
+                Account.last_error.is_not(None),
+            )
+        elif normalized_filter is AccountListFilter.PROFILE_INCOMPLETE:
+            filter_condition = profile_incomplete
+        elif normalized_filter is AccountListFilter.PAUSED:
+            filter_condition = Account.status == AccountStatus.PAUSED
+        elif normalized_filter is AccountListFilter.NO_SESSION:
+            filter_condition = no_session
+
+        conditions = [filter_condition]
+        if group_id is not None:
+            if group_id < 0:
+                raise ValueError("идентификатор группы не может быть отрицательным")
+            member_account_ids = select(AccountGroupMember.account_id)
+            if group_id == 0:
+                conditions.append(
+                    Account.id.not_in(
+                        member_account_ids.join(
+                            AccountGroup,
+                            AccountGroup.id == AccountGroupMember.group_id,
+                        ).where(AccountGroup.system_key.is_(None))
+                    )
+                )
+            else:
+                conditions.append(
+                    Account.id.in_(
+                        member_account_ids.where(AccountGroupMember.group_id == group_id)
+                    )
+                )
+        return tuple(conditions)
+
+    @staticmethod
+    def _normalize_account_group_name(value: str) -> str:
+        normalized = " ".join(value.split())
+        if not 1 <= len(normalized) <= 100:
+            raise ValueError("название группы должно содержать от 1 до 100 символов")
+        return normalized
+
+    @staticmethod
+    def _require_operator_group(group: AccountGroup) -> None:
+        if group.is_system:
+            raise ConflictError(
+                "системный раздел Premium обновляется по данным Telegram и не редактируется вручную"
+            )
+
+    @staticmethod
+    def _normalize_account_group_description(value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) > 500:
+            raise ValueError("описание группы не должно быть длиннее 500 символов")
+        return normalized
 
     async def active_owned_accounts(
         self, *, require_authorized_session: bool = False
@@ -479,6 +964,13 @@ class AdminRepository:
             account = await session.get(Account, account_id)
             if account is None:
                 raise NotFoundError("account not found")
+            if (
+                account.status is AccountStatus.DISABLED
+                and account.session_source is AccountSessionSource.NONE
+            ):
+                raise ConflictError(
+                    "у аккаунта нет Telegram-сессии; сначала импортируйте её повторно"
+                )
             account.status = (
                 AccountStatus.PAUSED
                 if account.status == AccountStatus.ACTIVE
@@ -1303,7 +1795,7 @@ class AdminRepository:
             existing = await session.scalar(select(Target).where(Target.chat_ref == chat_ref))
             if existing is not None:
                 if existing.is_standalone:
-                    raise ConflictError("target already exists")
+                    raise ConflictError("этот чат уже добавлен")
                 existing.is_standalone = True
                 existing.title = title
                 add_audit_event(
@@ -1319,7 +1811,7 @@ class AdminRepository:
                 return existing
             target = Target(chat_ref=chat_ref, title=title, is_standalone=True)
             session.add(target)
-            await self._flush_or_conflict(session, "target already exists")
+            await self._flush_or_conflict(session, "этот чат уже добавлен")
             add_audit_event(
                 session,
                 event_type="target.created",
@@ -1515,6 +2007,11 @@ class AdminRepository:
             if target is None:
                 raise NotFoundError("target not found")
             return target
+
+    async def find_target_by_chat_ref(self, chat_ref: str) -> Target | None:
+        """Return the canonical chat entry when it is already known."""
+        async with self._session_factory() as session:
+            return await session.scalar(select(Target).where(Target.chat_ref == chat_ref))
 
     async def target_timings(self, target_id: int) -> list[TargetTimingView]:
         async with self._session_factory() as session:
@@ -1856,8 +2353,7 @@ class AdminRepository:
             if primary_account_id == reply_account_id:
                 raise ConflictError("primary and reply accounts must be different")
             reply_is_captionless_media = bool(
-                normalized_dialogue_steps
-                and normalized_dialogue_steps[1].media_path is not None
+                normalized_dialogue_steps and normalized_dialogue_steps[1].media_path is not None
             )
             if not reply_text.strip() and not reply_is_captionless_media:
                 raise ConflictError("для диалога нужен текст ответа")
@@ -1923,12 +2419,13 @@ class AdminRepository:
                 if not 60 <= visibility_max_wait_seconds <= 7 * 24 * 3600:
                     raise ConflictError("максимальное ожидание должно быть от 1 минуты до 7 суток")
         primary_is_captionless_dialogue_media = bool(
-            normalized_dialogue_steps
-            and normalized_dialogue_steps[0].media_path is not None
+            normalized_dialogue_steps and normalized_dialogue_steps[0].media_path is not None
         )
-        if not primary_text.strip() and not (
-            primary_media_path is not None
-        ) and not primary_is_captionless_dialogue_media:
+        if (
+            not primary_text.strip()
+            and not (primary_media_path is not None)
+            and not primary_is_captionless_dialogue_media
+        ):
             raise ConflictError("primary message must not be empty")
         if (target_id is None) == (target_list_id is None):
             raise ConflictError("choose exactly one target or target list")
@@ -3744,9 +4241,16 @@ class AdminRepository:
             succeeded=counts[RunStatus.SUCCEEDED],
             failed=counts[RunStatus.FAILED],
             cancelled=counts[RunStatus.CANCELLED],
-            created_at=min(run.created_at for run in runs),
-            first_scheduled_for=min(run.scheduled_for for run in runs),
-            last_scheduled_for=max(run.scheduled_for for run in runs),
+            # SQLite can load older DATETIME values as naive while fresh values in
+            # the same process are UTC-aware.  LaunchView is used by UI sorting and
+            # must therefore expose one consistent time basis.
+            created_at=min(ensure_utc(run.created_at) or run.created_at for run in runs),
+            first_scheduled_for=min(
+                ensure_utc(run.scheduled_for) or run.scheduled_for for run in runs
+            ),
+            last_scheduled_for=max(
+                ensure_utc(run.scheduled_for) or run.scheduled_for for run in runs
+            ),
             smart_timer_mode=smart_timer_mode,
             active_until=active_until,
             no_timer_interval_seconds=no_timer_interval_seconds,
@@ -3754,7 +4258,9 @@ class AdminRepository:
             sender_mode=campaign.sender_mode,
             sent_publications=len(publications),
             next_scheduled_for=(
-                min(run.scheduled_for for run in active_runs) if active_runs else None
+                min(ensure_utc(run.scheduled_for) or run.scheduled_for for run in active_runs)
+                if active_runs
+                else None
             ),
             target_count=len({run.target_id for run in runs}),
             account_count=len(account_ids),

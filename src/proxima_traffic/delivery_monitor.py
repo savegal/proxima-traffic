@@ -244,12 +244,21 @@ class DelayedDeliveryMonitor:
             if code in ACCOUNT_WIDE_CODES:
                 await self._runner.handle_external_account_failure(account_id, exc)
             if code == "post_deleted_by_moderation":
-                await self._runner.record_observed_post_deletion(
+                recovered = await self._runner.recover_delayed_membership_gate(
+                    action_id=action_id,
+                    delayed_delivery_token=token,
                     account_id=account_id,
                     target_id=target_id,
                     message_id=message_id,
                     exc=exc,
                 )
+                if not recovered:
+                    await self._runner.record_observed_post_deletion(
+                        account_id=account_id,
+                        target_id=target_id,
+                        message_id=message_id,
+                        exc=exc,
+                    )
             elif code in OBSERVED_TARGET_FAILURE_CODES:
                 await self._runner.record_observed_target_failure(account_id, target_id, exc)
             elif getattr(exc, "retryable", True):

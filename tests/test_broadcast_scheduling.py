@@ -29,7 +29,7 @@ from proxima_traffic.models import (
     ensure_utc,
     utc_now,
 )
-from proxima_traffic.proxies import ProxyRouteUnavailable
+from proxima_traffic.proxies import ProxyRouteUnavailable, _ProxyProbeResult
 from proxima_traffic.scheduling import (
     AccountCapacitySlot,
     broadcast_profile,
@@ -81,13 +81,16 @@ def test_broadcast_profiles_are_complete_and_detectable() -> None:
         < balanced.min_messages_between_posts
         < gentle.min_messages_between_posts
     )
-    assert detect_broadcast_profile(
-        duration_seconds=active.duration_hours * 3600,
-        interval_seconds=active.interval_minutes * 60,
-        min_messages_between_posts=active.min_messages_between_posts,
-        activity_check_interval_seconds=active.activity_check_interval_seconds,
-        visibility_max_wait_seconds=active.visibility_max_wait_seconds,
-    ) == active
+    assert (
+        detect_broadcast_profile(
+            duration_seconds=active.duration_hours * 3600,
+            interval_seconds=active.interval_minutes * 60,
+            min_messages_between_posts=active.min_messages_between_posts,
+            activity_check_interval_seconds=active.activity_check_interval_seconds,
+            visibility_max_wait_seconds=active.visibility_max_wait_seconds,
+        )
+        == active
+    )
 
 
 @pytest.mark.asyncio
@@ -488,8 +491,7 @@ async def test_independent_mode_builds_every_account_chat_pair(tmp_path) -> None
     await app.state.database.create_schema()
     async with app.state.database.session_factory() as session:
         accounts = [
-            Account(label=f"lane-{index}", ownership_confirmed=True)
-            for index in range(1, 3)
+            Account(label=f"lane-{index}", ownership_confirmed=True) for index in range(1, 3)
         ]
         target_list = TargetList(name="independent targets")
         targets = [
@@ -525,12 +527,9 @@ async def test_independent_mode_builds_every_account_chat_pair(tmp_path) -> None
         session.add(campaign)
         await session.flush()
         session.add_all(
-            CampaignAccount(campaign_id=campaign.id, account_id=account.id)
-            for account in accounts
+            CampaignAccount(campaign_id=campaign.id, account_id=account.id) for account in accounts
         )
-        expected_pairs = {
-            (account.id, target.id) for account in accounts for target in targets
-        }
+        expected_pairs = {(account.id, target.id) for account in accounts for target in targets}
         await session.commit()
         campaign_id = campaign.id
 
@@ -1237,7 +1236,10 @@ async def _mark_account_live_ready(app, account_id: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_enqueue_rejects_account_without_healthy_proxy(tmp_path) -> None:
+async def test_live_enqueue_rejects_account_without_healthy_proxy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'proxy-guard.db'}",
         admin_api_key="test-admin-key",
@@ -1247,6 +1249,12 @@ async def test_live_enqueue_rejects_account_without_healthy_proxy(tmp_path) -> N
     )
     app = create_app(settings=settings)
     await app.state.database.create_schema()
+
+    async def healthy_probe(proxy_url: str) -> _ProxyProbeResult:
+        assert proxy_url.startswith("http://127.0.0.")
+        return _ProxyProbeResult(True, 30, "203.0.113.10", None)
+
+    monkeypatch.setattr(app.state.proxy_service, "_probe_proxy_url", healthy_probe)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     headers = {"X-Admin-Key": "test-admin-key"}
 

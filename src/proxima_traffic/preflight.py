@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxima_traffic.content import ContentError, parse_content_variants
@@ -211,9 +212,7 @@ class PreflightService:
                 )
             except ValueError as exc:
                 raise ConflictError(str(exc)) from exc
-            return frozenset(
-                step.media_kind for step in steps if step.media_kind is not None
-            )
+            return frozenset(step.media_kind for step in steps if step.media_kind is not None)
         try:
             variants = parse_content_variants(
                 campaign.content_variants_json,
@@ -246,16 +245,11 @@ class PreflightService:
             )
         except ValueError as exc:
             raise ConflictError(str(exc)) from exc
-        media_by_account: dict[int, set[str]] = {
-            int(step.account_id): set() for step in steps
-        }
+        media_by_account: dict[int, set[str]] = {int(step.account_id): set() for step in steps}
         for step in steps:
             if step.media_kind is not None:
                 media_by_account[int(step.account_id)].add(step.media_kind)
-        return {
-            account_id: frozenset(kinds)
-            for account_id, kinds in media_by_account.items()
-        }
+        return {account_id: frozenset(kinds) for account_id, kinds in media_by_account.items()}
 
     async def cached_campaign_summary(self, campaign_id: int) -> CampaignPreflightSummary:
         campaign, accounts, targets = await self._load_campaign_scope(campaign_id)
@@ -390,6 +384,15 @@ class PreflightService:
         async with self._session_factory() as session:
             account_ids = {pair.account_id for pair in pairs}
             target_ids = {pair.target_id for pair in pairs}
+            # More than one worker may preflight the same account × target
+            # pair.  Materialise missing rows with a native upsert, then read
+            # the canonical rows back before applying the newest result.
+            for pair in pairs:
+                await session.execute(
+                    sqlite_insert(TargetAccountState)
+                    .values(account_id=pair.account_id, target_id=pair.target_id)
+                    .on_conflict_do_nothing()
+                )
             existing_states = list(
                 await session.scalars(
                     select(TargetAccountState).where(
@@ -403,13 +406,8 @@ class PreflightService:
             }
             for pair in pairs:
                 state = states_by_pair.get((pair.account_id, pair.target_id))
-                if state is None:
-                    state = TargetAccountState(
-                        account_id=pair.account_id,
-                        target_id=pair.target_id,
-                    )
-                    session.add(state)
-                    states_by_pair[(pair.account_id, pair.target_id)] = state
+                if state is None:  # pragma: no cover - defensive against a deleted pair race
+                    raise RuntimeError("preflight state disappeared during reconciliation")
                 readiness = pair.readiness
                 state.membership_status = readiness.membership_status
                 state.can_send = readiness.can_send
@@ -485,7 +483,7 @@ class PreflightService:
                 for state in states
                 if state.membership_status == MembershipStatus.MEMBER and state.can_send
             ]
-            target_ready = (
+            target_ready = bool(accounts) and (
                 len(ready_states) == len(accounts) if require_all_accounts else bool(ready_states)
             )
             if target_ready:

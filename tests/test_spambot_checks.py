@@ -18,14 +18,17 @@ class MockGateway:
             return self.responses.pop(0)
         return SpamBotResult(SpamBotStatus.UNKNOWN, "error", parser_signal="mock")
 
+
 class MockSettings:
     spambot_enabled = True
     spambot_unknown_cooldown_seconds = 60
     spambot_min_check_interval_seconds = 21600
 
+
 @pytest.fixture
 def mock_gateway():
     return MockGateway()
+
 
 @pytest.fixture
 def checks_service(mock_gateway, app):
@@ -33,8 +36,9 @@ def checks_service(mock_gateway, app):
     return SpamBotCheckService(
         session_factory=app.state.database.session_factory,
         gateway=mock_gateway,
-        settings=MockSettings()
+        settings=MockSettings(),
     )
+
 
 @pytest.mark.asyncio
 async def test_check_account_free(checks_service, mock_gateway, app):
@@ -57,6 +61,7 @@ async def test_check_account_free(checks_service, mock_gateway, app):
         updated = await session.get(Account, acc_id)
         assert updated.status is AccountStatus.ACTIVE
         assert updated.cooldown_reason is None
+
 
 @pytest.mark.asyncio
 async def test_check_account_permanent_ban(checks_service, mock_gateway, app):
@@ -81,6 +86,7 @@ async def test_check_account_permanent_ban(checks_service, mock_gateway, app):
         assert updated.status is AccountStatus.DISABLED
         assert updated.cooldown_reason == "spambot_permanent_ban"
         assert updated.cooldown_until is None
+
 
 @pytest.mark.asyncio
 async def test_check_account_temporary_ban(checks_service, mock_gateway, app):

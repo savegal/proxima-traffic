@@ -117,9 +117,7 @@ async def test_live_html_parser_builds_real_telegram_mention_entities() -> None:
 
     assert text == f"Post{HIDDEN_MENTION_CHARACTER * len(user_ids)}"
     mentions = [
-        entity
-        for entity in entities
-        if isinstance(entity, types.InputMessageEntityMentionName)
+        entity for entity in entities if isinstance(entity, types.InputMessageEntityMentionName)
     ]
     assert len(mentions) == len(user_ids)
     assert {int(entity.user_id.user_id) for entity in mentions} == set(user_ids)
@@ -129,7 +127,8 @@ async def test_broadcast_resolves_members_once_and_sends_hidden_html_mentions(
     app: FastAPI,
 ) -> None:
     gateway = MentionRecordingGateway()
-    blocked_user_id = 7_588_293_197
+    # Keep the test-specific fixture outside the audited production seed list.
+    blocked_user_id = 8_000_000_000_000_000_001
     gateway.participants = (blocked_user_id, *range(1001, 1013))
     runner = CampaignRunner(
         app.state.database.session_factory,
@@ -398,16 +397,12 @@ async def test_terminal_broadcast_outcomes_release_or_hold_mention_reservations(
         states = list(
             await session.scalars(
                 select(CampaignMentionState).where(
-                    CampaignMentionState.reserved_run_id.in_(
-                        [known_run_id, uncertain_run_id]
-                    )
+                    CampaignMentionState.reserved_run_id.in_([known_run_id, uncertain_run_id])
                 )
             )
         )
     assert all(state.reserved_run_id != known_run_id for state in states)
-    uncertain_states = [
-        state for state in states if state.reserved_run_id == uncertain_run_id
-    ]
+    uncertain_states = [state for state in states if state.reserved_run_id == uncertain_run_id]
     assert len(uncertain_states) == 5
     assert all(
         state.reserved_until is not None

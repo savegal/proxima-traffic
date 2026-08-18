@@ -29,21 +29,46 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from proxima_traffic.account_groups import sync_premium_account_group
 from proxima_traffic.config import Settings
 from proxima_traffic.models import (
     Account,
+    AccountGroup,
+    AccountGroupMember,
+    AccountOperationLease,
     AccountSessionSource,
     AccountStatus,
+    CampaignRun,
+    ChannelCommentRule,
+    ChannelCommentRun,
+    ChannelCommentRunStatus,
+    DirectLaunch,
+    DirectLaunchStatus,
+    DirectMessageTask,
+    DirectMessageTaskStatus,
+    ParticipantReactionRule,
+    ParticipantReactionTask,
+    ParticipantReactionTaskStatus,
     ProxyAssignment,
+    ReactionTask,
+    ReactionTaskStatus,
+    RunStatus,
+    SubscriberInviteLaunch,
+    SubscriberInviteTask,
     ensure_utc,
     utc_now,
 )
 from proxima_traffic.profile_names import ProfileName
-from proxima_traffic.proxies import ProxyNetworkRoute, ProxyRouteUnavailable, ProxyService
+from proxima_traffic.proxies import (
+    ProxyNetworkRoute,
+    ProxyRouteUnavailable,
+    ProxyService,
+    mtproto_connection_type,
+)
 from proxima_traffic.services import ConflictError, DomainError, NotFoundError, add_audit_event
 
 logger = logging.getLogger(__name__)
@@ -58,6 +83,40 @@ MAX_JSON_SESSION_BYTES = 5 * 1024 * 1024
 MAX_BATCH_IMPORT_ACCOUNTS = 100
 MAX_BATCH_ARCHIVE_MEMBERS = 500
 TDATA_MARKER = "key_datas"
+
+
+def _serialized_account_ids(raw_value: str | None) -> frozenset[int]:
+    """Read account references from a trusted, durable JSON snapshot safely."""
+
+    if not raw_value:
+        return frozenset()
+    try:
+        payload = json.loads(raw_value)
+    except (TypeError, json.JSONDecodeError):
+        return frozenset()
+    account_ids: set[int] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            raw_account_id = value.get("account_id")
+            if isinstance(raw_account_id, int) and raw_account_id > 0:
+                account_ids.add(raw_account_id)
+            elif isinstance(raw_account_id, str) and raw_account_id.isdecimal():
+                account_ids.add(int(raw_account_id))
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                if isinstance(nested, int) and nested > 0:
+                    account_ids.add(nested)
+                elif isinstance(nested, str) and nested.isdecimal():
+                    account_ids.add(int(nested))
+                else:
+                    visit(nested)
+
+    visit(payload)
+    return frozenset(account_ids)
+
 
 # Telegram production DCs used when a Pyrogram/JSON export contains a raw
 # auth_key but no server address. The resulting source session is used only to
@@ -106,6 +165,20 @@ class DecryptedSession:
 
 
 @dataclass(frozen=True, slots=True)
+class TelethonTransport:
+    """Transport settings needed by Telethon without exposing proxy secrets."""
+
+    proxy: object | None = field(repr=False)
+    connection: object | None = field(default=None, repr=False)
+
+    def client_kwargs(self) -> dict[str, object]:
+        values: dict[str, object] = {"proxy": self.proxy}
+        if self.connection is not None:
+            values["connection"] = self.connection
+        return values
+
+
+@dataclass(frozen=True, slots=True)
 class AccountCheckResult:
     account_id: int
     authorized: bool
@@ -113,6 +186,77 @@ class AccountCheckResult:
     phone: str | None
     username: str | None
     error: str | None
+    # ``authorized`` records the last known account state.  A transient route
+    # error intentionally preserves it, so callers must use this code (rather
+    # than ``authorized is False``) before offering destructive actions.
+    failure_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRemovalResult:
+    """Outcome of a requested account removal without losing historical reports."""
+
+    account_id: int
+    label: str
+    deleted: bool
+    preserved_for_history: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRemovalPlan:
+    """Whether a live account can be removed without interrupting work."""
+
+    account_id: int
+    label: str
+    active_work: tuple[str, ...]
+
+    @property
+    def can_remove(self) -> bool:
+        return not self.active_work
+
+
+@dataclass(frozen=True, slots=True)
+class AccountBulkCheckEntry:
+    account_id: int
+    label: str
+    result: AccountCheckResult | None
+    error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.result is not None and self.result.authorized and not self.result.error)
+
+    @property
+    def session_revoked(self) -> bool:
+        """True only when Telegram conclusively rejected the session.
+
+        A bought, not-yet-checked account starts with ``authorized=False``.
+        Network/proxy failures must remain an actionable diagnostic issue, not
+        an invitation to delete a potentially valid session.
+        """
+        return bool(
+            self.result is not None
+            and self.result.failure_code in {"account_dead", "account_unauthorized"}
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AccountBulkCheckSummary:
+    entries: tuple[AccountBulkCheckEntry, ...]
+
+    @property
+    def ready(self) -> tuple[AccountBulkCheckEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.ready)
+
+    @property
+    def session_revoked(self) -> tuple[AccountBulkCheckEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.session_revoked)
+
+    @property
+    def issues(self) -> tuple[AccountBulkCheckEntry, ...]:
+        return tuple(
+            entry for entry in self.entries if not entry.ready and not entry.session_revoked
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +356,7 @@ class _ConvertedSession:
     phone: str | None = None
     username: str | None = None
     has_profile_photo: bool = False
+    is_premium: bool | None = None
 
 
 class AccountSecretCipher:
@@ -271,15 +416,16 @@ class AccountService:
     ) -> Account:
         normalized_label = _validate_label(label) if label is not None else None
         api_id, api_hash = self._require_api()
-        proxy = self._import_proxy(proxy_route)
+        transport = self._import_transport(proxy_route)
         two_factor_password = self._configured_two_factor_password(two_factor_password)
         converted = await asyncio.to_thread(
             self._convert_tdata_archive,
             archive_bytes,
             api_id,
             api_hash,
-            proxy,
+            transport.proxy,
             two_factor_password,
+            **_connection_kwargs(transport),
         )
         return await self._store_session(
             label=normalized_label,
@@ -297,7 +443,7 @@ class AccountService:
     ) -> Account:
         normalized_label = _validate_label(label) if label is not None else None
         api_id, api_hash = self._require_api()
-        proxy = self._import_proxy(proxy_route)
+        transport = self._import_transport(proxy_route)
         source_session = await asyncio.to_thread(
             self._read_session_file,
             session_bytes,
@@ -306,8 +452,9 @@ class AccountService:
             source_session,
             api_id=api_id,
             api_hash=api_hash,
-            proxy=proxy,
+            proxy=transport.proxy,
             two_factor_password=self._configured_two_factor_password(two_factor_password),
+            **_connection_kwargs(transport),
         )
         return await self._store_session(
             label=normalized_label,
@@ -325,14 +472,15 @@ class AccountService:
     ) -> Account:
         normalized_label = _validate_label(label) if label is not None else None
         api_id, api_hash = self._require_api()
-        proxy = self._import_proxy(proxy_route)
+        transport = self._import_transport(proxy_route)
         source_session = self._read_any_session_string(session_string)
         converted = await self._convert_existing_session(
             source_session,
             api_id=api_id,
             api_hash=api_hash,
-            proxy=proxy,
+            proxy=transport.proxy,
             two_factor_password=self._configured_two_factor_password(two_factor_password),
+            **_connection_kwargs(transport),
         )
         return await self._store_session(
             label=normalized_label,
@@ -357,14 +505,15 @@ class AccountService:
         """
         normalized_label = _validate_label(label) if label is not None else None
         api_id, api_hash = self._require_api()
-        proxy = self._import_proxy(proxy_route)
+        transport = self._import_transport(proxy_route)
         source_session = await asyncio.to_thread(self._read_json_session, json_bytes)
         converted = await self._convert_existing_session(
             source_session,
             api_id=api_id,
             api_hash=api_hash,
-            proxy=proxy,
+            proxy=transport.proxy,
             two_factor_password=self._configured_two_factor_password(two_factor_password),
+            **_connection_kwargs(transport),
         )
         return await self._store_session(
             label=normalized_label,
@@ -421,6 +570,87 @@ class AccountService:
 
         raise AccountImportError("в записи архива нет .session или .json")
 
+    async def create_archive_import_group(
+        self,
+        account_ids: list[int] | tuple[int, ...],
+        *,
+        actor: str = "control-bot",
+    ) -> AccountGroup:
+        """Create an operator-owned group for one completed ZIP import.
+
+        Import batches are processed entry by entry, so their account IDs stay
+        durable even if some archive members fail.  Keeping this as a regular
+        custom group lets the operator prepare just this batch afterwards.
+        """
+
+        normalized_ids = tuple(
+            sorted({int(account_id) for account_id in account_ids if int(account_id) > 0})
+        )
+        if not normalized_ids:
+            raise ValueError("для группы ZIP-импорта нужен хотя бы один аккаунт")
+
+        account_range = (
+            f"#{normalized_ids[0]}"
+            if len(normalized_ids) == 1
+            else f"#{normalized_ids[0]}–#{normalized_ids[-1]}"
+        )
+        base_name = f"ZIP-импорт · {utc_now():%Y-%m-%d %H:%M} · {account_range}"
+        description = f"Создано автоматически после ZIP-импорта · аккаунтов: {len(normalized_ids)}"
+
+        async with self._session_factory() as session:
+            found_ids = {
+                int(account_id)
+                for account_id in await session.scalars(
+                    select(Account.id).where(Account.id.in_(normalized_ids))
+                )
+            }
+            if found_ids != set(normalized_ids):
+                raise NotFoundError("некоторые импортированные аккаунты уже недоступны")
+
+            # The account-ID range makes collisions unlikely.  The suffix also
+            # covers an operator-created group with the same readable title.
+            existing_names = set(
+                await session.scalars(
+                    select(AccountGroup.name).where(AccountGroup.name.like(f"{base_name}%"))
+                )
+            )
+            group_name = base_name
+            for number in range(2, 10_000):
+                if group_name not in existing_names:
+                    break
+                group_name = f"{base_name} ({number})"
+            else:  # pragma: no cover - defensive guard for a corrupted database
+                raise ConflictError("не удалось подобрать название для группы ZIP-импорта")
+
+            group = AccountGroup(name=group_name, description=description)
+            session.add(group)
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ConflictError("не удалось создать группу ZIP-импорта") from exc
+            session.add_all(
+                [
+                    AccountGroupMember(group_id=group.id, account_id=account_id)
+                    for account_id in normalized_ids
+                ]
+            )
+            add_audit_event(
+                session,
+                event_type="account_group.archive_import_created",
+                entity_type="account_group",
+                entity_id=group.id,
+                details={
+                    "name": group.name,
+                    "account_ids": list(normalized_ids),
+                    "account_count": len(normalized_ids),
+                },
+                actor=actor,
+            )
+            await session.commit()
+            await session.refresh(group)
+            return group
+
     # ---------------------------------------------------------------- lifecycle
     async def get_account(self, account_id: int) -> Account:
         async with self._session_factory() as session:
@@ -434,6 +664,36 @@ class AccountService:
             account = await session.get(Account, account_id)
             if account is None:
                 raise NotFoundError("account not found")
+            configured_comment_rule = await session.scalar(
+                select(ChannelCommentRule.id).where(
+                    ChannelCommentRule.primary_account_id == account_id
+                )
+            )
+            configured_comment_json = any(
+                account_id in _serialized_account_ids(dialogue_steps_json)
+                or account_id in _serialized_account_ids(reaction_account_ids_json)
+                for dialogue_steps_json, reaction_account_ids_json in await session.execute(
+                    select(
+                        ChannelCommentRule.dialogue_steps_json,
+                        ChannelCommentRule.reaction_account_ids_json,
+                    )
+                )
+            )
+            configured_participant_rule = any(
+                account_id in _serialized_account_ids(account_ids_json)
+                for (account_ids_json,) in await session.execute(
+                    select(ParticipantReactionRule.account_ids_json)
+                )
+            )
+            if (
+                configured_comment_rule is not None
+                or configured_comment_json
+                or configured_participant_rule
+            ):
+                raise ConflictError(
+                    "аккаунт входит в настройки автоматизации. Сессия будет отозвана, "
+                    "а историческая запись сохранена, чтобы не сломать правила"
+                )
             add_audit_event(
                 session,
                 event_type="account.deleted",
@@ -459,8 +719,251 @@ class AccountService:
                     "Сотрите сессию и отключите доступ, а запись оставьте для журнала"
                 ) from exc
 
+    async def account_removal_plan(self, account_id: int) -> AccountRemovalPlan:
+        """Describe only work that makes a destructive removal unsafe right now."""
+        active_run_statuses = (RunStatus.QUEUED, RunStatus.RUNNING)
+        active_reaction_statuses = (ReactionTaskStatus.QUEUED, ReactionTaskStatus.RUNNING)
+        active_direct_statuses = (DirectMessageTaskStatus.QUEUED, DirectMessageTaskStatus.RUNNING)
+        active_comment_statuses = (
+            ChannelCommentRunStatus.QUEUED,
+            ChannelCommentRunStatus.RUNNING,
+        )
+        active_participant_statuses = (
+            ParticipantReactionTaskStatus.QUEUED,
+            ParticipantReactionTaskStatus.RUNNING,
+        )
+        async with self._session_factory() as session:
+            account = await session.get(Account, account_id)
+            if account is None:
+                raise NotFoundError("account not found")
+            now = utc_now()
+            campaign_run_ids = [
+                int(run_id)
+                for (
+                    run_id,
+                    sender_pool_snapshot_json,
+                    dialogue_steps_snapshot_json,
+                ) in await session.execute(
+                    select(
+                        CampaignRun.id,
+                        CampaignRun.sender_pool_snapshot_json,
+                        CampaignRun.dialogue_steps_snapshot_json,
+                    ).where(CampaignRun.status.in_(active_run_statuses))
+                )
+                if account_id in _serialized_account_ids(sender_pool_snapshot_json)
+                or account_id in _serialized_account_ids(dialogue_steps_snapshot_json)
+            ]
+            direct_launch_ids = [
+                int(launch_id)
+                for launch_id, account_ids_snapshot_json in await session.execute(
+                    select(DirectLaunch.id, DirectLaunch.account_ids_snapshot_json).where(
+                        DirectLaunch.status.in_(
+                            [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                        )
+                    )
+                )
+                if account_id in _serialized_account_ids(account_ids_snapshot_json)
+            ]
+            invite_launch_ids = [
+                int(launch_id)
+                for launch_id, account_ids_snapshot_json in await session.execute(
+                    select(
+                        SubscriberInviteLaunch.id,
+                        SubscriberInviteLaunch.account_ids_snapshot_json,
+                    ).where(
+                        SubscriberInviteLaunch.status.in_(
+                            [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                        )
+                    )
+                )
+                if account_id in _serialized_account_ids(account_ids_snapshot_json)
+            ]
+            comment_rule_ids = [
+                int(rule_id)
+                for (
+                    rule_id,
+                    primary_account_id,
+                    dialogue_steps_json,
+                    reaction_account_ids_json,
+                ) in await session.execute(
+                    select(
+                        ChannelCommentRule.id,
+                        ChannelCommentRule.primary_account_id,
+                        ChannelCommentRule.dialogue_steps_json,
+                        ChannelCommentRule.reaction_account_ids_json,
+                    )
+                )
+                if primary_account_id == account_id
+                or account_id in _serialized_account_ids(dialogue_steps_json)
+                or account_id in _serialized_account_ids(reaction_account_ids_json)
+            ]
+            participant_rule_ids = [
+                int(rule_id)
+                for rule_id, account_ids_json in await session.execute(
+                    select(ParticipantReactionRule.id, ParticipantReactionRule.account_ids_json)
+                )
+                if account_id in _serialized_account_ids(account_ids_json)
+            ]
+            direct_conditions = [
+                DirectMessageTask.status.in_(active_direct_statuses),
+                DirectMessageTask.sender_account_id == account_id,
+            ]
+            if direct_launch_ids:
+                direct_conditions[1] = or_(
+                    DirectMessageTask.sender_account_id == account_id,
+                    DirectMessageTask.launch_id.in_(direct_launch_ids),
+                )
+            invite_conditions = [
+                SubscriberInviteTask.status.in_(active_direct_statuses),
+                SubscriberInviteTask.sender_account_id == account_id,
+            ]
+            if invite_launch_ids:
+                invite_conditions[1] = or_(
+                    SubscriberInviteTask.sender_account_id == account_id,
+                    SubscriberInviteTask.launch_id.in_(invite_launch_ids),
+                )
+            comment_conditions = [ChannelCommentRun.status.in_(active_comment_statuses)]
+            if comment_rule_ids:
+                comment_conditions.append(ChannelCommentRun.rule_id.in_(comment_rule_ids))
+            else:
+                comment_conditions.append(ChannelCommentRule.primary_account_id == account_id)
+            participant_conditions = [
+                ParticipantReactionTask.status.in_(active_participant_statuses),
+                ParticipantReactionTask.reactor_account_id == account_id,
+            ]
+            if participant_rule_ids:
+                participant_conditions[1] = or_(
+                    ParticipantReactionTask.reactor_account_id == account_id,
+                    ParticipantReactionTask.rule_id.in_(participant_rule_ids),
+                )
+            checks = (
+                (
+                    "рассылки",
+                    select(func.count())
+                    .select_from(CampaignRun)
+                    .where(
+                        or_(
+                            CampaignRun.sender_account_id == account_id,
+                            CampaignRun.id.in_(campaign_run_ids),
+                        ),
+                        CampaignRun.status.in_(active_run_statuses),
+                    ),
+                ),
+                (
+                    "реакции на публикации",
+                    select(func.count())
+                    .select_from(ReactionTask)
+                    .where(
+                        (ReactionTask.source_account_id == account_id)
+                        | (ReactionTask.reactor_account_id == account_id),
+                        ReactionTask.status.in_(active_reaction_statuses),
+                    ),
+                ),
+                (
+                    "рассылки в ЛС",
+                    select(func.count()).select_from(DirectMessageTask).where(*direct_conditions),
+                ),
+                (
+                    "приглашения",
+                    select(func.count())
+                    .select_from(SubscriberInviteTask)
+                    .where(*invite_conditions),
+                ),
+                (
+                    "авто-реакции в чатах",
+                    select(func.count())
+                    .select_from(ParticipantReactionTask)
+                    .where(*participant_conditions),
+                ),
+                (
+                    "автокомментинг",
+                    select(func.count())
+                    .select_from(ChannelCommentRun)
+                    .join(ChannelCommentRule, ChannelCommentRule.id == ChannelCommentRun.rule_id)
+                    .where(*comment_conditions),
+                ),
+                (
+                    "текущая Telegram-операция",
+                    select(func.count())
+                    .select_from(AccountOperationLease)
+                    .where(
+                        AccountOperationLease.account_id == account_id,
+                        AccountOperationLease.lease_until > now,
+                    ),
+                ),
+            )
+            active_work: list[str] = []
+            for label, statement in checks:
+                count = int(await session.scalar(statement) or 0)
+                if count > 0:
+                    active_work.append(f"{label}: {count}")
+            return AccountRemovalPlan(
+                account_id=account_id,
+                label=account.label,
+                active_work=tuple(active_work),
+            )
+
+    async def remove_account_safely(
+        self,
+        account_id: int,
+        *,
+        actor: str = "control-bot",
+    ) -> AccountRemovalResult:
+        """Delete an account when possible, otherwise revoke only its live access.
+
+        Account rows may be protected by immutable campaign or delivery history.
+        A removal request must not strand the operator behind a foreign-key
+        error: in that case the account is disabled, credentials and proxy
+        assignment are erased, and the historical row remains valid.
+        """
+        plan = await self.account_removal_plan(account_id)
+        if not plan.can_remove:
+            raise ConflictError(
+                "аккаунт ещё участвует в активных задачах; остановите их или дождитесь "
+                "завершения: " + "; ".join(plan.active_work)
+            )
+        label = plan.label
+        try:
+            await self.delete_account(account_id, actor=actor)
+        except ConflictError:
+            await self.clear_session(account_id, actor=actor)
+            async with self._session_factory() as session:
+                add_audit_event(
+                    session,
+                    event_type="account.removal_preserved_history",
+                    entity_type="account",
+                    entity_id=account_id,
+                    details={"label": label, "reason": "referenced_by_history"},
+                    actor=actor,
+                )
+                await session.commit()
+            return AccountRemovalResult(
+                account_id=account_id,
+                label=label,
+                deleted=False,
+                preserved_for_history=True,
+            )
+        return AccountRemovalResult(
+            account_id=account_id,
+            label=label,
+            deleted=True,
+            preserved_for_history=False,
+        )
+
     async def clear_session(self, account_id: int, *, actor: str = "control-bot") -> Account:
-        """Revoke stored Telegram access while keeping the historical account row."""
+        """Revoke stored Telegram access while keeping the historical account row.
+
+        Access must never be removed from underneath a queued or running task.
+        Keeping this guard in the service (rather than only in the bot screen)
+        also protects maintenance callers and makes a confirmation click safe if
+        work appeared after the confirmation screen was opened.
+        """
+        plan = await self.account_removal_plan(account_id)
+        if not plan.can_remove:
+            raise ConflictError(
+                "аккаунт ещё участвует в активных задачах; остановите их или дождитесь "
+                "завершения: " + "; ".join(plan.active_work)
+            )
         async with self._session_factory() as session:
             account = await session.get(Account, account_id)
             if account is None:
@@ -474,8 +977,11 @@ class AccountService:
             account.last_name = None
             account.phone = None
             account.username = None
+            account.about = None
             account.has_profile_photo = False
             account.authorized = False
+            account.is_premium = None
+            account.premium_checked_at = None
             account.last_checked_at = None
             account.last_error = None
             account.next_send_at = None
@@ -496,6 +1002,7 @@ class AccountService:
                 details={"label": account.label},
                 actor=actor,
             )
+            await sync_premium_account_group(session, actor=actor)
             await session.commit()
             await session.refresh(account)
             return account
@@ -564,23 +1071,31 @@ class AccountService:
     ) -> AccountCheckResult:
         """Connect through the assigned proxy and confirm the session is alive."""
         decrypted = await self.load_session(account_id)
-        proxy = None
+        transport = TelethonTransport(proxy=None)
         if self._proxy_service is not None:
             try:
-                route = await self._proxy_service.require_account_route(account_id)
-                proxy = _telethon_proxy(route)
+                recovery = getattr(self._proxy_service, "ensure_account_route", None)
+                route = (
+                    await recovery(account_id, actor=actor)
+                    if callable(recovery)
+                    else await self._proxy_service.require_account_route(account_id)
+                )
+                transport = build_telethon_transport(route)
             except ProxyRouteUnavailable:
                 if self._settings.account_require_proxy:
                     return await self._record_check(
                         account_id,
                         authorized=None,
                         me=None,
-                        error="прокси для аккаунта не назначен (PROXIMA_ACCOUNT_REQUIRE_PROXY=1)",
+                        error=(
+                            "для аккаунта нет рабочего прокси; добавьте или включите "
+                            "рабочий HTTP(S)/SOCKS5/MTProto-прокси"
+                        ),
                         failure_code="proxy_unavailable",
                         actor=actor,
                     )
         try:
-            me = await self._fetch_me(decrypted, proxy)
+            me = await self._fetch_me(decrypted, transport)
         except Exception as exc:  # noqa: BLE001 - report any connection failure safely
             failure_code = _account_check_failure_code(exc)
             return await self._record_check(
@@ -599,6 +1114,66 @@ class AccountService:
             failure_code=None if me is not None else "account_unauthorized",
             actor=actor,
         )
+
+    async def check_all_sessions(
+        self,
+        *,
+        actor: str = "control-bot",
+        concurrency: int = 3,
+    ) -> AccountBulkCheckSummary:
+        """Verify every stored Telegram session without sending any messages.
+
+        Bought batches often contain dozens of accounts.  Checks make a real
+        network connection, so a strictly sequential pass turns one transient
+        timeout into a very long operator wait.  The small, bounded fan-out
+        retains independent account leases/routes without a connection burst.
+        """
+        async with self._session_factory() as session:
+            accounts = list(
+                await session.execute(
+                    select(Account.id, Account.label)
+                    .where(Account.session_source != AccountSessionSource.NONE)
+                    .order_by(Account.id)
+                )
+            )
+
+        semaphore = asyncio.Semaphore(max(1, min(int(concurrency), 5)))
+
+        async def run_check(account_id: int, label: str) -> AccountBulkCheckEntry:
+            try:
+                result = await self.check_account(account_id, actor=actor)
+            except (AccountImportError, NotFoundError) as exc:
+                return AccountBulkCheckEntry(
+                    account_id=account_id,
+                    label=label,
+                    result=None,
+                    error=_safe_account_error(exc),
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad session must not stop the batch
+                logger.exception("Bulk session check failed for account %s", account_id)
+                return AccountBulkCheckEntry(
+                    account_id=account_id,
+                    label=label,
+                    result=None,
+                    error=_safe_account_error(exc),
+                )
+            return AccountBulkCheckEntry(
+                account_id=account_id,
+                label=label,
+                result=result,
+                error=result.error,
+            )
+
+        async def check_one(account_id: int, label: str) -> AccountBulkCheckEntry:
+            async with semaphore:
+                return await run_check(account_id, label)
+
+        # gather preserves database order, so the report remains easy to
+        # reconcile with the account list despite parallel checks.
+        entries = await asyncio.gather(
+            *(check_one(int(account_id), str(label)) for account_id, label in accounts)
+        )
+        return AccountBulkCheckSummary(entries=tuple(entries))
 
     async def update_profile_name(
         self,
@@ -823,6 +1398,64 @@ class AccountService:
             photo_override=True,
         )
 
+    async def bulk_update_profile_photos(
+        self,
+        account_ids: list[int],
+        *,
+        photo_bytes: bytes,
+        file_name: str,
+        concurrency: int = 3,
+        actor: str = "control-bot",
+    ) -> BulkProfileNameResult:
+        """Set one validated avatar for a frozen, operator-selected account set."""
+
+        normalized_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
+        if not normalized_ids:
+            return BulkProfileNameResult(updated=(), failures=())
+        if len(normalized_ids) > 200:
+            raise AccountProfileError("за одну операцию можно изменить не более 200 аккаунтов")
+        if not photo_bytes:
+            raise AccountProfileError("файл аватара пуст")
+        if len(photo_bytes) > MAX_PROFILE_PHOTO_BYTES:
+            raise AccountProfileError("аватар больше 10 МБ")
+        safe_name = _validate_profile_photo_name(file_name)
+        semaphore = asyncio.Semaphore(max(1, min(concurrency, 5)))
+
+        async def apply_photo(account_id: int) -> Account | ProfileNameFailure:
+            async with semaphore:
+                try:
+                    return await self.update_profile_photo(
+                        account_id,
+                        photo_bytes=photo_bytes,
+                        file_name=safe_name,
+                        actor=actor,
+                    )
+                except (NotFoundError, AccountImportError, AccountProfileError) as exc:
+                    return ProfileNameFailure(account_id=account_id, error=str(exc))
+
+        results = await asyncio.gather(*(apply_photo(account_id) for account_id in normalized_ids))
+        updated = tuple(item for item in results if isinstance(item, Account))
+        failures = tuple(item for item in results if isinstance(item, ProfileNameFailure))
+        async with self._session_factory() as session:
+            add_audit_event(
+                session,
+                event_type="account.profile_photos_bulk_updated",
+                entity_type="account_batch",
+                entity_id=None,
+                details={
+                    "requested": len(normalized_ids),
+                    "updated": len(updated),
+                    "failed": len(failures),
+                    "file_name": safe_name,
+                    "size": len(photo_bytes),
+                    "updated_account_ids": [account.id for account in updated],
+                    "failed_account_ids": [failure.account_id for failure in failures],
+                },
+                actor=actor,
+            )
+            await session.commit()
+        return BulkProfileNameResult(updated=updated, failures=failures)
+
     async def delete_profile_photos(
         self,
         account_id: int,
@@ -891,31 +1524,70 @@ class AccountService:
         encrypted_session = self._cipher.encrypt(converted.session_string)
         encrypted_hash = self._cipher.encrypt(converted.api_hash)
         async with self._session_factory() as session:
+            restored = False
+            account: Account
             if converted.telegram_user_id is not None:
                 existing = await session.scalar(
                     select(Account).where(Account.telegram_user_id == converted.telegram_user_id)
                 )
                 if existing is not None:
-                    raise ConflictError(f"этот аккаунт уже загружен как «{existing.label}»")
-            resolved_label = label or await self._available_import_label(session, converted)
-            account = Account(
-                label=resolved_label,
-                telegram_user_id=converted.telegram_user_id,
-                ownership_confirmed=True,
-                status=AccountStatus.ACTIVE,
-                session_source=source,
-                session_encrypted=encrypted_session,
-                api_id=converted.api_id,
-                api_hash_encrypted=encrypted_hash,
-                first_name=_limited_optional(converted.first_name, 64),
-                last_name=_limited_optional(converted.last_name, 64),
-                phone=_limited_optional(converted.phone, 32),
-                username=_limited_optional(converted.username, 64),
-                has_profile_photo=converted.has_profile_photo,
-                authorized=True,
-                last_checked_at=utc_now(),
-            )
-            session.add(account)
+                    if (
+                        existing.status is AccountStatus.DISABLED
+                        and existing.session_source is AccountSessionSource.NONE
+                        and existing.session_encrypted is None
+                    ):
+                        # A preserved historical card deliberately keeps the
+                        # Telegram ID.  Re-importing the same account must
+                        # restore that card instead of trapping the operator
+                        # behind a duplicate-ID error or losing its history.
+                        account = existing
+                        restored = True
+                    else:
+                        raise ConflictError(f"этот аккаунт уже загружен как «{existing.label}»")
+            if restored:
+                # Preserve the operator's label and historical links; refresh
+                # only the live Telegram access and the profile snapshot.
+                account.ownership_confirmed = True
+                account.status = AccountStatus.ACTIVE
+                account.session_source = source
+                account.session_encrypted = encrypted_session
+                account.api_id = converted.api_id
+                account.api_hash_encrypted = encrypted_hash
+                account.first_name = _limited_optional(converted.first_name, 64)
+                account.last_name = _limited_optional(converted.last_name, 64)
+                account.phone = _limited_optional(converted.phone, 32)
+                account.username = _limited_optional(converted.username, 64)
+                account.has_profile_photo = converted.has_profile_photo
+                account.authorized = True
+                account.is_premium = converted.is_premium
+                account.premium_checked_at = utc_now() if converted.is_premium is not None else None
+                account.last_checked_at = utc_now()
+                account.last_error = None
+                account.next_send_at = None
+                account.cooldown_until = None
+                account.cooldown_reason = None
+            else:
+                resolved_label = label or await self._available_import_label(session, converted)
+                account = Account(
+                    label=resolved_label,
+                    telegram_user_id=converted.telegram_user_id,
+                    ownership_confirmed=True,
+                    status=AccountStatus.ACTIVE,
+                    session_source=source,
+                    session_encrypted=encrypted_session,
+                    api_id=converted.api_id,
+                    api_hash_encrypted=encrypted_hash,
+                    first_name=_limited_optional(converted.first_name, 64),
+                    last_name=_limited_optional(converted.last_name, 64),
+                    phone=_limited_optional(converted.phone, 32),
+                    username=_limited_optional(converted.username, 64),
+                    has_profile_photo=converted.has_profile_photo,
+                    authorized=True,
+                    is_premium=converted.is_premium,
+                    premium_checked_at=(utc_now() if converted.is_premium is not None else None),
+                    last_checked_at=utc_now(),
+                )
+                session.add(account)
             try:
                 await session.flush()
             except IntegrityError as exc:
@@ -923,12 +1595,13 @@ class AccountService:
                 raise ConflictError("название или Telegram ID аккаунта уже заняты") from exc
             add_audit_event(
                 session,
-                event_type="account.session_imported",
+                event_type=("account.session_restored" if restored else "account.session_imported"),
                 entity_type="account",
                 entity_id=account.id,
-                details={"label": resolved_label, "source": source.value},
+                details={"label": account.label, "source": source.value},
                 actor="control-bot",
             )
+            await sync_premium_account_group(session, actor="account-import")
             await session.commit()
             await session.refresh(account)
             return account
@@ -975,13 +1648,15 @@ class AccountService:
         last_name = getattr(me, "last_name", None)
         phone = getattr(me, "phone", None)
         username = getattr(me, "username", None)
+        is_premium = _telegram_premium_value(me)
+        checked_at = utc_now()
         async with self._session_factory() as session:
             account = await session.get(Account, account_id)
             if account is None:
                 raise NotFoundError("account not found")
             if authorized is not None:
                 account.authorized = authorized
-            account.last_checked_at = utc_now()
+            account.last_checked_at = checked_at
             account.last_error = None if authorized is True else (error or "не авторизован")[:500]
             if authorized is False and failure_code in {"account_dead", "account_unauthorized"}:
                 account.status = AccountStatus.DISABLED
@@ -995,6 +1670,9 @@ class AccountService:
                 account.last_name = str(last_name)[:64] if last_name else None
                 account.username = str(username)[:64] if username else None
                 account.has_profile_photo = getattr(me, "photo", None) is not None
+                if is_premium is not None:
+                    account.is_premium = is_premium
+                    account.premium_checked_at = checked_at
             add_audit_event(
                 session,
                 event_type="account.check_succeeded" if authorized else "account.check_failed",
@@ -1007,6 +1685,7 @@ class AccountService:
                 },
                 actor=actor,
             )
+            await sync_premium_account_group(session, actor=actor)
             try:
                 await session.commit()
             except IntegrityError:
@@ -1022,6 +1701,7 @@ class AccountService:
             phone=str(phone) if phone else None,
             username=str(username) if username else None,
             error=None if authorized else error,
+            failure_code=failure_code,
         )
 
     async def _record_profile(
@@ -1047,13 +1727,18 @@ class AccountService:
             phone = getattr(me, "phone", None)
             account.phone = str(phone)[:32] if phone else account.phone
             account.authorized = True
-            account.last_checked_at = utc_now()
+            checked_at = utc_now()
+            account.last_checked_at = checked_at
             account.last_error = None
             account.has_profile_photo = (
                 photo_override
                 if photo_override is not None
                 else getattr(me, "photo", None) is not None
             )
+            is_premium = _telegram_premium_value(me)
+            if is_premium is not None:
+                account.is_premium = is_premium
+                account.premium_checked_at = checked_at
             add_audit_event(
                 session,
                 event_type=event_type,
@@ -1062,6 +1747,7 @@ class AccountService:
                 details=details,
                 actor=actor,
             )
+            await sync_premium_account_group(session, actor=actor)
             await session.commit()
             await session.refresh(account)
             return account
@@ -1096,15 +1782,20 @@ class AccountService:
         from telethon.sessions import StringSession  # noqa: PLC0415
 
         decrypted = await self.load_session(account_id)
-        proxy = None
+        transport = TelethonTransport(proxy=None)
         if self._proxy_service is not None:
             try:
-                route = await self._proxy_service.require_account_route(account_id)
-                proxy = _telethon_proxy(route)
+                recovery = getattr(self._proxy_service, "ensure_account_route", None)
+                route = (
+                    await recovery(account_id, actor="account-profile-operation")
+                    if callable(recovery)
+                    else await self._proxy_service.require_account_route(account_id)
+                )
+                transport = build_telethon_transport(route)
             except ProxyRouteUnavailable as exc:
                 if self._settings.account_require_proxy:
                     raise AccountOperationError(
-                        "для операции нужен назначенный рабочий прокси"
+                        "для операции не найден рабочий прокси; добавьте его в разделе «Прокси»"
                     ) from exc
         elif self._settings.account_require_proxy:
             raise AccountOperationError("сервис прокси не настроен")
@@ -1113,7 +1804,7 @@ class AccountService:
             StringSession(decrypted.session_string),
             decrypted.api_id,
             decrypted.api_hash,
-            proxy=proxy,
+            **transport.client_kwargs(),
             connection_retries=1,
             timeout=int(self._settings.account_connect_timeout_seconds),
             flood_sleep_threshold=self._settings.account_flood_sleep_threshold,
@@ -1139,7 +1830,11 @@ class AccountService:
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 logger.debug("profile client disconnect failed", exc_info=True)
 
-    async def _fetch_me(self, decrypted: DecryptedSession, proxy: object | None) -> object | None:
+    async def _fetch_me(
+        self,
+        decrypted: DecryptedSession,
+        transport: TelethonTransport,
+    ) -> object | None:
         if self._client_coordinator is not None:
 
             async def no_operation(_client: object) -> None:
@@ -1158,7 +1853,7 @@ class AccountService:
             StringSession(decrypted.session_string),
             decrypted.api_id,
             decrypted.api_hash,
-            proxy=proxy,
+            **transport.client_kwargs(),
             connection_retries=1,
             timeout=int(self._settings.account_connect_timeout_seconds),
         )
@@ -1191,12 +1886,17 @@ class AccountService:
             return None
         return configured.get_secret_value().strip() or None
 
-    def _import_proxy(self, route: ProxyNetworkRoute | None) -> object | None:
+    def _import_transport(self, route: ProxyNetworkRoute | None) -> TelethonTransport:
         if route is None:
             if self._settings.account_require_proxy:
                 raise AccountImportError("для импорта аккаунта нужен назначенный рабочий прокси")
-            return None
-        return _telethon_proxy(route)
+            return TelethonTransport(proxy=None)
+        return build_telethon_transport(route)
+
+    def _import_proxy(self, route: ProxyNetworkRoute | None) -> object | None:
+        """Backward-compatible proxy-only view for integrations using this helper."""
+
+        return self._import_transport(route).proxy
 
     # ----------------------------------------------------- blocking converters
     def _convert_tdata_archive(
@@ -1206,6 +1906,7 @@ class AccountService:
         api_hash: str,
         proxy: object | None,
         two_factor_password: str | None,
+        connection: object | None = None,
     ) -> _ConvertedSession:
         if len(archive_bytes) > MAX_ARCHIVE_BYTES:
             raise AccountImportError("архив tdata больше 25 МБ")
@@ -1222,6 +1923,7 @@ class AccountService:
                     api_hash=api_hash,
                     proxy=proxy,
                     two_factor_password=two_factor_password,
+                    **_connection_kwargs(TelethonTransport(proxy, connection)),
                 )
             )
 
@@ -1233,6 +1935,7 @@ class AccountService:
         api_hash: str,
         proxy: object | None,
         two_factor_password: str | None,
+        connection: object | None = None,
     ) -> _ConvertedSession:
         from opentele2.api import UseCurrentSession  # noqa: PLC0415
         from opentele2.td import TDesktop  # noqa: PLC0415
@@ -1249,6 +1952,7 @@ class AccountService:
                 proxy=proxy,
                 connection_retries=1,
                 timeout=int(self._settings.account_connect_timeout_seconds),
+                **_connection_kwargs(TelethonTransport(proxy, connection)),
             )
         except AccountImportError:
             raise
@@ -1261,6 +1965,7 @@ class AccountService:
             proxy=proxy,
             two_factor_password=two_factor_password,
             source_name="Telegram Desktop",
+            **_connection_kwargs(TelethonTransport(proxy, connection)),
         )
 
     async def _convert_existing_session(
@@ -1271,6 +1976,7 @@ class AccountService:
         api_hash: str,
         proxy: object | None,
         two_factor_password: str | None,
+        connection: object | None = None,
     ) -> _ConvertedSession:
         from opentele2.api import APIData  # noqa: PLC0415
         from opentele2.tl import TelegramClient as OpenTelethonClient  # noqa: PLC0415
@@ -1283,6 +1989,7 @@ class AccountService:
                 proxy=proxy,
                 connection_retries=1,
                 timeout=int(self._settings.account_connect_timeout_seconds),
+                **_connection_kwargs(TelethonTransport(proxy, connection)),
             )
         except Exception as exc:
             raise AccountImportError(
@@ -1295,6 +2002,7 @@ class AccountService:
             proxy=proxy,
             two_factor_password=two_factor_password,
             source_name="исходная Telethon-сессия",
+            **_connection_kwargs(TelethonTransport(proxy, connection)),
         )
 
     async def _authorize_new_server_session(
@@ -1306,6 +2014,7 @@ class AccountService:
         proxy: object | None,
         two_factor_password: str | None,
         source_name: str,
+        connection: object | None = None,
     ) -> _ConvertedSession:
         from opentele2.api import APIData  # noqa: PLC0415
         from opentele2.exception import NoPasswordProvided, PasswordIncorrect  # noqa: PLC0415
@@ -1332,6 +2041,7 @@ class AccountService:
                     connection_retries=1,
                     request_retries=2,
                     timeout=int(self._settings.account_connect_timeout_seconds),
+                    **_connection_kwargs(TelethonTransport(proxy, connection)),
                 ),
                 timeout=login_timeout,
             )
@@ -1361,6 +2071,7 @@ class AccountService:
                 phone=getattr(me, "phone", None),
                 username=getattr(me, "username", None),
                 has_profile_photo=getattr(me, "photo", None) is not None,
+                is_premium=_telegram_premium_value(me),
             )
         except AccountImportError:
             raise
@@ -1819,6 +2530,26 @@ def _locate_tdata_dir(root: Path) -> Path:
     return min(candidates, key=lambda item: len(item.parts))
 
 
+def build_telethon_transport(route: object) -> TelethonTransport:
+    """Map a stored route to both Telethon proxy data and connection type."""
+
+    protocol = route.protocol
+    value = getattr(protocol, "value", str(protocol))
+    if value == "mtproto":
+        secret = getattr(route, "password", None)
+        if not isinstance(secret, str) or not secret:
+            raise ProxyRouteUnavailable("у MTProto-прокси отсутствует secret")
+        return TelethonTransport(
+            proxy=(route.host, int(route.port), secret),
+            connection=mtproto_connection_type(secret),
+        )
+    return TelethonTransport(proxy=_telethon_proxy(route))
+
+
+def _connection_kwargs(transport: TelethonTransport) -> dict[str, object]:
+    return {"connection": transport.connection} if transport.connection is not None else {}
+
+
 def _telethon_proxy(route: object) -> tuple[object, str, int, bool, str | None, str | None]:
     import socks  # noqa: PLC0415 - PySocks constants for telethon
 
@@ -1830,6 +2561,8 @@ def _telethon_proxy(route: object) -> tuple[object, str, int, bool, str | None, 
     elif value in {"http", "https"}:
         proxy_type = socks.HTTP
         rdns = True
+    elif value == "mtproto":
+        raise ProxyRouteUnavailable("для MTProto нужен специальный транспорт Telethon")
     else:  # pragma: no cover - defensive
         raise ProxyRouteUnavailable(f"неподдерживаемый протокол прокси: {value}")
     return (
@@ -1906,6 +2639,14 @@ def _validate_profile_photo_name(value: str) -> str:
 def _optional_profile_value(value: object) -> str | None:
     normalized = str(value).strip() if value is not None else ""
     return normalized[:64] or None
+
+
+def _telegram_premium_value(profile: object | None) -> bool | None:
+    """Return Telegram's value only when the response actually includes it."""
+    if profile is None:
+        return None
+    value = getattr(profile, "premium", None)
+    return bool(value) if value is not None else None
 
 
 def _safe_account_operation_error(error: BaseException) -> str:
@@ -2010,6 +2751,6 @@ def _chat_can_send_hint(chat: object, chat_type: str) -> bool:
     )
 
 
-def build_telethon_proxy(route: object) -> tuple[object, str, int, bool, str | None, str | None]:
+def build_telethon_proxy(route: object) -> object:
     """Public wrapper so the live gateway can reuse the proxy mapping."""
-    return _telethon_proxy(route)
+    return build_telethon_transport(route).proxy

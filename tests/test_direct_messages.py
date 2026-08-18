@@ -15,16 +15,26 @@ from proxima_traffic.direct_messages import (
     DirectMessageService,
     parse_direct_blacklist_ids,
 )
-from proxima_traffic.gateways import DirectMessageDelivery, DryRunGateway
+from proxima_traffic.gateways import (
+    DirectMessageDelivery,
+    DryRunGateway,
+    TemporaryGatewayError,
+)
 from proxima_traffic.models import (
     Account,
+    DirectLaunch,
     DirectLaunchStatus,
     DirectMessageTask,
     DirectMessageTaskStatus,
+    ProxyAssignment,
+    ProxyEndpoint,
+    ProxyProtocol,
+    ProxyStatus,
     Subscriber,
     SubscriberSegment,
     utc_now,
 )
+from proxima_traffic.proxies import ProxyService, _ProxyProbeResult
 from proxima_traffic.services import CampaignRunner, ConflictError
 from proxima_traffic.subscriber_import import (
     SubscriberParseStats,
@@ -76,6 +86,12 @@ class CapturingDirectGateway(DryRunGateway):
         self.direct_sender_ids.append(int(kwargs["account"].id))
         self.direct_texts.append(str(kwargs["text"]))
         return await super().send_direct_content(**kwargs)
+
+
+class NetworkFailureDirectGateway(DryRunGateway):
+    async def send_direct_content(self, **kwargs):
+        del kwargs
+        raise TemporaryGatewayError("network unavailable", code="network_error", retry_after=0)
 
 
 def test_jsonl_reader_normalizes_real_export_schema_and_skips_bad_rows(tmp_path: Path) -> None:
@@ -235,6 +251,100 @@ async def test_pre_send_stop_guard_skips_task_without_calling_gateway(tmp_path: 
     assert result.status == DirectMessageTaskStatus.SKIPPED
     assert result.error_code == "recipient_blacklisted"
     assert gateway._next_message_id == 10_000
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_direct_launch_keeps_running_recipient_reserved(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "direct-cancel-reservation.db")
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = DryRunGateway()
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    service = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct",
+    )
+    source = tmp_path / "cancel-reservation.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                '{"telegram_id":"360001","username":"first_member","is_premium":false}',
+                '{"telegram_id":"360002","username":"second_member","is_premium":false}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    imported = await service.import_subscribers(
+        source,
+        list_name="Cancel reservation",
+        source_filename=source.name,
+    )
+    async with database.session_factory() as session:
+        account = Account(label="sender", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Cancel reservation DM",
+        subscriber_list_id=imported.subscriber_list.id,
+        segment=SubscriberSegment.ALL,
+        recipient_limit=2,
+        contact_cooldown_days=30,
+        account_ids=[account.id],
+        text="Prepared post",
+        html_text=None,
+        media_path=None,
+        media_kind=None,
+        media_name=None,
+        media_size=None,
+    )
+    launch = await service.launch_campaign(campaign.id, consent_confirmed=True)
+    running_task = await service._claim_next()
+
+    assert running_task is not None
+    assert await service.cancel_launch(launch.id) == 1
+
+    async with database.session_factory() as session:
+        tasks = list(
+            await session.scalars(
+                select(DirectMessageTask)
+                .where(DirectMessageTask.launch_id == launch.id)
+                .order_by(DirectMessageTask.id)
+            )
+        )
+        active = next(task for task in tasks if task.id == running_task.id)
+        cancelled = next(task for task in tasks if task.id != running_task.id)
+        active_subscriber = await session.get(Subscriber, active.subscriber_id)
+        cancelled_subscriber = await session.get(Subscriber, cancelled.subscriber_id)
+
+    assert active.status == DirectMessageTaskStatus.RUNNING
+    assert active_subscriber is not None
+    assert active_subscriber.reserved_direct_launch_id == launch.id
+    assert cancelled.status == DirectMessageTaskStatus.CANCELLED
+    assert cancelled_subscriber is not None
+    assert cancelled_subscriber.reserved_direct_launch_id is None
+
+    async with database.session_factory() as session:
+        expired = await session.get(DirectMessageTask, running_task.id)
+        assert expired is not None
+        expired.lease_until = utc_now() - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.process_next() is None
+    async with database.session_factory() as session:
+        recovered = await session.get(DirectMessageTask, running_task.id)
+        recovered_subscriber = await session.get(Subscriber, running_task.subscriber_id)
+    assert recovered is not None
+    assert recovered.status == DirectMessageTaskStatus.FAILED
+    assert recovered.error_code == "cancelled_outcome_unknown"
+    assert recovered_subscriber is not None
+    assert recovered_subscriber.reserved_direct_launch_id is None
+    assert (await service.get_launch_view(launch.id)).launch.status == DirectLaunchStatus.CANCELLED
     await database.dispose()
 
 
@@ -423,6 +533,256 @@ async def test_direct_launch_requires_explicit_consent_confirmation(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_live_direct_launch_refuses_unhealthy_required_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path, "direct-required-proxy.db")
+    settings.dry_run = False
+    settings.account_require_proxy = True
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = DryRunGateway()
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    proxy_service = ProxyService(database.session_factory, settings)
+
+    async def failed_probe(proxy_url: str) -> _ProxyProbeResult:
+        assert "127.0.0.1:1080" in proxy_url
+        return _ProxyProbeResult(
+            healthy=False,
+            latency_ms=None,
+            observed_ip=None,
+            error="ConnectError: соединение через прокси не установлено",
+        )
+
+    monkeypatch.setattr(proxy_service, "_probe_proxy_url", failed_probe)
+    service = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct",
+        proxy_service=proxy_service,
+    )
+    source = tmp_path / "required-proxy.jsonl"
+    source.write_text(
+        '{"telegram_id":"501111","username":"recipient","is_premium":false}\n',
+        encoding="utf-8",
+    )
+    imported = await service.import_subscribers(
+        source,
+        list_name="Required proxy",
+        source_filename=source.name,
+    )
+    async with database.session_factory() as session:
+        account = Account(
+            label="live sender",
+            ownership_confirmed=True,
+            authorized=True,
+            session_encrypted="session",
+            api_id=1,
+            api_hash_encrypted="api-hash",
+        )
+        proxy = ProxyEndpoint(
+            label="broken proxy",
+            protocol=ProxyProtocol.SOCKS5,
+            host="127.0.0.1",
+            port=1080,
+            fingerprint="a" * 64,
+            status=ProxyStatus.UNHEALTHY,
+        )
+        session.add_all([account, proxy])
+        await session.flush()
+        session.add(
+            ProxyAssignment(
+                proxy_id=proxy.id,
+                assignment_key=f"account:{account.id}",
+            )
+        )
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Required proxy DM",
+        subscriber_list_id=imported.subscriber_list.id,
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[account.id],
+        text="Prepared post",
+        html_text=None,
+        media_path=None,
+        media_kind=None,
+        media_name=None,
+        media_size=None,
+    )
+
+    with pytest.raises(ConflictError, match="обязательный прокси"):
+        await service.launch_campaign(campaign.id, consent_confirmed=True)
+    async with database.session_factory() as session:
+        assert await session.scalar(select(func.count(DirectLaunch.id))) == 0
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_running_direct_launch_stops_and_releases_recipients_when_route_is_lost(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, "direct-route-lost.db")
+    settings.dry_run = False
+    settings.account_require_proxy = True
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = DryRunGateway()
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    service = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct",
+    )
+    source = tmp_path / "route-lost.jsonl"
+    source.write_text(
+        '{"telegram_id":"501113","username":"recipient","is_premium":false}\n',
+        encoding="utf-8",
+    )
+    imported = await service.import_subscribers(
+        source,
+        list_name="Route lost",
+        source_filename=source.name,
+    )
+    async with database.session_factory() as session:
+        account = Account(
+            label="live sender",
+            ownership_confirmed=True,
+            authorized=True,
+            session_encrypted="session",
+            api_id=1,
+            api_hash_encrypted="api-hash",
+        )
+        proxy = ProxyEndpoint(
+            label="initially healthy proxy",
+            protocol=ProxyProtocol.SOCKS5,
+            host="127.0.0.1",
+            port=1080,
+            fingerprint="b" * 64,
+            status=ProxyStatus.HEALTHY,
+        )
+        session.add_all([account, proxy])
+        await session.flush()
+        session.add(
+            ProxyAssignment(
+                proxy_id=proxy.id,
+                assignment_key=f"account:{account.id}",
+            )
+        )
+        await session.commit()
+        await session.refresh(account)
+        await session.refresh(proxy)
+    campaign = await service.create_campaign(
+        name="Route lost DM",
+        subscriber_list_id=imported.subscriber_list.id,
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[account.id],
+        text="Prepared post",
+        html_text=None,
+        media_path=None,
+        media_kind=None,
+        media_name=None,
+        media_size=None,
+    )
+    launch = await service.launch_campaign(campaign.id, consent_confirmed=True)
+    async with database.session_factory() as session:
+        stored_proxy = await session.get(ProxyEndpoint, proxy.id)
+        assert stored_proxy is not None
+        stored_proxy.status = ProxyStatus.UNHEALTHY
+        await session.commit()
+
+    result = await service.process_next()
+
+    assert result is not None
+    assert result.status == DirectMessageTaskStatus.FAILED
+    assert result.error_code == "proxy_unavailable"
+    view = await service.get_launch_view(launch.id)
+    assert view.launch.status == DirectLaunchStatus.FAILED
+    assert view.failed == 1
+    async with database.session_factory() as session:
+        subscriber = await session.scalar(select(Subscriber))
+        assert subscriber is not None
+        assert subscriber.reserved_direct_launch_id is None
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_direct_network_errors_stop_at_attempt_limit(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "direct-network-limit.db")
+    settings.worker_max_attempts = 2
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = NetworkFailureDirectGateway()
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    service = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct",
+    )
+    source = tmp_path / "network-limit.jsonl"
+    source.write_text(
+        '{"telegram_id":"501112","username":"recipient","is_premium":false}\n',
+        encoding="utf-8",
+    )
+    imported = await service.import_subscribers(
+        source,
+        list_name="Network limit",
+        source_filename=source.name,
+    )
+    async with database.session_factory() as session:
+        account = Account(label="sender", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Network limit DM",
+        subscriber_list_id=imported.subscriber_list.id,
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[account.id],
+        text="Prepared post",
+        html_text=None,
+        media_path=None,
+        media_kind=None,
+        media_name=None,
+        media_size=None,
+    )
+    launch = await service.launch_campaign(campaign.id, consent_confirmed=True)
+
+    first = await service.process_next()
+    assert first is not None and first.status == DirectMessageTaskStatus.QUEUED
+    async with database.session_factory() as session:
+        task = await session.scalar(
+            select(DirectMessageTask).where(DirectMessageTask.launch_id == launch.id)
+        )
+        assert task is not None
+        task.attempt_count = task.max_attempts - 1
+        task.scheduled_for = utc_now()
+        await session.commit()
+    second = await service.process_next()
+
+    assert second is not None
+    assert second.status == DirectMessageTaskStatus.FAILED
+    assert second.error_code == "network_error"
+    assert second.attempt_count == second.max_attempts
+    view = await service.get_launch_view(launch.id)
+    assert view.launch.status == DirectLaunchStatus.FAILED
+    await database.dispose()
+
+
+@pytest.mark.asyncio
 async def test_uncertain_delivery_is_not_automatically_sent_twice(tmp_path: Path) -> None:
     settings = _settings(tmp_path, "direct-timeout.db")
     settings.worker_step_timeout_seconds = 0.02
@@ -457,7 +817,7 @@ async def test_uncertain_delivery_is_not_automatically_sent_twice(tmp_path: Path
         subscriber_list_id=imported.subscriber_list.id,
         segment=SubscriberSegment.ALL,
         recipient_limit=1,
-        contact_cooldown_days=30,
+        contact_cooldown_days=0,
         account_ids=[account.id],
         text="Prepared post",
         html_text=None,

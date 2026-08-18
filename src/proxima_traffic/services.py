@@ -7,7 +7,7 @@ import logging
 import random
 import re
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -26,6 +26,7 @@ from proxima_traffic.content import (
     parse_content_variants,
     render_spintax,
     serialize_content_variants,
+    validate_spintax,
 )
 from proxima_traffic.dialogues import (
     DialogueStep,
@@ -72,6 +73,10 @@ from proxima_traffic.models import (
     ChannelCommentRule,
     ChannelCommentRun,
     ChannelCommentRunStatus,
+    DirectLaunch,
+    DirectLaunchStatus,
+    DirectMessageTask,
+    DirectMessageTaskStatus,
     MembershipStatus,
     ParticipantReactionRule,
     ParticipantReactionTask,
@@ -80,6 +85,9 @@ from proxima_traffic.models import (
     ReactionTaskStatus,
     RunStatus,
     RunStep,
+    Subscriber,
+    SubscriberInviteLaunch,
+    SubscriberInviteTask,
     Target,
     TargetAccountState,
     TargetListItem,
@@ -163,6 +171,43 @@ class WorkerSnapshot:
     failed_steps: int
     last_error: str | None
     last_processed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalStopSummary:
+    """A truthful result for the operator's cross-queue emergency stop."""
+
+    campaign_runs: int = 0
+    campaign_reactions: int = 0
+    channel_comment_rules_paused: int = 0
+    channel_comment_runs: int = 0
+    participant_reaction_rules_paused: int = 0
+    participant_reaction_tasks: int = 0
+    direct_launches: int = 0
+    direct_message_tasks: int = 0
+    subscriber_invite_launches: int = 0
+    subscriber_invite_tasks: int = 0
+
+    @property
+    def task_count(self) -> int:
+        """Number of concrete deliveries/tasks that were cancelled or signalled."""
+
+        return (
+            self.campaign_runs
+            + self.campaign_reactions
+            + self.channel_comment_runs
+            + self.participant_reaction_tasks
+            + self.direct_message_tasks
+            + self.subscriber_invite_tasks
+        )
+
+    @property
+    def rule_count(self) -> int:
+        return self.channel_comment_rules_paused + self.participant_reaction_rules_paused
+
+    @property
+    def launch_count(self) -> int:
+        return self.direct_launches + self.subscriber_invite_launches
 
 
 def add_audit_event(
@@ -345,16 +390,31 @@ class CampaignRunner:
             raise AccountSendDeferred(resume_at or utc_now() + timedelta(seconds=1))
         context_token = self._send_reservation.set((account_id, token))
         heartbeat_stop = asyncio.Event()
+        reservation_lost = asyncio.Event()
+        owner_task = asyncio.current_task()
         heartbeat_task = asyncio.create_task(
-            self._heartbeat_account_send_slot(account_id, token, heartbeat_stop),
+            self._heartbeat_account_send_slot(
+                account_id,
+                token,
+                heartbeat_stop,
+                reservation_lost,
+                owner_task,
+            ),
             name=f"account-send-reservation-{account_id}",
         )
         try:
             yield
+            if reservation_lost.is_set():
+                raise LeaseLostError("account send reservation was lost")
+        except asyncio.CancelledError:
+            if reservation_lost.is_set():
+                raise LeaseLostError("account send reservation was lost") from None
+            raise
         finally:
             self._send_reservation.reset(context_token)
             heartbeat_stop.set()
-            await heartbeat_task
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
             await self._release_account_send_slot(account_id, token)
 
     async def _claim_account_send_slot(
@@ -418,6 +478,8 @@ class CampaignRunner:
         account_id: int,
         token: str,
         stop_event: asyncio.Event,
+        lost_event: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
     ) -> None:
         interval = max(1.0, float(self._cfg("worker_heartbeat_seconds", 15.0)))
         while not stop_event.is_set():
@@ -439,12 +501,23 @@ class CampaignRunner:
                             + timedelta(seconds=self._send_reservation_seconds)
                         )
                     )
-                    await session.commit()
+                await session.commit()
                 if renewed.rowcount != 1:
+                    self._signal_lost_reservation(lost_event, owner_task)
                     return
             except Exception:  # noqa: BLE001 - expiry permits another worker to recover
                 logger.exception("Account send reservation heartbeat failed for %s", account_id)
+                self._signal_lost_reservation(lost_event, owner_task)
                 return
+
+    @staticmethod
+    def _signal_lost_reservation(
+        lost_event: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
+    ) -> None:
+        lost_event.set()
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
 
     async def _release_account_send_slot(self, account_id: int, token: str) -> None:
         async with self._session_factory() as session:
@@ -527,6 +600,144 @@ class CampaignRunner:
             message_id=message_id,
             exc=exc,
         )
+
+    async def recover_delayed_membership_gate(
+        self,
+        *,
+        action_id: int,
+        delayed_delivery_token: str,
+        account_id: int,
+        target_id: int,
+        message_id: int,
+        exc: BaseException,
+    ) -> bool:
+        """Recover one late moderator subscription gate and reopen its exact step.
+
+        The delayed monitor only acts while the deleted action is still the
+        newest successful step of its run.  That avoids replaying a message
+        below a later dialogue reply or a completed newer publication.
+        """
+
+        async with self._session_factory() as session:
+            action = await session.get(ActionLog, action_id)
+            if (
+                action is None
+                or action.status != ActionStatus.SUCCEEDED
+                or action.external_message_id != message_id
+                or action.delayed_delivery_lease_token != delayed_delivery_token
+            ):
+                return False
+            run = await session.get(CampaignRun, action.run_id)
+            if (
+                run is None
+                or run.membership_gate_retry_count >= 1
+                or run.cancel_requested
+                or run.status == RunStatus.RUNNING
+            ):
+                return False
+            has_later_step = await session.scalar(
+                select(ActionLog.id)
+                .where(
+                    ActionLog.run_id == action.run_id,
+                    ActionLog.status == ActionStatus.SUCCEEDED,
+                    ActionLog.id > action.id,
+                )
+                .limit(1)
+            )
+            if has_later_step is not None:
+                return False
+
+        recovery = await self._recover_membership_gate(run, account_id, target_id, exc)
+        if recovery is None or not recovery.detected or not recovery.recovered:
+            return False
+
+        retry_at = utc_now() + timedelta(
+            seconds=int(self._cfg("membership_gate_retry_delay_seconds", 300))
+        )
+        async with self._session_factory() as session:
+            action = await session.get(ActionLog, action_id)
+            run = await session.get(CampaignRun, action.run_id) if action is not None else None
+            if (
+                action is None
+                or run is None
+                or action.status != ActionStatus.SUCCEEDED
+                or action.external_message_id != message_id
+                or action.delayed_delivery_lease_token != delayed_delivery_token
+                or run.membership_gate_retry_count >= 1
+                or run.cancel_requested
+                or run.status == RunStatus.RUNNING
+            ):
+                return False
+            has_later_step = await session.scalar(
+                select(ActionLog.id)
+                .where(
+                    ActionLog.run_id == action.run_id,
+                    ActionLog.status == ActionStatus.SUCCEEDED,
+                    ActionLog.id > action.id,
+                )
+                .limit(1)
+            )
+            campaign = await session.get(Campaign, run.campaign_id)
+            if has_later_step is not None or campaign is None:
+                return False
+            if campaign.mode == CampaignMode.BROADCAST:
+                if (
+                    action.kind != ActionKind.PRIMARY_MESSAGE
+                    or run.primary_message_id != message_id
+                ):
+                    return False
+                run.primary_message_id = None
+                run.next_step = RunStep.PRIMARY
+            else:
+                retry_step_index = int(run.dialogue_step_index) - 1
+                if retry_step_index < 0 or run.dialogue_last_message_id != message_id:
+                    return False
+                run.dialogue_step_index = retry_step_index
+                run.dialogue_last_message_id = action.reply_to_message_id
+                run.next_step = RunStep.PRIMARY if retry_step_index == 0 else RunStep.REPLY
+                if retry_step_index == 0:
+                    run.primary_message_id = None
+                elif retry_step_index == 1:
+                    run.reply_message_id = None
+
+            action.status = ActionStatus.FAILED
+            action.error_code = "membership_gate_recovered"
+            action.error = (
+                "subscription gate resolved after delayed delivery verification: "
+                f"{recovery.notice or 'Telegram inline buttons'}"
+            )[:2000]
+            action.delayed_delivery_checked_at = utc_now()
+            action.delayed_delivery_retry_at = None
+            action.delayed_delivery_lease_owner = None
+            action.delayed_delivery_lease_token = None
+            action.delayed_delivery_lease_until = None
+            run.membership_gate_retry_count = 1
+            run.status = RunStatus.QUEUED
+            run.scheduled_for = retry_at
+            run.error = None
+            run.error_code = "membership_gate_retry"
+            run.finished_at = None
+            run.attempt_count = max(0, run.attempt_count - 1)
+            self._release_lease(run)
+            await self.refresh_target_quality(session, target_id)
+            add_audit_event(
+                session,
+                event_type="run.membership_gate_late_retry_scheduled",
+                entity_type="campaign_run",
+                entity_id=run.id,
+                details={
+                    "action_id": action.id,
+                    "account_id": account_id,
+                    "target_id": target_id,
+                    "message_id": message_id,
+                    "retry_at": retry_at.isoformat(),
+                    "joined_channel_refs": list(recovery.joined_channel_refs),
+                    "verification_callback_count": recovery.verification_callback_count,
+                },
+                actor="delivery-monitor",
+            )
+            await session.commit()
+            return True
 
     async def _run_with_broadcast_locks(
         self,
@@ -1334,9 +1545,7 @@ class CampaignRunner:
             content_sender = getattr(self._gateway, "send_content", None)
             if content_sender is None:
                 if step.media_path is not None:
-                    raise ConflictError(
-                        "настроенный шлюз не поддерживает медиа в цепочках диалога"
-                    )
+                    raise ConflictError("настроенный шлюз не поддерживает медиа в цепочках диалога")
                 sent = await self._gateway.send_message(
                     account=sender,
                     target=target,
@@ -3600,7 +3809,11 @@ class CampaignRunner:
             CampaignRunner._campaign_content_variants(campaign)
             if campaign.primary_media_path is not None:
                 if campaign.primary_media_kind not in {
-                    "photo", "video", "document", "voice", "video_note"
+                    "photo",
+                    "video",
+                    "document",
+                    "voice",
+                    "video_note",
                 }:
                     raise ConflictError("broadcast media kind is invalid")
                 if len(campaign.primary_text) > 1024:
@@ -4284,8 +4497,7 @@ class RunQueue:
                     continue
                 media_by_account.setdefault(int(step.account_id), set()).add(step.media_kind)
             required_media_kinds_by_account = {
-                account_id: frozenset(kinds)
-                for account_id, kinds in media_by_account.items()
+                account_id: frozenset(kinds) for account_id, kinds in media_by_account.items()
             }
         else:
             variants = CampaignRunner._campaign_content_variants(campaign)
@@ -4387,15 +4599,19 @@ class RunQueue:
         available: list[int] = []
         for account_id in account_ids:
             try:
-                await self._proxy_service.require_account_route(account_id)
+                recovery = getattr(self._proxy_service, "ensure_account_route", None)
+                if callable(recovery):
+                    await recovery(account_id, actor="broadcast-route-recovery")
+                else:
+                    await self._proxy_service.require_account_route(account_id)
             except ProxyRouteUnavailable as exc:
                 if tolerate_unavailable and account_id in sender_pool:
                     continue
                 account = await session.get(Account, account_id)
                 label = account.label if account is not None else f"#{account_id}"
                 raise ConflictError(
-                    f"у аккаунта «{label}» не назначен исправный прокси; "
-                    "сначала назначьте HEALTHY прокси"
+                    f"у аккаунта «{label}» нет рабочего прокси; "
+                    "автозамена проверила пул, но не нашла исправный вариант"
                 ) from exc
             if account_id in sender_pool:
                 available.append(account_id)
@@ -4769,6 +4985,10 @@ class RunQueue:
             primary_text = primary_text.strip()
             if not 1 <= len(primary_text) <= 4096:
                 raise ConflictError("message text must contain 1 to 4096 characters")
+            try:
+                validate_spintax(primary_text)
+            except ContentError as exc:
+                raise ConflictError(str(exc)) from exc
         if no_timer_interval_seconds is not None and not (
             60 <= no_timer_interval_seconds <= 7 * 24 * 3600
         ):
@@ -4989,6 +5209,24 @@ class RunQueue:
             return len(runs)
 
     async def cancel_all(self) -> int:
+        """Preserve the legacy task-count API for non-UI callers.
+
+        The control panel needs the detailed result to report paused rules and
+        the different delivery queues accurately; callers that historically
+        expected an integer continue to receive the number of affected tasks.
+        """
+
+        return (await self.cancel_all_with_summary()).task_count
+
+    async def cancel_all_with_summary(self) -> GlobalStopSummary:
+        """Atomically stop every delivery queue owned by this installation.
+
+        Queued work becomes terminal immediately. Running work keeps its lease
+        so its worker can persist the truthful external outcome, but is told to
+        stop before its next external step. Subscriber reservations belonging
+        to cancelled work are released in the same transaction.
+        """
+
         async with self._session_factory() as session:
             runs = list(
                 await session.scalars(
@@ -5092,6 +5330,141 @@ class RunQueue:
                     error_code="cancel_requested",
                 )
             )
+
+            direct_launches = list(
+                await session.scalars(
+                    select(DirectLaunch).where(
+                        DirectLaunch.status.in_(
+                            [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                        )
+                    )
+                )
+            )
+            direct_launch_ids = [int(launch.id) for launch in direct_launches]
+            direct_queued_subscriber_ids: list[int] = []
+            direct_message_tasks = 0
+            if direct_launch_ids:
+                direct_queued_subscriber_ids = [
+                    int(subscriber_id)
+                    for subscriber_id in await session.scalars(
+                        select(DirectMessageTask.subscriber_id).where(
+                            DirectMessageTask.launch_id.in_(direct_launch_ids),
+                            DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                        )
+                    )
+                ]
+                cancelled_direct_messages = await session.execute(
+                    update(DirectMessageTask)
+                    .where(
+                        DirectMessageTask.launch_id.in_(direct_launch_ids),
+                        DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                    )
+                    .values(
+                        status=DirectMessageTaskStatus.CANCELLED,
+                        error="global stop requested",
+                        error_code="global_stop",
+                        finished_at=now,
+                        updated_at=now,
+                        lease_owner=None,
+                        lease_token=None,
+                        lease_until=None,
+                    )
+                )
+                direct_message_tasks = int(cancelled_direct_messages.rowcount or 0)
+                if direct_queued_subscriber_ids:
+                    await session.execute(
+                        update(Subscriber)
+                        .where(
+                            Subscriber.id.in_(direct_queued_subscriber_ids),
+                            Subscriber.reserved_direct_launch_id.in_(direct_launch_ids),
+                        )
+                        .values(reserved_direct_launch_id=None, updated_at=now)
+                    )
+                running_direct_launch_ids = {
+                    int(launch_id)
+                    for launch_id in await session.scalars(
+                        select(DirectMessageTask.launch_id)
+                        .where(
+                            DirectMessageTask.launch_id.in_(direct_launch_ids),
+                            DirectMessageTask.status == DirectMessageTaskStatus.RUNNING,
+                        )
+                        .distinct()
+                    )
+                }
+                for launch in direct_launches:
+                    launch.cancel_requested = True
+                    launch.updated_at = now
+                    if int(launch.id) not in running_direct_launch_ids:
+                        launch.status = DirectLaunchStatus.CANCELLED
+                        launch.finished_at = now
+
+            invite_launches = list(
+                await session.scalars(
+                    select(SubscriberInviteLaunch).where(
+                        SubscriberInviteLaunch.status.in_(
+                            [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                        )
+                    )
+                )
+            )
+            invite_launch_ids = [int(launch.id) for launch in invite_launches]
+            invite_queued_subscriber_ids: list[int] = []
+            subscriber_invite_tasks = 0
+            if invite_launch_ids:
+                invite_queued_subscriber_ids = [
+                    int(subscriber_id)
+                    for subscriber_id in await session.scalars(
+                        select(SubscriberInviteTask.subscriber_id).where(
+                            SubscriberInviteTask.launch_id.in_(invite_launch_ids),
+                            SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                        )
+                    )
+                ]
+                cancelled_invites = await session.execute(
+                    update(SubscriberInviteTask)
+                    .where(
+                        SubscriberInviteTask.launch_id.in_(invite_launch_ids),
+                        SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                    )
+                    .values(
+                        status=DirectMessageTaskStatus.CANCELLED,
+                        error="global stop requested",
+                        error_code="global_stop",
+                        finished_at=now,
+                        updated_at=now,
+                        lease_owner=None,
+                        lease_token=None,
+                        lease_until=None,
+                    )
+                )
+                subscriber_invite_tasks = int(cancelled_invites.rowcount or 0)
+                if invite_queued_subscriber_ids:
+                    await session.execute(
+                        update(Subscriber)
+                        .where(
+                            Subscriber.id.in_(invite_queued_subscriber_ids),
+                            Subscriber.reserved_invite_launch_id.in_(invite_launch_ids),
+                        )
+                        .values(reserved_invite_launch_id=None, updated_at=now)
+                    )
+                running_invite_launch_ids = {
+                    int(launch_id)
+                    for launch_id in await session.scalars(
+                        select(SubscriberInviteTask.launch_id)
+                        .where(
+                            SubscriberInviteTask.launch_id.in_(invite_launch_ids),
+                            SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
+                        )
+                        .distinct()
+                    )
+                }
+                for launch in invite_launches:
+                    launch.cancel_requested = True
+                    launch.updated_at = now
+                    if int(launch.id) not in running_invite_launch_ids:
+                        launch.status = DirectLaunchStatus.CANCELLED
+                        launch.finished_at = now
+
             campaign_count = len(runs)
             reaction_count = int(cancelled_reactions.rowcount or 0) + int(
                 running_reactions.rowcount or 0
@@ -5104,8 +5477,19 @@ class RunQueue:
             participant_count = int(cancelled_participant_reactions.rowcount or 0) + int(
                 running_participant_reactions.rowcount or 0
             )
-            total = campaign_count + reaction_count + comment_count + participant_count
-            if total or comment_rule_count or participant_rule_count:
+            summary = GlobalStopSummary(
+                campaign_runs=campaign_count,
+                campaign_reactions=reaction_count,
+                channel_comment_rules_paused=comment_rule_count,
+                channel_comment_runs=comment_count,
+                participant_reaction_rules_paused=participant_rule_count,
+                participant_reaction_tasks=participant_count,
+                direct_launches=len(direct_launches),
+                direct_message_tasks=direct_message_tasks,
+                subscriber_invite_launches=len(invite_launches),
+                subscriber_invite_tasks=subscriber_invite_tasks,
+            )
+            if summary.task_count or summary.rule_count or summary.launch_count:
                 add_audit_event(
                     session,
                     event_type="queue.cancel_all_requested",
@@ -5118,10 +5502,14 @@ class RunQueue:
                         "channel_comment_runs": comment_count,
                         "participant_reaction_rules_paused": participant_rule_count,
                         "participant_reaction_tasks": participant_count,
+                        "direct_launches": summary.direct_launches,
+                        "direct_message_tasks": summary.direct_message_tasks,
+                        "subscriber_invite_launches": summary.subscriber_invite_launches,
+                        "subscriber_invite_tasks": summary.subscriber_invite_tasks,
                     },
                 )
                 await session.commit()
-            return total
+            return summary
 
     async def recover_expired_leases(self) -> int:
         async with self._session_factory() as session:
@@ -5237,14 +5625,43 @@ class QueueWorker:
             raise LeaseLostError("claimed run has no fencing token")
         lease_token = run.lease_token
         heartbeat_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
         heartbeat_task = asyncio.create_task(
-            self._heartbeat(run.id, lease_token, heartbeat_stop),
+            self._heartbeat(
+                run.id,
+                lease_token,
+                heartbeat_stop,
+                lease_lost,
+                asyncio.current_task(),
+            ),
             name=f"heartbeat-{run.id}",
         )
+
+        async def stop_heartbeat() -> None:
+            """End renewal before writing this step's terminal/retry outcome.
+
+            The outcome write intentionally clears the run lease.  Letting a
+            concurrent heartbeat observe that expected change and cancel this
+            task can interrupt the very write that makes the outcome durable.
+            """
+
+            heartbeat_stop.set()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
         self._active_steps += 1
         try:
-            async with asyncio.timeout(self._step_timeout_seconds):
-                result = await self._runner.process_step(run.id, lease_token)
+            try:
+                async with asyncio.timeout(self._step_timeout_seconds):
+                    result = await self._runner.process_step(run.id, lease_token)
+            except BaseException:
+                await stop_heartbeat()
+                if lease_lost.is_set():
+                    raise LeaseLostError("campaign run lease was lost") from None
+                raise
+            await stop_heartbeat()
+            if lease_lost.is_set():
+                raise LeaseLostError("campaign run lease was lost")
             self._processed_steps += 1
             self._last_error = None
             self._last_processed_at = utc_now().isoformat()
@@ -5264,6 +5681,11 @@ class QueueWorker:
                 safe_error_message(exc),
                 error_code="cancelled",
             )
+        except asyncio.CancelledError:
+            if not lease_lost.is_set():
+                raise
+            logger.warning("Campaign run %s lost its lease during execution", run.id)
+            return await self._queue.get_run(run.id)
         except LeaseLostError:
             logger.warning("Campaign run %s lost its lease fencing token", run.id)
             return await self._queue.get_run(run.id)
@@ -5302,7 +5724,9 @@ class QueueWorker:
             )
         finally:
             heartbeat_stop.set()
-            await heartbeat_task
+            if not heartbeat_task.done():
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
             self._active_steps -= 1
 
     async def run_forever(self, reporter: WorkerIterationReporter | None = None) -> None:
@@ -5345,6 +5769,8 @@ class QueueWorker:
         run_id: int,
         lease_token: str,
         stop_event: asyncio.Event,
+        lost_event: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
     ) -> None:
         while not stop_event.is_set():
             try:
@@ -5355,10 +5781,21 @@ class QueueWorker:
                     renewed = await self._queue.heartbeat(run_id, self._worker_id, lease_token)
                 except Exception:
                     logger.exception("Heartbeat failed for campaign run %s", run_id)
+                    self._signal_lost_lease(lost_event, owner_task)
                     return
                 if not renewed:
                     logger.warning("Heartbeat lost for campaign run %s", run_id)
+                    self._signal_lost_lease(lost_event, owner_task)
                     return
+
+    @staticmethod
+    def _signal_lost_lease(
+        lost_event: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
+    ) -> None:
+        lost_event.set()
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
 
     async def _mark_error(
         self,

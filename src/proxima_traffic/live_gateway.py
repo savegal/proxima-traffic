@@ -25,7 +25,12 @@ from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxima_traffic.account_leases import AccountOperationLeaseCoordinator
-from proxima_traffic.accounts import AccountImportError, AccountService, build_telethon_proxy
+from proxima_traffic.accounts import (
+    AccountImportError,
+    AccountService,
+    TelethonTransport,
+    build_telethon_transport,
+)
 from proxima_traffic.config import Settings
 from proxima_traffic.content import (
     ContentError,
@@ -359,63 +364,58 @@ class TelethonGateway:
         if account.id is None or target.id is None or deleted_message_id <= 0:
             raise PermanentGatewayError("live context is missing persisted identifiers")
         async with self._account_operation(account.id):
-            gate_detected = False
             try:
                 client = await self._ensure_client(account.id)
                 entity = await self._resolve_entity(client, account.id, target.chat_ref)
-                recent = await asyncio.wait_for(
-                    client.get_messages(
-                        entity,
-                        limit=int(self._settings.membership_gate_scan_limit),
-                    ),
-                    timeout=float(self._settings.account_delivery_verify_timeout_seconds),
-                )
-                gate_message, gate = self._find_membership_gate(
-                    list(recent) if recent is not None else [],
-                    after_message_id=deleted_message_id,
-                )
-                if gate_message is None or gate is None:
-                    return MembershipGateRecovery(detected=False, recovered=False)
-                gate_detected = True
-                if len(gate.channel_refs) > int(self._settings.membership_gate_max_channels):
-                    return MembershipGateRecovery(
-                        detected=True,
-                        recovered=False,
-                        notice=gate.notice,
-                        error="subscription gate lists too many channels",
-                    )
-                joined: list[str] = []
-                for channel_ref in gate.channel_refs:
-                    did_join = await self._join_membership_channel(client, account.id, channel_ref)
-                    if did_join:
-                        joined.append(channel_ref)
-                callback_count = 0
-                gate_message_id = int(gate_message.id)
-                for callback_data in gate.verification_callbacks:
-                    await self._click_membership_verification(
-                        client,
-                        entity,
-                        gate_message_id,
-                        callback_data,
-                    )
-                    callback_count += 1
-                return MembershipGateRecovery(
-                    detected=True,
-                    recovered=True,
-                    notice=gate.notice,
-                    joined_channel_refs=tuple(joined),
-                    verification_callback_count=callback_count,
-                )
-            except GatewayError as exc:
-                return MembershipGateRecovery(
-                    detected=gate_detected,
-                    recovered=False,
-                    error=self._safe_gateway_error(exc),
+                return await self._recover_membership_gate_for_entity(
+                    client,
+                    account.id,
+                    entity,
+                    deleted_message_id,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve original post-deletion context
                 mapped = self._map_rpc_error(exc, context="membership_gate")
                 return MembershipGateRecovery(
-                    detected=gate_detected,
+                    detected=False,
+                    recovered=False,
+                    error=self._safe_gateway_error(mapped),
+                )
+
+    async def recover_channel_comment_membership_gate(
+        self,
+        *,
+        account: Account,
+        channel_ref: str,
+        channel_post_id: int,
+        deleted_message_id: int,
+    ) -> MembershipGateRecovery:
+        """Recover a subscription gate in the discussion group of a channel post."""
+
+        if not self._settings.membership_gate_recovery_enabled:
+            return MembershipGateRecovery(detected=False, recovered=False)
+        if account.id is None or channel_post_id <= 0 or deleted_message_id <= 0:
+            raise PermanentGatewayError("live context is missing persisted identifiers")
+        async with self._account_operation(account.id):
+            try:
+                client = await self._ensure_client(account.id)
+                channel = await self._resolve_entity(client, account.id, channel_ref)
+                if not bool(getattr(channel, "broadcast", False)):
+                    raise PermanentGatewayError(
+                        "comments can only be attached to channel posts",
+                        code="channel_required",
+                    )
+                discussion = await self._discussion_for_post(client, channel, channel_post_id)
+                discussion_entity, _ = await self._discussion_entity(client, discussion)
+                return await self._recover_membership_gate_for_entity(
+                    client,
+                    account.id,
+                    discussion_entity,
+                    deleted_message_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve the deleted-comment context
+                mapped = self._map_rpc_error(exc, context="channel_comment_membership_gate")
+                return MembershipGateRecovery(
+                    detected=False,
                     recovered=False,
                     error=self._safe_gateway_error(mapped),
                 )
@@ -480,21 +480,35 @@ class TelethonGateway:
                 if isinstance(exc, GatewayError):
                     raise
                 raise self._map_rpc_error(exc, context="channel_scan") from exc
-            posts = tuple(
-                ChannelPost(
-                    message_id=int(message.id),
-                    published_at=self._as_utc(message.date),
-                )
-                for message in messages
+            posts: list[ChannelPost] = []
+            seen_albums: set[int] = set()
+            for message in messages:
+                message_id = getattr(message, "id", None)
                 if (
-                    getattr(message, "id", None) is not None
-                    and int(message.id) > after_message_id
-                    and getattr(message, "action", None) is None
+                    message_id is None
+                    or int(message_id) <= after_message_id
+                    or getattr(message, "action", None) is not None
+                ):
+                    continue
+                grouped_id = getattr(message, "grouped_id", None)
+                if isinstance(grouped_id, int) and grouped_id > 0:
+                    # Telegram exposes every item in a media album as a separate
+                    # message.  An album has one comment thread, anchored to its
+                    # first item when the forward scan is ordered ascending.
+                    # Processing its remaining media IDs created duplicate report
+                    # rows that could not have their own discussion thread.
+                    if grouped_id in seen_albums:
+                        continue
+                    seen_albums.add(grouped_id)
+                posts.append(
+                    ChannelPost(
+                        message_id=int(message_id),
+                        published_at=self._as_utc(message.date),
+                    )
                 )
-            )
             return ChannelPostScan(
                 title=str(getattr(channel, "title", "") or "") or None,
-                posts=posts,
+                posts=tuple(posts),
             )
 
     async def preflight_channel_comments(
@@ -575,7 +589,11 @@ class TelethonGateway:
         del media_name
         media_without_caption = media_path is not None
         if media_path is not None and media_kind not in {
-            "photo", "video", "document", "voice", "video_note"
+            "photo",
+            "video",
+            "document",
+            "voice",
+            "video_note",
         }:
             raise PermanentGatewayError("unsupported comment media kind", code="comment_invalid")
         if media_kind == "video_note" and (text or html_text):
@@ -981,10 +999,9 @@ class TelethonGateway:
             except ContentError as exc:
                 raise PermanentGatewayError(str(exc), code="content_invalid") from exc
             media_without_caption = single_media_kind is not None
-            if (
-                (not rendered_text and not media_without_caption)
-                or len(rendered_text) > maximum_text
-            ):
+            if (not rendered_text and not media_without_caption) or len(
+                rendered_text
+            ) > maximum_text:
                 raise PermanentGatewayError("message text must contain 1 to 4096 characters")
             if single_media_kind == "video_note" and (text or html_text):
                 raise PermanentGatewayError(
@@ -1002,8 +1019,7 @@ class TelethonGateway:
                 raise PermanentGatewayError(str(exc), code="media_unavailable") from exc
             resolved_media_items.append((str(resolved), item_kind))
         if len(resolved_media_items) > 1 and any(
-            kind in {"document", "voice", "video_note"}
-            for _, kind in resolved_media_items
+            kind in {"document", "voice", "video_note"} for _, kind in resolved_media_items
         ):
             raise PermanentGatewayError(
                 "documents, voices and video notes can only be sent as a single file"
@@ -1478,7 +1494,20 @@ class TelethonGateway:
             and client.is_connected()  # type: ignore[attr-defined]
             and client_generations.get(account_id) == generation
         ):
-            return client
+            route_check_due = getattr(self._proxy_service, "account_route_check_due", None)
+            if not callable(route_check_due) or not await route_check_due(
+                account_id,
+                max_age_seconds=self._settings.proxy_health_recheck_seconds,
+            ):
+                return client
+            # A client can remain marked as connected after its upstream proxy
+            # has disappeared.  Recheck at a bounded interval before reusing
+            # that client, so a dead route becomes a clear proxy result rather
+            # than a vague Telegram network error on the next send.
+            await self._resolve_proxy(account_id)
+            generation = await self._account_connection_generation(account_id)
+            if client_generations.get(account_id) == generation:
+                return client
         if client is not None:
             try:
                 await client.disconnect()  # type: ignore[attr-defined]
@@ -1533,12 +1562,13 @@ class TelethonGateway:
                 f"сессия аккаунта #{account_id} повреждена или недоступна; импортируйте её заново",
                 code="account_unauthorized",
             ) from exc
-        proxy = await self._resolve_proxy(account_id)
+        transport = await self._resolve_proxy(account_id)
+        transport_kwargs = transport.client_kwargs() if transport is not None else {}
         client = TelegramClient(
             session,
             decrypted.api_id,
             decrypted.api_hash,
-            proxy=proxy,
+            **transport_kwargs,
             connection_retries=2,
             retry_delay=2,
             timeout=int(self._settings.account_connect_timeout_seconds),
@@ -1567,19 +1597,25 @@ class TelethonGateway:
 
     async def _resolve_proxy(self, account_id: int):
         try:
-            route = await self._proxy_service.require_account_route(account_id)
+            recovery = getattr(self._proxy_service, "ensure_account_route", None)
+            route = (
+                await recovery(account_id, actor="telethon-gateway")
+                if callable(recovery)
+                else await self._proxy_service.require_account_route(account_id)
+            )
         except ProxyRouteUnavailable as exc:
             if self._settings.account_require_proxy:
                 raise TemporaryGatewayError(
-                    "назначенный прокси временно недоступен; проверьте его в панели",
+                    "назначенный прокси не работает и в пуле нет рабочего варианта; "
+                    "добавьте рабочий прокси в панели",
                     retry_after=60,
                     code="proxy_unavailable",
                 ) from exc
             logger.warning(
                 "account %s sending WITHOUT a proxy (account_require_proxy is off)", account_id
             )
-            return None
-        return build_telethon_proxy(route)
+            return TelethonTransport(proxy=None)
+        return build_telethon_transport(route)
 
     @staticmethod
     async def _discussion_for_post(client, channel: object, channel_post_id: int):
@@ -1784,28 +1820,164 @@ class TelethonGateway:
                 )
         return tuple(buttons)
 
-    @classmethod
-    def _find_membership_gate(
-        cls,
+    async def _recover_membership_gate_for_entity(
+        self,
+        client: object,
+        account_id: int,
+        entity: object,
+        deleted_message_id: int,
+    ) -> MembershipGateRecovery:
+        """Resolve one validated subscription gate in the exact delivery chat."""
+
+        gate_detected = False
+        try:
+            recent = await asyncio.wait_for(
+                client.get_messages(  # type: ignore[attr-defined]
+                    entity,
+                    limit=int(self._settings.membership_gate_scan_limit),
+                ),
+                timeout=float(self._settings.account_delivery_verify_timeout_seconds),
+            )
+            gate_message, gate = await self._find_membership_gate(
+                client,
+                entity,
+                list(recent) if recent is not None else [],
+                after_message_id=deleted_message_id,
+            )
+            if gate_message is None or gate is None:
+                return MembershipGateRecovery(detected=False, recovered=False)
+            gate_detected = True
+            if len(gate.channel_refs) > int(self._settings.membership_gate_max_channels):
+                return MembershipGateRecovery(
+                    detected=True,
+                    recovered=False,
+                    notice=gate.notice,
+                    error="subscription gate lists too many channels",
+                )
+            joined: list[str] = []
+            for channel_ref in gate.channel_refs:
+                did_join = await self._join_membership_channel(client, account_id, channel_ref)
+                if did_join:
+                    joined.append(channel_ref)
+            callback_count = 0
+            gate_message_id = int(gate_message.id)
+            for callback_data in gate.verification_callbacks:
+                await self._click_membership_verification(
+                    client,
+                    entity,
+                    gate_message_id,
+                    callback_data,
+                )
+                callback_count += 1
+            return MembershipGateRecovery(
+                detected=True,
+                recovered=True,
+                notice=gate.notice,
+                joined_channel_refs=tuple(joined),
+                verification_callback_count=callback_count,
+            )
+        except GatewayError as exc:
+            return MembershipGateRecovery(
+                detected=gate_detected,
+                recovered=False,
+                error=self._safe_gateway_error(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the deleted post as source of truth
+            mapped = self._map_rpc_error(exc, context="membership_gate")
+            return MembershipGateRecovery(
+                detected=gate_detected,
+                recovered=False,
+                error=self._safe_gateway_error(mapped),
+            )
+
+    async def _find_membership_gate(
+        self,
+        client: object,
+        entity: object,
         messages: list[object],
         *,
         after_message_id: int,
     ) -> tuple[object | None, object | None]:
+        """Find the first authorised gate that can belong to the deleted post.
+
+        A generic subscription-looking post is not enough: it must come from a
+        bot.  In supergroups the bot must also be an administrator.  If the bot
+        chose to reply to a message, its reply must point at the post that was
+        actually removed.  This prevents an unrelated bot announcement from
+        making an account join channels.
+        """
+
         candidates: list[tuple[int, object, object]] = []
         for message in messages:
             raw_id = getattr(message, "id", None)
             if raw_id is None or int(raw_id) <= after_message_id:
                 continue
+            reply_to_id = self._reply_to_message_id(message)
+            if reply_to_id is not None and reply_to_id != after_message_id:
+                continue
             text = str(
                 getattr(message, "raw_text", None) or getattr(message, "message", None) or ""
             )
-            gate = parse_membership_gate(text, cls._inline_buttons(message))
-            if gate is not None:
-                candidates.append((int(raw_id), message, gate))
+            gate = parse_membership_gate(text, self._inline_buttons(message))
+            if gate is None:
+                continue
+            if not await self._is_moderator_bot_message(client, entity, message):
+                continue
+            candidates.append((int(raw_id), message, gate))
         if not candidates:
             return None, None
         _, message, gate = min(candidates, key=lambda item: item[0])
         return message, gate
+
+    @staticmethod
+    def _reply_to_message_id(message: object) -> int | None:
+        reply_to = getattr(message, "reply_to", None)
+        raw = (
+            getattr(reply_to, "reply_to_msg_id", None)
+            if reply_to is not None
+            else getattr(message, "reply_to_msg_id", None)
+        )
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _is_moderator_bot_message(
+        self,
+        client: object,
+        entity: object,
+        message: object,
+    ) -> bool:
+        """Accept only bot notices, plus administrator status in supergroups."""
+
+        sender = getattr(message, "sender", None)
+        if sender is None:
+            get_sender = getattr(message, "get_sender", None)
+            if callable(get_sender):
+                try:
+                    sender = await get_sender()
+                except Exception:  # noqa: BLE001 - absent sender metadata is not trusted
+                    return False
+        if sender is None or not bool(getattr(sender, "bot", False)):
+            return False
+
+        from telethon import functions, types, utils  # noqa: PLC0415
+
+        if not isinstance(entity, types.Channel):
+            # Basic groups do not support channels.GetParticipant; a Telegram
+            # bot sender is still a substantially stronger signal than text.
+            return True
+        try:
+            result = await client(  # type: ignore[operator]
+                functions.channels.GetParticipantRequest(entity, utils.get_input_peer(sender))
+            )
+        except Exception:  # noqa: BLE001 - do not act without admin proof
+            return False
+        participant = getattr(result, "participant", None)
+        return isinstance(
+            participant,
+            (types.ChannelParticipantAdmin, types.ChannelParticipantCreator),
+        )
 
     async def _join_membership_channel(
         self,

@@ -6,7 +6,11 @@ from sqlalchemy import select
 
 from proxima_traffic.config import Settings
 from proxima_traffic.delivery_monitor import DelayedDeliveryMonitor
-from proxima_traffic.gateways import PermanentGatewayError, TemporaryGatewayError
+from proxima_traffic.gateways import (
+    MembershipGateRecovery,
+    PermanentGatewayError,
+    TemporaryGatewayError,
+)
 from proxima_traffic.models import (
     Account,
     AccountStatus,
@@ -14,6 +18,7 @@ from proxima_traffic.models import (
     ActionLog,
     ActionStatus,
     Campaign,
+    CampaignMode,
     CampaignRun,
     Target,
     TargetAccountState,
@@ -33,6 +38,22 @@ class DeletedGateway:
             "message was removed by moderation",
             code="post_deleted_by_moderation",
             external_message_id=int(kwargs["message_id"]),
+        )
+
+
+class GateDeletedGateway(DeletedGateway):
+    def __init__(self) -> None:
+        self.recovery_calls = 0
+
+    async def recover_membership_gate(self, **kwargs: object) -> MembershipGateRecovery:
+        del kwargs
+        self.recovery_calls += 1
+        return MembershipGateRecovery(
+            detected=True,
+            recovered=True,
+            notice="Subscribe before sending",
+            joined_channel_refs=("@required_news",),
+            verification_callback_count=1,
         )
 
 
@@ -81,6 +102,7 @@ async def _sent_action(app, *, account_label: str = "monitor-account") -> tuple[
         await session.flush()
         campaign = Campaign(
             name=f"{account_label}-campaign",
+            mode=CampaignMode.BROADCAST,
             primary_account_id=account.id,
             target_id=target.id,
             primary_text="Allowed update",
@@ -92,6 +114,8 @@ async def _sent_action(app, *, account_label: str = "monitor-account") -> tuple[
             target_id=target.id,
             sender_account_id=account.id,
             request_key=f"{account_label}-request",
+            status="succeeded",
+            primary_message_id=77_001,
         )
         session.add(run)
         await session.flush()
@@ -142,6 +166,33 @@ async def test_delayed_monitor_marks_confirmed_removed_post_as_bad_target(app) -
         assert action.delayed_delivery_checked_at is not None
         assert target is not None and target.quality_status == "bad"
         assert "moderation" in (target.quality_reason or "")
+
+
+async def test_delayed_monitor_recovers_a_subscription_gate_and_requeues_latest_step(app) -> None:
+    action_id, _, _ = await _sent_action(app, account_label="gate-monitor")
+    gateway = GateDeletedGateway()
+    runner = CampaignRunner(app.state.database.session_factory, gateway, settings=_settings(app))
+    monitor = DelayedDeliveryMonitor(
+        app.state.database.session_factory,
+        gateway,
+        runner,
+        _settings(app),
+    )
+
+    assert await monitor.check_due_once() == 1
+    assert gateway.recovery_calls == 1
+    async with app.state.database.session_factory() as session:
+        action = await session.get(ActionLog, action_id)
+        run = await session.scalar(select(CampaignRun).where(CampaignRun.id == action.run_id))
+    assert action is not None
+    assert action.status == ActionStatus.FAILED
+    assert action.error_code == "membership_gate_recovered"
+    assert action.delayed_delivery_checked_at is not None
+    assert run is not None
+    assert run.status.value == "queued"
+    assert run.membership_gate_retry_count == 1
+    assert run.primary_message_id is None
+    assert run.error_code == "membership_gate_retry"
 
 
 async def test_delayed_monitor_records_chat_ban_without_reclassifying_one_account(app) -> None:

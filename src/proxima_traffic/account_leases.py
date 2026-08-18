@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from uuid import uuid4
 
@@ -12,9 +12,21 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from proxima_traffic.gateways import TemporaryGatewayError
 from proxima_traffic.models import AccountOperationLease, utc_now
 
 logger = logging.getLogger(__name__)
+
+
+class AccountOperationLeaseLost(TemporaryGatewayError):
+    """Raised inside an operation when its cross-process lease is no longer valid."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "account operation lease was lost",
+            retry_after=5,
+            code="account_operation_lease_lost",
+        )
 
 
 class AccountOperationLeaseCoordinator:
@@ -43,15 +55,30 @@ class AccountOperationLeaseCoordinator:
             yield None
             return
         heartbeat_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        owner_task = asyncio.current_task()
         heartbeat_task = asyncio.create_task(
-            self._heartbeat(account_id, token, heartbeat_stop),
+            self._heartbeat(
+                account_id,
+                token,
+                heartbeat_stop,
+                lease_lost,
+                owner_task,
+            ),
             name=f"account-operation-lease-{account_id}",
         )
         try:
             yield token
+            if lease_lost.is_set():
+                raise AccountOperationLeaseLost()
+        except asyncio.CancelledError:
+            if lease_lost.is_set():
+                raise AccountOperationLeaseLost() from None
+            raise
         finally:
             heartbeat_stop.set()
-            await heartbeat_task
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
             await self._release(account_id, token)
 
     async def _acquire(self, account_id: int) -> str | None:
@@ -101,6 +128,8 @@ class AccountOperationLeaseCoordinator:
         account_id: int,
         token: str,
         stop_event: asyncio.Event,
+        lost_event: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
     ) -> None:
         while not stop_event.is_set():
             try:
@@ -122,10 +151,23 @@ class AccountOperationLeaseCoordinator:
                     await session.commit()
             except Exception:  # noqa: BLE001 - caller remains bounded by its durable task lease
                 logger.exception("Account operation lease heartbeat failed for %s", account_id)
+                self._signal_lost(lost_event, owner_task)
                 return
             if renewed.rowcount != 1:
                 logger.warning("Account operation lease lost for %s", account_id)
+                self._signal_lost(lost_event, owner_task)
                 return
+
+    @staticmethod
+    def _signal_lost(
+        lost_event: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
+    ) -> None:
+        """Interrupt an RPC that no longer has exclusive session ownership."""
+
+        lost_event.set()
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
 
     async def _release(self, account_id: int, token: str) -> None:
         try:

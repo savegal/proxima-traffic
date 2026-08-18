@@ -20,12 +20,18 @@ from proxima_traffic.models import (
     Campaign,
     CampaignMode,
     CampaignRun,
+    ChannelCommentRule,
+    DirectCampaign,
+    DirectLaunch,
     ProxyAssignment,
     ProxyEndpoint,
     ProxyGroup,
     ProxyProtocol,
     RunStatus,
     RunStep,
+    SubscriberList,
+    SubscriberListStatus,
+    SubscriberSegment,
     Target,
     TargetList,
     TargetListItem,
@@ -321,9 +327,23 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
     campaign_media = storage / "campaign.bin"
     variant_media = storage / "variant.bin"
     snapshot_media = storage / "snapshot.bin"
+    direct_campaign_media = storage / "direct-campaign.bin"
+    direct_snapshot_media = storage / "direct-snapshot.bin"
+    comment_media = storage / "comment.bin"
+    comment_dialogue_media = storage / "comment-dialogue.bin"
     orphan = storage / "orphan.bin"
     recent = storage / "recent.bin"
-    for media_path in (campaign_media, variant_media, snapshot_media, orphan, recent):
+    for media_path in (
+        campaign_media,
+        variant_media,
+        snapshot_media,
+        direct_campaign_media,
+        direct_snapshot_media,
+        comment_media,
+        comment_dialogue_media,
+        orphan,
+        recent,
+    ):
         media_path.write_bytes(b"media")
     old_timestamp = time.time() - 48 * 3600
     os.utime(orphan, (old_timestamp, old_timestamp))
@@ -356,6 +376,44 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
                 primary_media_path_snapshot=str(snapshot_media),
             )
         )
+        subscriber_list = SubscriberList(
+            name="Media GC subscribers", status=SubscriberListStatus.READY
+        )
+        session.add(subscriber_list)
+        await session.flush()
+        direct_campaign = DirectCampaign(
+            name="Media GC direct campaign",
+            subscriber_list_id=subscriber_list.id,
+            primary_text="Media",
+            primary_media_path=str(direct_campaign_media),
+        )
+        session.add(direct_campaign)
+        await session.flush()
+        session.add(
+            DirectLaunch(
+                campaign_id=direct_campaign.id,
+                subscriber_list_id=subscriber_list.id,
+                segment_snapshot=SubscriberSegment.ALL,
+                recipient_limit_snapshot=1,
+                contact_cooldown_days_snapshot=30,
+                account_ids_snapshot_json="[]",
+                primary_text_snapshot="Media",
+                primary_media_path_snapshot=str(direct_snapshot_media),
+                consent_confirmed_at=utc_now(),
+            )
+        )
+        session.add(
+            ChannelCommentRule(
+                name="Media GC comments",
+                channel_ref="@media_gc_comments",
+                primary_account_id=account.id,
+                primary_text="Media",
+                primary_media_path=str(comment_media),
+                dialogue_steps_json=json.dumps(
+                    [{"account_id": account.id, "media_path": str(comment_dialogue_media)}]
+                ),
+            )
+        )
         await session.commit()
 
     database_url = app.state.settings.database_url
@@ -371,6 +429,10 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
     assert campaign_media.exists()
     assert variant_media.exists()
     assert snapshot_media.exists()
+    assert direct_campaign_media.exists()
+    assert direct_snapshot_media.exists()
+    assert comment_media.exists()
+    assert comment_dialogue_media.exists()
     assert recent.exists()
 
 
@@ -441,6 +503,10 @@ async def test_clean_database_keeps_accounts_proxies_and_chats_only(
         assert connection.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM campaign_runs").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM target_lists").fetchone()[0] == 0
+        blacklist_count = connection.execute(
+            "SELECT COUNT(*) FROM mention_blacklist_entries"
+        ).fetchone()[0]
+        assert blacklist_count == 1057
         target = connection.execute(
             "SELECT is_standalone, approved_by_operator FROM targets WHERE chat_ref = '@clean_chat'"
         ).fetchone()

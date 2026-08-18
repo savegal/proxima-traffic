@@ -21,10 +21,13 @@ def test_spintax_supports_nested_choices_and_stable_retries() -> None:
         "Здравствуйте, приятель!",
     }
     assert render_spintax(template, seed="run-101:primary") == rendered
-    assert CampaignRunner._render_delivery_text(  # noqa: SLF001 - delivery invariant
-        template,
-        idempotency_key="run-101:primary",
-    ) == rendered
+    assert (
+        CampaignRunner._render_delivery_text(  # noqa: SLF001 - delivery invariant
+            template,
+            idempotency_key="run-101:primary",
+        )
+        == rendered
+    )
 
 
 def test_spintax_escape_syntax_preserves_literal_braces_and_pipe() -> None:

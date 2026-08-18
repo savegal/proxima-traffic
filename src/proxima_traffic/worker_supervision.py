@@ -89,6 +89,7 @@ class WorkerSupervisor:
             try:
                 await runner(self._reporter(name))
             except asyncio.CancelledError:
+                state.state = "stopped"
                 raise
             except Exception as exc:  # noqa: BLE001 - workers must restart after an unexpected crash
                 state.restart_count += 1

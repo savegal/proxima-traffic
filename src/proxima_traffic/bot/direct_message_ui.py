@@ -7,6 +7,7 @@ from math import ceil
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from proxima_traffic.bot.ui import screen_title, section, themed_keyboard
 from proxima_traffic.direct_messages import (
     DirectCampaignView,
     DirectLaunchView,
@@ -35,17 +36,20 @@ def direct_messages_home_text(dashboard: DirectMessageDashboard) -> str:
     else:
         next_step = "🚀 Можно создать новый запуск или повторно использовать готовую заготовку."
     return (
-        "<b>✉️ Личные сообщения</b>\n"
-        "<i>Базы подписчиков, готовые посты и контролируемая отправка.</i>\n\n"
-        "<b>Следующий шаг</b>\n"
+        screen_title(
+            "Личные сообщения",
+            "Базы подписчиков, готовые посты и контролируемая отправка.",
+        )
+        + "\n\n"
+        f"{section('Следующий шаг')}\n"
         f"{next_step}\n\n"
-        "<b>База</b>\n"
+        f"{section('База подписчиков')}\n"
         f"📂 Списков: <b>{dashboard.list_count:,}</b>\n"
         f"👤 Уникальных людей: <b>{dashboard.subscriber_count:,}</b>\n"
         f"⭐ Premium: <b>{dashboard.premium_count:,}</b>\n"
         f"🔗 С username: <b>{dashboard.username_count:,}</b>\n\n"
         f"🚫 В глобальном стоп-листе: <b>{dashboard.blacklist_count:,}</b>\n\n"
-        "<b>Рассылки в ЛС</b>\n"
+        f"{section('Рассылки в ЛС')}\n"
         f"📝 Заготовок: <b>{dashboard.campaign_count:,}</b>\n"
         f"🔵 Активных запусков: <b>{dashboard.active_launches:,}</b>\n"
         f"🕒 В очереди: <b>{dashboard.queued_tasks:,}</b>"
@@ -68,42 +72,52 @@ def direct_messages_home_menu() -> InlineKeyboardMarkup:
                 )
             ],
             [
-                InlineKeyboardButton(text="📂 Базы", callback_data="dm:lists:0"),
+                InlineKeyboardButton(text="📂 Базы подписчиков", callback_data="dm:lists:0"),
                 InlineKeyboardButton(text="📥 Импортировать", callback_data="dm:import"),
             ],
             [
                 InlineKeyboardButton(text="📝 Заготовки", callback_data="dm:campaigns:0"),
                 InlineKeyboardButton(text="📊 Запуски", callback_data="dm:launches:0"),
             ],
-            [InlineKeyboardButton(text="🚫 Стоп-лист ID", callback_data="dm:blacklist")],
+            [InlineKeyboardButton(text="🚫 Глобальный стоп-лист", callback_data="dm:blacklist")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="dm:home")],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home")],
         ]
     )
 
 
+def _direct_wizard_title(step: int) -> str:
+    return screen_title("Новая ЛС-рассылка", f"Шаг {step} из 6")
+
+
 def direct_blacklist_text(total: int) -> str:
     return (
-        "<b>🚫 Глобальный стоп-лист ID</b>\n\n"
+        screen_title("Глобальный стоп-лист", "Запрет на любые контакты по Telegram ID") + "\n\n"
         f"Сейчас запрещено: <b>{total:,}</b> Telegram ID.\n\n"
-        "Этим людям сервис не будет писать в ЛС и не будет отмечать их в рассылках "
-        "по чатам или комментариях. Запрет проверяется при выборе аудитории и ещё раз "
+        "Этим людям сервис не будет писать в ЛС, приглашать в канал или группу и не будет "
+        "отмечать их в рассылках по чатам или комментариях. Запрет проверяется при "
+        "выборе аудитории и ещё раз "
         "перед самой отправкой. Он действует и для ID, которых пока нет ни в одной базе."
     )
 
 
-def direct_blacklist_menu() -> InlineKeyboardMarkup:
+def direct_blacklist_menu(
+    *,
+    add_callback: str = "dm:blacklist:add",
+    back_callback: str = "dm:home",
+    back_text: str = "⬅️ К личным сообщениям",
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить ID", callback_data="dm:blacklist:add")],
-            [InlineKeyboardButton(text="⬅️ К личным сообщениям", callback_data="dm:home")],
+            [InlineKeyboardButton(text="➕ Добавить ID", callback_data=add_callback)],
+            [InlineKeyboardButton(text=back_text, callback_data=back_callback)],
         ]
     )
 
 
 def direct_blacklist_add_prompt_text() -> str:
     return (
-        "<b>➕ Добавить в стоп-лист</b>\n\n"
+        screen_title("Добавить в стоп-лист") + "\n\n"
         "Отправьте один ID или несколько ID через пробел, запятую либо каждый с новой "
         "строки. За один раз — до 500 ID.\n\n"
         "Пример: <code>123456789, 987654321</code>"
@@ -112,7 +126,7 @@ def direct_blacklist_add_prompt_text() -> str:
 
 def subscriber_import_prompt_text(max_upload_bytes: int) -> str:
     return (
-        "<b>📥 Импорт базы подписчиков</b>\n\n"
+        screen_title("Импорт базы подписчиков", "Безопасная построчная обработка файла") + "\n\n"
         "Отправьте документ в формате:\n"
         "• <code>.jsonl</code>\n"
         "• <code>.jsonl.gz</code>\n"
@@ -136,7 +150,7 @@ def subscriber_import_result_text(result: SubscriberImportResult) -> str:
             "Они пропущены без остановки остальных данных."
         )
     return (
-        "<b>✅ База импортирована</b>\n\n"
+        screen_title("База импортирована", "Результат обработки") + "\n\n"
         f"Название: <b>{escape(subscriber_list.name)}</b>\n"
         f"Строк прочитано: <b>{result.total_lines:,}</b>\n"
         f"Корректных записей: <b>{result.valid_records:,}</b>\n"
@@ -178,8 +192,8 @@ def subscriber_lists_text(
 ) -> str:
     pages = max(1, ceil(total / page_size))
     lines = [
-        "<b>📂 Базы подписчиков</b>",
-        f"Списков: <b>{total:,}</b> · страница <b>{page + 1}/{pages}</b>\n",
+        screen_title("Базы подписчиков", f"Списков: {total:,} · страница {page + 1}/{pages}"),
+        "",
     ]
     for item in items:
         state = {
@@ -239,8 +253,7 @@ def subscriber_list_details_text(item: SubscriberList) -> str:
     }[item.status]
     error = f"\n\nОшибка: <code>{escape(item.last_error)}</code>" if item.last_error else ""
     return (
-        f"<b>📂 {escape(item.name)}</b>\n"
-        f"Состояние: <b>{status}</b>\n\n"
+        screen_title(escape(item.name), f"Состояние: {status}") + "\n\n"
         f"👤 Всего: <b>{item.member_count:,}</b>\n"
         f"⭐ Premium: <b>{item.premium_count:,}</b>\n"
         f"Обычные: <b>{item.non_premium_count:,}</b>\n"
@@ -303,8 +316,7 @@ def subscriber_list_delete_menu(list_id: int, page: int) -> InlineKeyboardMarkup
 def direct_list_picker_text(total: int, page: int, page_size: int) -> str:
     pages = max(1, ceil(total / page_size))
     return (
-        "<b>✉️ Новая ЛС-рассылка</b>\n"
-        "<i>Шаг 1 из 6</i>\n\n"
+        _direct_wizard_title(1) + "\n\n"
         "Выберите базу подписчиков. Один Telegram ID получит не больше одного задания "
         "в этом запуске.\n\n"
         f"Доступных баз: <b>{total:,}</b> · страница <b>{page + 1}/{pages}</b>"
@@ -343,8 +355,7 @@ def direct_list_picker(
 
 def direct_segment_text(item: SubscriberList) -> str:
     return (
-        "<b>✉️ Новая ЛС-рассылка</b>\n"
-        "<i>Шаг 2 из 6</i>\n\n"
+        _direct_wizard_title(2) + "\n\n"
         f"База: <b>{escape(item.name)}</b> · {item.member_count:,} человек\n\n"
         "Кому подготовить задания? Premium берётся из поля "
         "<code>is_premium</code> и будет уточняться после успешного разрешения профиля."
@@ -377,8 +388,7 @@ def direct_limit_text(segment: SubscriberSegment) -> str:
         SubscriberSegment.NON_PREMIUM: "без Premium",
     }[segment]
     return (
-        "<b>✉️ Новая ЛС-рассылка</b>\n"
-        "<i>Шаг 3 из 6</i>\n\n"
+        _direct_wizard_title(3) + "\n\n"
         f"Сегмент: <b>{segment_label}</b>.\n"
         "Введите количество получателей от 1 до 1 000 000. Можно написать "
         "<code>все</code> — будет взят весь доступный сегмент."
@@ -387,8 +397,7 @@ def direct_limit_text(segment: SubscriberSegment) -> str:
 
 def direct_cooldown_text() -> str:
     return (
-        "<b>✉️ Новая ЛС-рассылка</b>\n"
-        "<i>Шаг 4 из 6</i>\n\n"
+        _direct_wizard_title(4) + "\n\n"
         "Как долго не писать одному человеку повторно? Защита действует глобально "
         "между всеми базами и параллельными запусками.\n\n"
         "<i>30 дней — безопасный вариант по умолчанию.</i>"
@@ -419,8 +428,7 @@ def direct_account_picker_text(
 ) -> str:
     pages = max(1, ceil(total / page_size))
     return (
-        "<b>✉️ Новая ЛС-рассылка</b>\n"
-        "<i>Шаг 5 из 6</i>\n\n"
+        _direct_wizard_title(5) + "\n\n"
         f"Выбрано отправителей: <b>{selected_count}</b>.\n"
         "Задания распределяются автоматически. Используются только готовые аккаунты "
         "со свободным дневным лимитом; паузы и ограничения Telegram соблюдаются."
@@ -479,8 +487,7 @@ def direct_account_picker(
 
 def direct_content_prompt_text() -> str:
     return (
-        "<b>✉️ Новая ЛС-рассылка</b>\n"
-        "<i>Шаг 6 из 6</i>\n\n"
+        _direct_wizard_title(6) + "\n\n"
         "Отправьте готовый пост: текст, фото, видео, документ, голосовое или видеокружок. "
         "У видеокружка подписи быть не может; для остальных вложений она допустима. "
         "Форматирование Telegram и Spintax сохраняются.\n\n"
@@ -509,7 +516,7 @@ def direct_campaign_confirmation_text(view: DirectCampaignView) -> str:
     media = f"\nВложение: <b>{escape(media_kind)}</b>" if campaign.primary_media_path else ""
     content_preview = preview or "<i>без подписи — будет отправлено только вложение</i>"
     return (
-        "<b>✅ Проверьте ЛС-рассылку</b>\n\n"
+        screen_title("Проверьте ЛС-рассылку", "Перед созданием задач") + "\n\n"
         f"Название: <b>{escape(campaign.name)}</b>\n"
         f"База: <b>{escape(view.list_name)}</b>\n"
         f"Сегмент: <b>{segment}</b>\n"
@@ -545,8 +552,8 @@ def direct_campaigns_text(
 ) -> str:
     pages = max(1, ceil(total / page_size))
     lines = [
-        "<b>📝 Заготовки ЛС-рассылок</b>",
-        f"Всего: <b>{total}</b> · страница <b>{page + 1}/{pages}</b>\n",
+        screen_title("Заготовки ЛС-рассылок", f"Всего: {total} · страница {page + 1}/{pages}"),
+        "",
     ]
     for campaign in items:
         segment = {
@@ -566,8 +573,7 @@ def direct_campaigns_text(
         )
     else:
         lines.append(
-            "\n<i>Откройте заготовку, чтобы запустить её повторно с новой проверкой "
-            "доступа.</i>"
+            "\n<i>Откройте заготовку, чтобы запустить её повторно с новой проверкой доступа.</i>"
         )
     return "\n".join(lines)
 
@@ -619,8 +625,8 @@ def direct_launches_text(
 ) -> str:
     pages = max(1, ceil(total / page_size))
     lines = [
-        "<b>📊 Запуски ЛС-рассылок</b>",
-        f"Всего: <b>{total}</b> · страница <b>{page + 1}/{pages}</b>\n",
+        screen_title("Запуски ЛС-рассылок", f"Всего: {total} · страница {page + 1}/{pages}"),
+        "",
     ]
     icons = {
         DirectLaunchStatus.QUEUED: "🕒",
@@ -672,45 +678,57 @@ def direct_launches_menu(
 def direct_launch_details_text(view: DirectLaunchView) -> str:
     launch = view.launch
     status = {
-        DirectLaunchStatus.QUEUED: "🕒 ожидает",
+        DirectLaunchStatus.QUEUED: "🕒 готовится к отправке",
         DirectLaunchStatus.RUNNING: "🔵 выполняется",
         DirectLaunchStatus.SUCCEEDED: "✅ завершён",
         DirectLaunchStatus.PARTIAL: "🟡 завершён частично",
         DirectLaunchStatus.FAILED: "❌ не выполнен",
         DirectLaunchStatus.CANCELLED: "⏸ остановлен",
     }[launch.status]
-    error = ""
-    if view.last_error_code:
-        error = "\n\n<b>⚠️ Последняя ситуация</b>"
+    issue = ""
+    if view.last_error_code in {"account_pacing", "account_operation_busy"}:
+        issue = (
+            "\n\n<i>⏳ Следующее сообщение ждёт безопасного окна аккаунта. "
+            "Это штатная пауза — сервис продолжит сам.</i>"
+        )
+    elif view.last_error_code:
+        issue = "\n\n<b>⚠️ Требуется внимание</b>"
         if view.last_error_account_label:
-            error += f"\nОтправитель: <b>{escape(view.last_error_account_label)}</b>"
+            issue += f"\nАккаунт: <b>{escape(view.last_error_account_label)}</b>"
         if view.last_error_recipient:
-            error += f"\nПолучатель: <code>{escape(view.last_error_recipient)}</code>"
-        error += f"\nПричина: <b>{escape(failure_label(view.last_error_code))}</b>"
+            issue += f"\nПолучатель: <code>{escape(view.last_error_recipient)}</code>"
+        issue += f"\nПричина: <b>{escape(failure_label(view.last_error_code))}</b>"
         hint = failure_hint(view.last_error_code)
         if hint:
-            error += f"\nЧто делать: {escape(hint)}"
+            issue += f"\nЧто делать: {escape(hint)}"
         if view.last_error_status == DirectMessageTaskStatus.QUEUED:
-            error += "\nСистема: попытка перенесена; доступные отправители продолжают работу."
+            issue += (
+                "\n<i>Попытка перенесена; остальные доступные отправители продолжают работу.</i>"
+            )
         elif view.last_error_status == DirectMessageTaskStatus.SKIPPED:
-            error += "\nСистема: этот получатель пропущен; остальные задачи продолжаются."
+            issue += "\n<i>Этот получатель пропущен; остальные задачи продолжаются.</i>"
         elif view.last_error_status == DirectMessageTaskStatus.FAILED:
-            error += "\nСистема: задача завершена без небезопасного повтора."
-        if view.last_error:
-            error += f"\nТехнически: <code>{escape(view.last_error)}</code>"
+            issue += "\n<i>Задача завершена без небезопасного повтора.</i>"
+    exclusions: list[str] = []
+    if launch.excluded_recent:
+        exclusions.append(f"не повторяем сейчас: <b>{launch.excluded_recent:,}</b>")
+    if launch.excluded_reserved:
+        exclusions.append(f"заняты в другом запуске: <b>{launch.excluded_reserved:,}</b>")
+    excluded_text = (
+        "\n\n<i>При старте не включены — " + " · ".join(exclusions) + ".</i>" if exclusions else ""
+    )
     return (
-        f"<b>📊 Запуск #{launch.id}</b>\n"
-        f"Состояние: <b>{status}</b>\n"
+        screen_title(f"Запуск #{launch.id}", f"Состояние: {status}") + "\n"
         f"Заготовка: <b>{escape(view.campaign_name)}</b>\n"
         f"База: <b>{escape(view.list_name)}</b>\n\n"
+        f"{section('Результат')}\n"
         f"Получателей: <b>{launch.total_tasks:,}</b>\n"
         f"✅ Доставлено: <b>{view.succeeded:,}</b>\n"
-        f"🕒 В работе: <b>{view.active:,}</b>\n"
+        f"🕒 В очереди и работе: <b>{view.active:,}</b>\n"
         f"⏭ Пропущено: <b>{view.skipped:,}</b>\n"
         f"❌ Ошибок: <b>{view.failed:,}</b>\n"
-        f"⏸ Отменено: <b>{view.cancelled:,}</b>\n\n"
-        f"На паузе повтора при старте: <b>{launch.excluded_recent:,}</b>\n"
-        f"Заняты другим запуском: <b>{launch.excluded_reserved:,}</b>{error}"
+        f"⏸ Отменено: <b>{view.cancelled:,}</b>"
+        f"{excluded_text}{issue}"
     )
 
 
@@ -727,6 +745,15 @@ def direct_launch_details_menu(view: DirectLaunchView, page: int) -> InlineKeybo
             [
                 InlineKeyboardButton(
                     text="⏸ Остановить", callback_data=f"dm:launchcancel:{view.launch.id}:{page}"
+                )
+            ]
+        )
+    if view.last_error_code == "proxy_unavailable":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🌐 Проверить прокси",
+                    callback_data="menu:proxies:0",
                 )
             ]
         )
@@ -755,3 +782,12 @@ def direct_cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="dm:home")]]
     )
+
+
+for _factory_name, _factory in tuple(globals().items()):
+    if (
+        not _factory_name.startswith("_")
+        and callable(_factory)
+        and _factory_name.endswith(("menu", "picker", "confirmation", "cancel"))
+    ):
+        globals()[_factory_name] = themed_keyboard(_factory)

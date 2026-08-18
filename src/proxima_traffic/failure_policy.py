@@ -86,6 +86,7 @@ TRANSIENT_CODES = frozenset(
 OBSERVED_TARGET_FAILURE_CODES = ACCOUNT_TARGET_BLOCK_CODES | TARGET_FAILURE_CODES
 
 _FAILURE_LABELS = {
+    "album_duplicate": "элемент альбома обработан общим комментарием",
     "account_banned_in_chat": "аккаунт заблокирован или ограничен в этом чате",
     "account_dead": "сессия или API-данные аккаунта недействительны",
     "account_join_limit": "аккаунт достиг лимита групп и каналов Telegram",
@@ -147,12 +148,13 @@ _FAILURE_LABELS = {
     "participant_reaction_timeout": "авто-реакция не завершилась вовремя",
     "peer_flood": "Telegram ограничил активность аккаунта",
     "post_deleted_by_moderation": "публикация удалена модерацией сразу после отправки",
+    "primary_account_auto_replaced": "основной аккаунт автоматически заменён",
     "preflight_dialogue_not_ready": "не все аккаунты диалога готовы к этому чату",
     "preflight_failed": "проверка готовности не пройдена",
     "preflight_independent_not_ready": "не все независимые отправители готовы к этому чату",
     "preflight_no_ready_sender": "нет готового отправителя для этого чата",
     "primary_account_replaced": "основной аккаунт правила был заменён",
-    "proxy_unavailable": "назначенный прокси недоступен",
+    "proxy_unavailable": "не найден рабочий прокси для аккаунта",
     "recipient_identity_mismatch": "username теперь принадлежит другому пользователю",
     "recipient_blacklisted": "получатель находится в глобальном стоп-листе",
     "recipient_opted_out": "получатель находится в списке «не писать»",
@@ -167,6 +169,7 @@ _FAILURE_LABELS = {
     "reaction_timeout": "реакция не завершилась вовремя",
     "reaction_unavailable": "реакции для сообщения или аккаунта недоступны",
     "reactions_disabled": "реакции отключены в настройках",
+    "reactor_removed_from_rule": "аккаунт удалён из выбранного пула реакций",
     "reactor_unavailable": "нет доступного аккаунта для реакции",
     "repeat_window_elapsed": "окно повторной отправки уже закончилось",
     "request_invalid": "Telegram отклонил параметры запроса",
@@ -243,13 +246,19 @@ _FAILURE_HINTS = {
     "membership_gate_verification_failed": "Проверьте требования бота-модератора вручную.",
     "network_error": "Сервис повторит операцию автоматически.",
     "post_deleted_by_moderation": "Проверьте правила чата и требования его бота-модератора.",
+    "primary_account_auto_replaced": (
+        "Новый аккаунт прошёл проверку канала; будущие первые комментарии пойдут от него."
+    ),
     "preflight_dialogue_not_ready": "Повторите проверку аккаунтов и чатов перед запуском.",
     "preflight_failed": "Откройте «Проверить чаты и аккаунты» и устраните указанные причины.",
     "preflight_independent_not_ready": (
         "Отключите недоступных отправителей или восстановите доступ."
     ),
     "preflight_no_ready_sender": "Добавьте рабочий аккаунт или восстановите доступ к чату.",
-    "proxy_unavailable": "Проверьте назначение и состояние прокси этого аккаунта.",
+    "proxy_unavailable": (
+        "Автозамена проверила все включённые прокси, но рабочего варианта не нашла. "
+        "Добавьте или включите рабочий HTTP(S)/SOCKS5-прокси."
+    ),
     "recipient_identity_mismatch": "Запись пропущена, чтобы сообщение не ушло другому человеку.",
     "recipient_blacklisted": "Запись пропущена без попытки отправки.",
     "recipient_opted_out": "Запись пропущена без попытки отправки.",
@@ -265,6 +274,9 @@ _FAILURE_HINTS = {
     "recipient_unavailable": "Обновите базу; запись останется недоступной для новых запусков.",
     "recipient_unresolvable": "Нужен актуальный username или доступ аккаунта к общему чату.",
     "reaction_unavailable": "Основная публикация продолжит работу; будет пропущена только реакция.",
+    "reactor_removed_from_rule": (
+        "Задача отменена до отправки: правило теперь использует другой набор аккаунтов."
+    ),
     "reactor_unavailable": "Добавьте рабочие аккаунты-реакторы или уменьшите число реакций.",
     "request_invalid": "Проверьте содержимое и настройки операции перед повтором.",
     "rpc_error": "Сервис выполнит ограниченный автоматический повтор.",
@@ -278,9 +290,9 @@ _FAILURE_HINTS = {
     "unhandled_execution_error": "Откройте журнал; задача остановлена без бесконечных повторов.",
 }
 
-# A channel-comment rule has a fixed set of accounts and one destination.  It
-# cannot safely fail over like a broadcast, so permanent route/configuration
-# failures pause the rule until the operator verifies it again.
+# A channel-comment rule normally has a fixed route and pauses on permanent
+# account/channel failures. Rules that explicitly enable sender replacement may
+# fail over before their first comment, after the replacement passes preflight.
 CHANNEL_COMMENT_AUTO_PAUSE_CODES = (
     ACCOUNT_FATAL_CODES
     | ACCOUNT_CHAT_BLOCK_CODES

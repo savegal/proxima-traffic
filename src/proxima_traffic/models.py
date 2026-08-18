@@ -161,6 +161,7 @@ class ProxyProtocol(StrEnum):
     HTTPS = "https"
     SOCKS5 = "socks5"
     SOCKS5H = "socks5h"
+    MTPROTO = "mtproto"
 
 
 class ProxyStatus(StrEnum):
@@ -177,6 +178,7 @@ class Base(DeclarativeBase):
 
 class Account(Base):
     __tablename__ = "accounts"
+    __table_args__ = (Index("ix_accounts_management", "status", "authorized", "is_premium", "id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     label: Mapped[str] = mapped_column(String(100), unique=True)
@@ -198,6 +200,12 @@ class Account(Base):
     about: Mapped[str | None] = mapped_column(String(70), nullable=True)
     has_profile_photo: Mapped[bool] = mapped_column(Boolean, default=False)
     authorized: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Telegram does not expose this flag in every profile response.  Keep an
+    # unknown state instead of guessing that an account is non-Premium.
+    is_premium: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    premium_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     connection_generation: Mapped[int] = mapped_column(Integer, default=0)
@@ -228,6 +236,45 @@ class Account(Base):
         DateTime(timezone=True), nullable=True
     )
     last_join_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AccountGroup(Base):
+    """A private, operator-defined collection of Telegram accounts.
+
+    Groups are deliberately separate from account status and from sender-rule
+    selections: an account can be in several groups and deleting a group never
+    deletes or disables its accounts.
+    """
+
+    __tablename__ = "account_groups"
+    __table_args__ = (Index("ux_account_groups_system_key", "system_key", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    description: Mapped[str] = mapped_column(String(500), default="")
+    # A system key makes a built-in collection identifiable independently of its
+    # human-facing title.  Operator groups deliberately keep this as ``None``.
+    system_key: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    @property
+    def is_system(self) -> bool:
+        return self.system_key is not None
+
+
+class AccountGroupMember(Base):
+    """Many-to-many membership for :class:`AccountGroup`."""
+
+    __tablename__ = "account_group_members"
+    __table_args__ = (Index("ix_account_group_members_account", "account_id"),)
+
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("account_groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -1214,6 +1261,7 @@ class ChannelCommentRule(Base):
         default=ChannelCommentMode.SINGLE,
     )
     primary_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    auto_replace_primary_account: Mapped[bool] = mapped_column(Boolean, default=False)
     primary_text: Mapped[str] = mapped_column(Text)
     primary_media_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     primary_media_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -1276,6 +1324,7 @@ class ChannelCommentRun(Base):
     scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    membership_gate_retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=5)
     lease_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
     lease_token: Mapped[str | None] = mapped_column(String(32), nullable=True)

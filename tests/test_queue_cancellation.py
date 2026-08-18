@@ -13,9 +13,21 @@ from proxima_traffic.models import (
     Campaign,
     CampaignMode,
     CampaignRun,
+    DirectCampaign,
+    DirectLaunch,
+    DirectLaunchStatus,
+    DirectMessageTask,
+    DirectMessageTaskStatus,
     ReactionTask,
     ReactionTaskStatus,
     RunStatus,
+    Subscriber,
+    SubscriberInviteCampaign,
+    SubscriberInviteLaunch,
+    SubscriberInviteTask,
+    SubscriberList,
+    SubscriberListStatus,
+    SubscriberSegment,
     Target,
     utc_now,
 )
@@ -206,14 +218,105 @@ async def test_global_stop_preserves_running_reaction_lease_until_telegram_retur
     gateway.release.set()
     assert await processing is True
     async with app.state.database.session_factory() as session:
-        completed = await session.scalar(
-            select(ReactionTask).where(ReactionTask.id == reaction_id)
-        )
+        completed = await session.scalar(select(ReactionTask).where(ReactionTask.id == reaction_id))
         assert completed is not None
         assert completed.status == ReactionTaskStatus.SUCCEEDED
         assert completed.error_code == "completed_during_cancel"
         assert completed.lease_token is None
     await app.state.database.dispose()
+
+
+async def test_global_stop_cancels_direct_messages_and_subscriber_invites(app) -> None:
+    """The emergency stop must cover every delivery queue, not only chat posts."""
+
+    now = utc_now()
+    async with app.state.database.session_factory() as session:
+        subscriber_list = SubscriberList(name="Global stop list", status=SubscriberListStatus.READY)
+        direct_subscriber = Subscriber(telegram_user_id=81001)
+        invite_subscriber = Subscriber(telegram_user_id=81002)
+        session.add_all([subscriber_list, direct_subscriber, invite_subscriber])
+        await session.flush()
+
+        direct_campaign = DirectCampaign(
+            name="Global stop direct",
+            subscriber_list_id=subscriber_list.id,
+            primary_text="Message",
+        )
+        invite_campaign = SubscriberInviteCampaign(
+            name="Global stop invite",
+            subscriber_list_id=subscriber_list.id,
+            destination_ref="@owned_channel",
+            destination_key="owned_channel",
+        )
+        session.add_all([direct_campaign, invite_campaign])
+        await session.flush()
+
+        direct_launch = DirectLaunch(
+            campaign_id=direct_campaign.id,
+            subscriber_list_id=subscriber_list.id,
+            status=DirectLaunchStatus.QUEUED,
+            segment_snapshot=SubscriberSegment.ALL,
+            recipient_limit_snapshot=1,
+            contact_cooldown_days_snapshot=30,
+            account_ids_snapshot_json="[]",
+            primary_text_snapshot="Message",
+            consent_confirmed_at=now,
+        )
+        invite_launch = SubscriberInviteLaunch(
+            campaign_id=invite_campaign.id,
+            subscriber_list_id=subscriber_list.id,
+            status=DirectLaunchStatus.QUEUED,
+            destination_ref_snapshot="@owned_channel",
+            destination_key_snapshot="owned_channel",
+            segment_snapshot=SubscriberSegment.ALL,
+            recipient_limit_snapshot=1,
+            contact_cooldown_days_snapshot=30,
+            account_ids_snapshot_json="[]",
+            consent_confirmed_at=now,
+        )
+        session.add_all([direct_launch, invite_launch])
+        await session.flush()
+        direct_subscriber.reserved_direct_launch_id = direct_launch.id
+        invite_subscriber.reserved_invite_launch_id = invite_launch.id
+        session.add_all(
+            [
+                DirectMessageTask(
+                    launch_id=direct_launch.id,
+                    subscriber_id=direct_subscriber.id,
+                    scheduled_for=now,
+                ),
+                SubscriberInviteTask(
+                    launch_id=invite_launch.id,
+                    subscriber_id=invite_subscriber.id,
+                    scheduled_for=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+    summary = await app.state.run_queue.cancel_all_with_summary()
+    assert summary.direct_launches == 1
+    assert summary.direct_message_tasks == 1
+    assert summary.subscriber_invite_launches == 1
+    assert summary.subscriber_invite_tasks == 1
+
+    async with app.state.database.session_factory() as session:
+        direct_task = await session.scalar(select(DirectMessageTask))
+        invite_task = await session.scalar(select(SubscriberInviteTask))
+        stored_direct_launch = await session.get(DirectLaunch, direct_launch.id)
+        stored_invite_launch = await session.get(SubscriberInviteLaunch, invite_launch.id)
+        stored_direct_subscriber = await session.get(Subscriber, direct_subscriber.id)
+        stored_invite_subscriber = await session.get(Subscriber, invite_subscriber.id)
+        assert direct_task is not None and direct_task.status == DirectMessageTaskStatus.CANCELLED
+        assert invite_task is not None and invite_task.status == DirectMessageTaskStatus.CANCELLED
+        assert stored_direct_launch is not None and stored_direct_launch.cancel_requested is True
+        assert stored_direct_launch.status == DirectLaunchStatus.CANCELLED
+        assert stored_invite_launch is not None and stored_invite_launch.cancel_requested is True
+        assert stored_invite_launch.status == DirectLaunchStatus.CANCELLED
+        assert stored_direct_subscriber is not None
+        assert stored_direct_subscriber.reserved_direct_launch_id is None
+        assert stored_invite_subscriber is not None
+        assert stored_invite_subscriber.reserved_invite_launch_id is None
 
 
 async def test_expired_cancelled_campaign_run_has_unknown_outcome(app) -> None:

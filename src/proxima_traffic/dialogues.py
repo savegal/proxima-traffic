@@ -34,7 +34,10 @@ def validate_dialogue_steps(raw_steps: list[dict[str, Any]]) -> list[DialogueSte
             account_id = int(raw["account_id"])
             text = str(raw["text"]).strip()
             delay_seconds = int(raw.get("delay_seconds", 0))
-            reply_to_previous = bool(raw.get("reply_to_previous", index > 0))
+            raw_reply_to_previous = raw.get("reply_to_previous", index > 0)
+            if not isinstance(raw_reply_to_previous, bool):
+                raise ValueError("reply_to_previous must be a boolean")
+            reply_to_previous = raw_reply_to_previous
             media_path = str(raw["media_path"]) if raw.get("media_path") else None
             media_kind = str(raw["media_kind"]) if raw.get("media_kind") else None
             media_name = str(raw["media_name"]) if raw.get("media_name") else None

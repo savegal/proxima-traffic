@@ -111,3 +111,21 @@ async def test_supervisor_readiness_rejects_a_stale_running_worker() -> None:
     release.set()
     supervisor.stop()
     await task
+
+
+@pytest.mark.asyncio
+async def test_supervisor_marks_an_externally_cancelled_worker_as_stopped() -> None:
+    entered = asyncio.Event()
+
+    async def runner(report) -> None:
+        await report()
+        entered.set()
+        await asyncio.Event().wait()
+
+    supervisor = WorkerSupervisor()
+    task = supervisor.start("campaigns", runner)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert supervisor.snapshots()[0].state == "stopped"

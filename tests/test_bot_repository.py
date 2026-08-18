@@ -257,6 +257,18 @@ async def test_template_library_and_target_batch_import(app: FastAPI) -> None:
     assert stats.targets_approved == 0
 
 
+async def test_existing_standalone_target_is_found_before_duplicate_creation(app: FastAPI) -> None:
+    repository = AdminRepository(app.state.database.session_factory)
+    target = await repository.create_target(chat_ref="@already_added", title="Already added")
+
+    existing = await repository.find_target_by_chat_ref("@already_added")
+
+    assert existing is not None
+    assert existing.id == target.id
+    with pytest.raises(ConflictError, match="этот чат уже добавлен"):
+        await repository.create_target(chat_ref="@already_added", title="Duplicate")
+
+
 async def test_named_target_list_fans_out_to_one_run_per_approved_target(
     app: FastAPI,
 ) -> None:
@@ -302,6 +314,40 @@ async def test_named_target_list_fans_out_to_one_run_per_approved_target(
     assert all(item is not None for item in processed)
     stored_runs = await repository.list_runs(0, 10)
     assert {run.status.value for run in stored_runs.items} == {"succeeded"}
+
+
+async def test_one_sender_queues_a_separate_broadcast_for_every_selected_chat(
+    app: FastAPI,
+) -> None:
+    """One account is a valid sender pool; pacing serializes its deliveries."""
+
+    repository = AdminRepository(app.state.database.session_factory)
+    account = await repository.create_account(
+        label="one-sender", telegram_user_id=503, ownership_confirmed=True
+    )
+    target_list, added, _ = await repository.create_target_list(
+        name="One sender rooms",
+        chat_refs=["@one_sender_a", "@one_sender_b", "@one_sender_c"],
+    )
+    assert added == 3
+    assert await repository.set_target_list_approval(target_list.id, True) == 3
+    campaign = await repository.create_campaign(
+        name="One sender fanout",
+        mode=CampaignMode.BROADCAST,
+        primary_account_id=account.id,
+        sender_account_ids=[account.id],
+        target_id=None,
+        target_list_id=target_list.id,
+        primary_text="One account, many chats",
+        spread_seconds=0,
+    )
+
+    runs = await app.state.run_queue.enqueue_campaign(campaign.id, "one-sender-fanout")
+
+    assert len(runs) == 3
+    assert len({run.target_id for run in runs}) == 3
+    assert {run.sender_account_id for run in runs} == {account.id}
+    assert all(run.status == RunStatus.QUEUED for run in runs)
 
 
 async def test_bulk_standalone_chat_activation_never_releases_bad_targets(

@@ -623,6 +623,41 @@ async def test_channel_scan_reads_forward_from_last_seen_post(tmp_path) -> None:
     assert [post.message_id for post in scan.posts] == [51, 52]
 
 
+async def test_channel_scan_collapses_media_album_to_one_comment_target(tmp_path) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "channel-album-scan.db"))
+    channel = SimpleNamespace(broadcast=True, title="Новости")
+
+    class AlbumClient:
+        async def iter_messages(self, entity: object, **kwargs: object):
+            assert entity is channel
+            assert kwargs == {"limit": 30, "min_id": 50, "reverse": True}
+            yield SimpleNamespace(id=51, date=utc_now(), action=None, grouped_id=777)
+            yield SimpleNamespace(id=52, date=utc_now(), action=None, grouped_id=777)
+            yield SimpleNamespace(id=53, date=utc_now(), action=None, grouped_id=None)
+
+    client = AlbumClient()
+
+    async def ensure_client(account_id: int) -> AlbumClient:
+        assert account_id == 92
+        return client
+
+    async def resolve_entity(*args: object) -> object:
+        del args
+        return channel
+
+    gateway._ensure_client = ensure_client  # type: ignore[method-assign]
+    gateway._resolve_entity = resolve_entity  # type: ignore[method-assign]
+
+    scan = await gateway.scan_channel_posts(
+        account=Account(id=92, label="album-scan", ownership_confirmed=True),
+        channel_ref="@album_channel",
+        after_message_id=50,
+        limit=30,
+    )
+
+    assert [post.message_id for post in scan.posts] == [51, 53]
+
+
 async def test_channel_scan_bootstrap_reads_only_the_current_newest_post(tmp_path) -> None:
     gateway = _channel_gateway(_settings(tmp_path, "channel-bootstrap.db"))
     client = ChannelPostScanClient()
@@ -1065,6 +1100,7 @@ async def test_membership_gate_joins_button_channels_and_clicks_verify_once(tmp_
     gate_message = SimpleNamespace(
         id=778,
         message="Чтобы писать в чате, подпишитесь на канал и нажмите Проверить.",
+        sender=SimpleNamespace(bot=True),
         reply_markup=types.ReplyInlineMarkup(
             rows=[
                 types.KeyboardButtonRow(
@@ -1129,6 +1165,81 @@ async def test_membership_gate_joins_button_channels_and_clicks_verify_once(tmp_
         isinstance(request, functions.messages.GetBotCallbackAnswerRequest)
         for request in client.requests
     )
+
+
+async def test_membership_gate_ignores_non_bot_and_mismatched_bot_replies(tmp_path) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "membership-gate-source.db"))
+    markup = types.ReplyInlineMarkup(
+        rows=[
+            types.KeyboardButtonRow(
+                buttons=[types.KeyboardButtonUrl("Канал", "https://t.me/required_news")]
+            )
+        ]
+    )
+    messages = [
+        SimpleNamespace(
+            id=778,
+            message="Чтобы писать в чате, подпишитесь на канал.",
+            sender=SimpleNamespace(bot=False),
+            reply_markup=markup,
+        ),
+        SimpleNamespace(
+            id=779,
+            message="Чтобы писать в чате, подпишитесь на канал.",
+            sender=SimpleNamespace(bot=True),
+            reply_to=SimpleNamespace(reply_to_msg_id=123),
+            reply_markup=markup,
+        ),
+    ]
+
+    message, gate = await gateway._find_membership_gate(  # noqa: SLF001 - safety policy test
+        object(),
+        types.InputPeerSelf(),
+        messages,
+        after_message_id=777,
+    )
+
+    assert message is None
+    assert gate is None
+
+
+async def test_membership_gate_ignores_a_bot_that_is_not_a_chat_admin(tmp_path) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "membership-gate-non-admin.db"))
+    entity = types.Channel(
+        551,
+        "Target chat",
+        types.ChatPhotoEmpty(),
+        None,
+        megagroup=True,
+        access_hash=552,
+    )
+    message = SimpleNamespace(
+        id=778,
+        message="Чтобы писать в чате, подпишитесь на канал.",
+        sender=types.User(553, bot=True, access_hash=554),
+        reply_markup=types.ReplyInlineMarkup(
+            rows=[
+                types.KeyboardButtonRow(
+                    buttons=[types.KeyboardButtonUrl("Канал", "https://t.me/required_news")]
+                )
+            ]
+        ),
+    )
+
+    class NonAdminClient:
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, functions.channels.GetParticipantRequest)
+            return SimpleNamespace(participant=types.ChannelParticipant(553, None))
+
+    found_message, gate = await gateway._find_membership_gate(  # noqa: SLF001 - policy test
+        NonAdminClient(),
+        entity,
+        [message],
+        after_message_id=777,
+    )
+
+    assert found_message is None
+    assert gate is None
 
 
 async def test_delayed_verification_prioritizes_removed_post_over_later_chat_ban(tmp_path) -> None:
@@ -1200,6 +1311,44 @@ async def test_required_proxy_outage_is_retryable(tmp_path) -> None:
 
     assert raised.value.code == "proxy_unavailable"
     assert raised.value.retry_after == 60
+
+
+async def test_cached_client_rechecks_its_proxy_before_reuse_when_due(tmp_path) -> None:
+    class CachedClient:
+        def is_connected(self) -> bool:
+            return True
+
+    class RouteCheckService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, float]] = []
+
+        async def account_route_check_due(self, account_id: int, *, max_age_seconds: float) -> bool:
+            self.calls.append((account_id, max_age_seconds))
+            return True
+
+    gateway = _gateway(_settings(tmp_path, "cached-proxy-check.db"))
+    gateway._clients = {12: CachedClient()}
+    gateway._client_generations = {12: 4}
+    route_service = RouteCheckService()
+    gateway._proxy_service = route_service
+    recovered: list[int] = []
+
+    async def account_generation(account_id: int) -> int:
+        assert account_id == 12
+        return 4
+
+    async def resolve_proxy(account_id: int) -> object:
+        recovered.append(account_id)
+        return object()
+
+    gateway._account_connection_generation = account_generation  # type: ignore[method-assign]
+    gateway._resolve_proxy = resolve_proxy  # type: ignore[method-assign]
+
+    client = await gateway._ensure_client(12)
+
+    assert client is gateway._clients[12]
+    assert recovered == [12]
+    assert route_service.calls == [(12, gateway._settings.proxy_health_recheck_seconds)]
 
 
 async def test_account_operations_share_gateway_client_and_lock(tmp_path) -> None:

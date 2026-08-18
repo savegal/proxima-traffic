@@ -433,3 +433,125 @@ async def test_expired_cancelled_participant_reaction_has_unknown_outcome(app) -
         assert stored.status == ParticipantReactionTaskStatus.FAILED
         assert stored.error_code == "cancelled_outcome_unknown"
         assert stored.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_participant_reactions_never_use_an_account_removed_from_the_rule(
+    app, monkeypatch
+) -> None:
+    async with app.state.database.session_factory() as session:
+        first = Account(
+            label="removed-reactor",
+            telegram_user_id=84_001,
+            authorized=True,
+            ownership_confirmed=True,
+        )
+        second = Account(
+            label="selected-reactor",
+            telegram_user_id=84_002,
+            authorized=True,
+            ownership_confirmed=True,
+        )
+        target = Target(chat_ref="@selection_guard", title="Selection guard")
+        target_list = TargetList(name="Selection guard chats")
+        session.add_all([first, second, target, target_list])
+        await session.flush()
+        session.add(
+            TargetListItem(target_list_id=target_list.id, target_id=target.id, enabled=True)
+        )
+        await session.commit()
+        first_id = int(first.id)
+        second_id = int(second.id)
+        target_id = int(target.id)
+        target_list_id = int(target_list.id)
+
+    service = app.state.participant_reactions
+    rule = await service.create_rule(
+        name="Selection guard rule",
+        target_list_id=target_list_id,
+        account_ids=[first_id],
+        emoji="👍",
+        sample_numerator=1,
+        sample_denominator=1,
+    )
+
+    observed = [ParticipantMessage(message_id=100, sender_id=85_001)]
+    reconfigured_during_scan = False
+
+    async def scan_participant_messages(**_: object) -> ParticipantMessageScan:
+        nonlocal reconfigured_during_scan
+        if reconfigured_during_scan:
+            await service.update_rule(
+                int(rule.id),
+                target_list_id=target_list_id,
+                account_ids=[second_id],
+                emoji="👍",
+                sample_numerator=1,
+                sample_denominator=1,
+            )
+        return ParticipantMessageScan(messages=tuple(observed))
+
+    app.state.gateway.scan_participant_messages = scan_participant_messages
+    await service.scan_rule(int(rule.id))  # primes the cursor only
+    reconfigured_during_scan = True
+    observed[:] = [ParticipantMessage(message_id=101, sender_id=85_002)]
+    await service.scan_rule(int(rule.id))
+
+    async with app.state.database.session_factory() as session:
+        scanned_task = await session.scalar(
+            select(ParticipantReactionTask).where(ParticipantReactionTask.message_id == 101)
+        )
+        assert scanned_task is not None
+        assert int(scanned_task.reactor_account_id) == second_id
+
+    await service.update_rule(
+        int(rule.id),
+        target_list_id=target_list_id,
+        account_ids=[first_id],
+        emoji="👍",
+        sample_numerator=1,
+        sample_denominator=1,
+    )
+    async with app.state.database.session_factory() as session:
+        stale_task = ParticipantReactionTask(
+            rule_id=rule.id,
+            target_id=target_id,
+            reactor_account_id=first_id,
+            message_id=102,
+            source_sender_id=85_003,
+            emoji="👍",
+            scheduled_for=utc_now() - timedelta(seconds=1),
+        )
+        session.add(stale_task)
+        await session.commit()
+        stale_task_id = int(stale_task.id)
+
+    sent_from: list[int] = []
+
+    async def send_reaction(**kwargs: object) -> None:
+        account = kwargs["account"]
+        sent_from.append(int(account.id))
+
+    monkeypatch.setattr(app.state.gateway, "send_reaction", send_reaction)
+    run_send = service._runner.run_account_send_operation
+
+    async def reconfigure_before_send(account_id: int, operation) -> None:
+        await service.update_rule(
+            int(rule.id),
+            target_list_id=target_list_id,
+            account_ids=[second_id],
+            emoji="👍",
+            sample_numerator=1,
+            sample_denominator=1,
+        )
+        await run_send(account_id, operation)
+
+    monkeypatch.setattr(service._runner, "run_account_send_operation", reconfigure_before_send)
+    assert await service.process_next() is True
+
+    async with app.state.database.session_factory() as session:
+        stored = await session.get(ParticipantReactionTask, stale_task_id)
+        assert stored is not None
+        assert stored.status == ParticipantReactionTaskStatus.CANCELLED
+        assert stored.error_code == "reactor_removed_from_rule"
+    assert sent_from == []

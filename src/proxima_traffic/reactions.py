@@ -51,6 +51,10 @@ from proxima_traffic.worker_supervision import WorkerIterationReporter
 logger = logging.getLogger(__name__)
 
 
+class _ReactionCancelledBeforeDelivery(Exception):
+    """The task was cancelled after it was claimed but before Telegram was called."""
+
+
 class ReactionWorker:
     """Executes queued reactions separately from posting and reporting workers."""
 
@@ -158,6 +162,8 @@ class ReactionWorker:
                     task.finished_at = now
                 elif task.attempt_count >= task.max_attempts:
                     task.status = ReactionTaskStatus.FAILED
+                    task.error = "maximum reaction delivery attempts exhausted"
+                    task.error_code = "reaction_attempts_exhausted"
                     task.finished_at = now
                 else:
                     task.status = ReactionTaskStatus.QUEUED
@@ -204,7 +210,6 @@ class ReactionWorker:
                     lease_token=token,
                     lease_until=now + timedelta(seconds=self._settings.worker_lease_seconds),
                     started_at=task.started_at or now,
-                    attempt_count=task.attempt_count + 1,
                 )
             )
             if result.rowcount != 1:
@@ -263,11 +268,17 @@ class ReactionWorker:
             else:
                 campaign = await session.get(Campaign, task.campaign_id)
                 target = await session.get(Target, task.target_id)
-            if task.cancel_requested or task.attempt_count >= task.max_attempts:
+            if task.cancel_requested:
                 terminal = (
                     ReactionTaskStatus.CANCELLED,
                     "cancel requested before reaction",
                     "cancelled_before_send",
+                )
+            elif task.attempt_count >= task.max_attempts:
+                terminal = (
+                    ReactionTaskStatus.FAILED,
+                    "maximum reaction delivery attempts exhausted",
+                    "reaction_attempts_exhausted",
                 )
             elif (
                 account is None
@@ -350,6 +361,7 @@ class ReactionWorker:
             return
 
         async def deliver() -> None:
+            await self._record_delivery_attempt(task_id, token)
             if is_comment:
                 assert comment_run is not None and comment_rule is not None
                 await self._gateway.send_channel_comment_reaction(
@@ -382,6 +394,15 @@ class ReactionWorker:
         except AccountSendDeferred as exc:
             await self._defer(task_id, token, exc.resume_at, "account_pacing")
             return
+        except _ReactionCancelledBeforeDelivery:
+            await self._finish(
+                task_id,
+                token,
+                ReactionTaskStatus.CANCELLED,
+                "cancel requested before reaction",
+                "cancelled_before_send",
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - persist all gateway failures
             code = failure_code(exc, "reaction_failed")
             account_failure_recorded = False
@@ -413,6 +434,15 @@ class ReactionWorker:
             )
             return
         await self._finish(task_id, token, ReactionTaskStatus.SUCCEEDED, None, None)
+
+    async def _record_delivery_attempt(self, task_id: int, token: str) -> None:
+        """Count only a real Telegram delivery attempt, never local deferrals."""
+        async with self._session_factory() as session:
+            task = await self._require_running(session, task_id, token)
+            if task.cancel_requested:
+                raise _ReactionCancelledBeforeDelivery
+            task.attempt_count += 1
+            await session.commit()
 
     async def _handle_error(
         self,

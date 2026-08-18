@@ -8,6 +8,7 @@ from fastapi import FastAPI, Response, status
 
 from proxima_traffic.accounts import AccountService
 from proxima_traffic.api import router
+from proxima_traffic.bot.repository import AdminRepository
 from proxima_traffic.channel_comments import ChannelCommentService
 from proxima_traffic.config import Settings, get_settings
 from proxima_traffic.db import Database
@@ -152,6 +153,9 @@ def create_app(
         background_tasks.clear()
         if resolved_settings.auto_create_schema:
             await database.create_schema()
+        await AdminRepository(database.session_factory).ensure_system_account_groups(
+            actor="api-startup"
+        )
         await spambot_checks.prepare_legacy_unknown_rechecks()
         if resolved_settings.api_worker_enabled:
             worker_task = worker_supervisor.start("campaigns", queue_worker.run_forever)

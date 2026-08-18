@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -22,6 +23,7 @@ from proxima_traffic.content import (
 )
 from proxima_traffic.dialogues import DialogueStep, parse_dialogue_steps, serialize_dialogue_steps
 from proxima_traffic.failure_policy import (
+    ACCOUNT_CHAT_BLOCK_CODES,
     ACCOUNT_FATAL_CODES,
     ACCOUNT_TEMPORARY_CODES,
     CHANNEL_COMMENT_AUTO_PAUSE_CODES,
@@ -34,6 +36,7 @@ from proxima_traffic.gateways import (
     ChannelCommentPreflight,
     ChannelPostScan,
     GatewayError,
+    MembershipGateRecovery,
     PermanentGatewayError,
     TemporaryGatewayError,
 )
@@ -77,6 +80,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+AUTO_REPLACE_PRIMARY_ACCOUNT_CODES = (
+    ACCOUNT_FATAL_CODES
+    | ACCOUNT_CHAT_BLOCK_CODES
+    | frozenset({"account_paused", "account_restricted", "sender_unavailable"})
+)
+
+
 class _ChannelCommentCancelled(Exception):
     pass
 
@@ -98,6 +108,19 @@ class ChannelCommentRuleView:
     reaction_succeeded: int = 0
     reaction_failed: int = 0
     reaction_skipped: int = 0
+    reaction_cancelled: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelCommentReactionSummary:
+    """Reaction task state shown beside one concrete auto-comment result."""
+
+    queued: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    cancelled: int = 0
 
 
 class ChannelCommentService:
@@ -138,8 +161,63 @@ class ChannelCommentService:
         message_edit_delay_seconds: int | None = None,
         actor: str = "control-bot",
     ) -> ChannelCommentRule:
+        """Create one rule, retaining the public single-channel API."""
+        rules = await self.create_rules(
+            name=name,
+            channel_refs=(channel_ref,),
+            mode=mode,
+            primary_account_id=primary_account_id,
+            primary_text=primary_text,
+            initial_delay_seconds=initial_delay_seconds,
+            primary_media_path=primary_media_path,
+            primary_media_kind=primary_media_kind,
+            primary_media_name=primary_media_name,
+            primary_media_size=primary_media_size,
+            dialogue_steps=dialogue_steps,
+            message_edit_initial_text=message_edit_initial_text,
+            message_edit_delay_seconds=message_edit_delay_seconds,
+            actor=actor,
+        )
+        return rules[0]
+
+    async def create_rules(
+        self,
+        *,
+        name: str,
+        channel_refs: Sequence[str],
+        mode: ChannelCommentMode,
+        primary_account_id: int,
+        primary_text: str,
+        initial_delay_seconds: int,
+        primary_media_path: str | None = None,
+        primary_media_kind: str | None = None,
+        primary_media_name: str | None = None,
+        primary_media_size: int | None = None,
+        dialogue_steps: list[DialogueStep] | None = None,
+        message_edit_initial_text: str | None = None,
+        message_edit_delay_seconds: int | None = None,
+        actor: str = "control-bot",
+    ) -> list[ChannelCommentRule]:
+        """Create identical comment rules for several channels atomically.
+
+        A rule deliberately remains tied to one channel, so its cursor,
+        discussion availability and error history never leak into another
+        channel.  This batch helper shares the configured flow while creating
+        one independent durable rule per selected channel.
+        """
         normalized_name = self._normalize_name(name)
-        normalized_ref = self._normalize_channel_ref(channel_ref)
+        raw_values: Sequence[str] = (
+            (channel_refs,) if isinstance(channel_refs, str) else channel_refs
+        )
+        raw_refs = [str(value).strip() for value in raw_values if str(value).strip()]
+        if not raw_refs:
+            raise ConflictError("укажите хотя бы один публичный канал")
+        if len(raw_refs) > 25:
+            raise ConflictError("за один раз можно настроить не больше 25 каналов")
+        normalized_refs = [self._normalize_channel_ref(value) for value in raw_refs]
+        if len(set(normalized_refs)) != len(normalized_refs):
+            raise ConflictError("один и тот же канал указан несколько раз")
+        normalized_names = self._batch_rule_names(normalized_name, len(normalized_refs))
         if primary_media_name is not None and len(primary_media_name) > 255:
             raise ConflictError("имя медиафайла не должно быть длиннее 255 символов")
         try:
@@ -197,9 +275,7 @@ class ChannelCommentService:
                 try:
                     resolve_media_path(self._settings, step.media_path)
                 except ContentError as exc:
-                    raise ConflictError(
-                        f"медиа шага цепочки № {index}: {exc}"
-                    ) from exc
+                    raise ConflictError(f"медиа шага цепочки № {index}: {exc}") from exc
             if (
                 steps[0].account_id != primary_account_id
                 or steps[0].text != normalized_text
@@ -234,53 +310,85 @@ class ChannelCommentService:
                     self._validate_account(dialogue_account)
                     accounts[account_id] = dialogue_account
 
-        preflight = await self._preflight_accounts(list(accounts.values()), normalized_ref)
+        # Fail before any write if the requested set overlaps an active rule.
+        # The database constraints still protect this check from a concurrent
+        # operator creating a rule in the small window before the final flush.
         async with self._session_factory() as session:
-            rule = ChannelCommentRule(
-                name=normalized_name,
-                channel_ref=normalized_ref,
-                mode=mode,
-                primary_account_id=primary_account_id,
-                primary_text=normalized_text,
-                primary_media_path=primary_media_path,
-                primary_media_kind=primary_media_kind,
-                primary_media_name=(primary_media_name[:255] if primary_media_name else None),
-                primary_media_size=(
-                    int(primary_media_size) if primary_media_size is not None else None
-                ),
-                dialogue_steps_json=serialized_steps,
-                message_edit_initial_text=normalized_edit_initial_text,
-                message_edit_delay_seconds=normalized_edit_delay,
-                mention_cooldown_days=(self._settings.channel_comments_mention_cooldown_days),
-                initial_delay_seconds=normalized_delay,
-                approved_by_operator=True,
-                enabled=True,
-                armed_at=utc_now(),
-                channel_title=preflight.title if preflight is not None else None,
+            conflicting = await session.scalar(
+                select(ChannelCommentRule.id).where(
+                    ChannelCommentRule.archived_at.is_(None),
+                    or_(
+                        ChannelCommentRule.channel_ref.in_(normalized_refs),
+                        ChannelCommentRule.name.in_(normalized_names),
+                    ),
+                )
             )
-            session.add(rule)
+        if conflicting is not None:
+            raise ConflictError("один из каналов или названий уже добавлен")
+
+        # One Telegram preflight per channel is intentional: discussion groups
+        # and sender permissions may differ even when the flow is identical.
+        preflights = [
+            await self._preflight_accounts(list(accounts.values()), channel_ref)
+            for channel_ref in normalized_refs
+        ]
+        async with self._session_factory() as session:
+            rules = [
+                ChannelCommentRule(
+                    name=rule_name,
+                    channel_ref=channel_ref,
+                    mode=mode,
+                    primary_account_id=primary_account_id,
+                    primary_text=normalized_text,
+                    primary_media_path=primary_media_path,
+                    primary_media_kind=primary_media_kind,
+                    primary_media_name=(primary_media_name[:255] if primary_media_name else None),
+                    primary_media_size=(
+                        int(primary_media_size) if primary_media_size is not None else None
+                    ),
+                    dialogue_steps_json=serialized_steps,
+                    message_edit_initial_text=normalized_edit_initial_text,
+                    message_edit_delay_seconds=normalized_edit_delay,
+                    mention_cooldown_days=(self._settings.channel_comments_mention_cooldown_days),
+                    initial_delay_seconds=normalized_delay,
+                    approved_by_operator=True,
+                    enabled=True,
+                    armed_at=utc_now(),
+                    channel_title=preflight.title if preflight is not None else None,
+                )
+                for rule_name, channel_ref, preflight in zip(
+                    normalized_names,
+                    normalized_refs,
+                    preflights,
+                    strict=True,
+                )
+            ]
+            session.add_all(rules)
             try:
                 await session.flush()
             except IntegrityError as exc:
                 await session.rollback()
                 raise ConflictError("канал или название уже добавлены") from exc
-            add_audit_event(
-                session,
-                event_type="channel_comment_rule.created",
-                entity_type="channel_comment_rule",
-                entity_id=rule.id,
-                details={
-                    "channel_ref": normalized_ref,
-                    "mode": mode.value,
-                    "initial_delay_seconds": normalized_delay,
-                    "message_edit_delay_seconds": normalized_edit_delay,
-                    "mention_cooldown_days": rule.mention_cooldown_days,
-                },
-                actor=actor,
-            )
+            for rule in rules:
+                add_audit_event(
+                    session,
+                    event_type="channel_comment_rule.created",
+                    entity_type="channel_comment_rule",
+                    entity_id=rule.id,
+                    details={
+                        "channel_ref": rule.channel_ref,
+                        "mode": mode.value,
+                        "initial_delay_seconds": normalized_delay,
+                        "message_edit_delay_seconds": normalized_edit_delay,
+                        "mention_cooldown_days": rule.mention_cooldown_days,
+                        "batch_size": len(rules),
+                    },
+                    actor=actor,
+                )
             await session.commit()
-            await session.refresh(rule)
-            return rule
+            for rule in rules:
+                await session.refresh(rule)
+            return rules
 
     async def list_rules(
         self,
@@ -327,6 +435,40 @@ class ChannelCommentService:
                     .limit(max(1, min(limit, 30)))
                 )
             )
+
+    async def recent_run_reaction_summaries(
+        self,
+        run_ids: list[int],
+    ) -> dict[int, ChannelCommentReactionSummary]:
+        """Return every reaction outcome for the runs currently visible in a report."""
+        normalized_ids = list(dict.fromkeys(run_id for run_id in run_ids if run_id > 0))
+        if not normalized_ids:
+            return {}
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(
+                    ReactionTask.channel_comment_run_id,
+                    ReactionTask.status,
+                    func.count(ReactionTask.id),
+                )
+                .where(ReactionTask.channel_comment_run_id.in_(normalized_ids))
+                .group_by(ReactionTask.channel_comment_run_id, ReactionTask.status)
+            )
+        counts: dict[int, dict[ReactionTaskStatus, int]] = {run_id: {} for run_id in normalized_ids}
+        for run_id, status, count in result:
+            if run_id is not None:
+                counts[int(run_id)][status] = int(count)
+        return {
+            run_id: ChannelCommentReactionSummary(
+                queued=states.get(ReactionTaskStatus.QUEUED, 0),
+                running=states.get(ReactionTaskStatus.RUNNING, 0),
+                succeeded=states.get(ReactionTaskStatus.SUCCEEDED, 0),
+                failed=states.get(ReactionTaskStatus.FAILED, 0),
+                skipped=states.get(ReactionTaskStatus.SKIPPED, 0),
+                cancelled=states.get(ReactionTaskStatus.CANCELLED, 0),
+            )
+            for run_id, states in counts.items()
+        }
 
     async def set_rule_enabled(
         self,
@@ -388,6 +530,31 @@ class ChannelCommentService:
                 entity_type="channel_comment_rule",
                 entity_id=rule.id,
                 details={"enabled": enabled},
+                actor=actor,
+            )
+            await session.commit()
+            await session.refresh(rule)
+            return rule
+
+    async def set_auto_replace_primary_account(
+        self,
+        rule_id: int,
+        enabled: bool,
+        *,
+        actor: str = "control-bot",
+    ) -> ChannelCommentRule:
+        """Opt in or out of replacing the first sender after a route failure."""
+        async with self._session_factory() as session:
+            rule = await self._active_rule(session, rule_id)
+            if rule is None:
+                raise NotFoundError("настройка комментариев не найдена")
+            rule.auto_replace_primary_account = bool(enabled)
+            add_audit_event(
+                session,
+                event_type="channel_comment_rule.auto_replace_primary_account_changed",
+                entity_type="channel_comment_rule",
+                entity_id=rule.id,
+                details={"enabled": rule.auto_replace_primary_account},
                 actor=actor,
             )
             await session.commit()
@@ -834,6 +1001,8 @@ class ChannelCommentService:
         return len(rule_ids)
 
     async def scan_rule(self, rule_id: int) -> None:
+        validation_error: ConflictError | None = None
+        account: Account | None = None
         async with self._session_factory() as session:
             rule = await self._active_rule(session, rule_id)
             if rule is None or not rule.enabled or not rule.approved_by_operator:
@@ -842,21 +1011,17 @@ class ChannelCommentService:
             try:
                 self._validate_account(account)
             except ConflictError as exc:
-                self._store_rule_error(rule, exc, account_id=rule.primary_account_id)
-                rule.last_scanned_at = utc_now()
-                if failure_code(exc) in CHANNEL_COMMENT_AUTO_PAUSE_CODES:
-                    await self._auto_pause_rule(
-                        session,
-                        rule,
-                        exc,
-                        account_id=rule.primary_account_id,
-                    )
-                await session.commit()
-                return
-            channel_ref = rule.channel_ref
-            after_message_id = int(rule.last_seen_post_id or 0)
-            bootstrap = rule.last_seen_post_id is None
-            armed_at = ensure_utc(rule.armed_at)
+                validation_error = exc
+            else:
+                channel_ref = rule.channel_ref
+                after_message_id = int(rule.last_seen_post_id or 0)
+                bootstrap = rule.last_seen_post_id is None
+                armed_at = ensure_utc(rule.armed_at)
+
+        if validation_error is not None:
+            await self._record_scan_failure(rule_id, validation_error)
+            return
+        assert account is not None
 
         try:
             async with asyncio.timeout(self._settings.channel_comments_scan_timeout_seconds):
@@ -1029,18 +1194,31 @@ class ChannelCommentService:
             rule = await self._active_rule(session, rule_id)
             if rule is None:
                 return
-            self._store_rule_error(rule, exc, account_id=rule.primary_account_id)
+            account_id = int(rule.primary_account_id)
+        await self._runner.handle_external_account_failure(account_id, exc)
+        if await self._try_auto_replace_primary_account(
+            rule_id=rule_id,
+            failed_account_id=account_id,
+            exc=exc,
+        ):
+            # The replacement passed a live channel check. Scan once with it so
+            # the monitor does not wait for the next interval to resume.
+            await self.scan_rule(rule_id)
+            return
+        async with self._session_factory() as session:
+            rule = await self._active_rule(session, rule_id)
+            if rule is None or rule.primary_account_id != account_id:
+                return
+            self._store_rule_error(rule, exc, account_id=account_id)
             rule.last_scanned_at = utc_now()
             if failure_code(exc) in CHANNEL_COMMENT_AUTO_PAUSE_CODES:
                 await self._auto_pause_rule(
                     session,
                     rule,
                     exc,
-                    account_id=rule.primary_account_id,
+                    account_id=account_id,
                 )
             await session.commit()
-        account_id = rule.primary_account_id
-        await self._runner.handle_external_account_failure(account_id, exc)
 
     async def _claim_next(self) -> tuple[int, str] | None:
         now = utc_now()
@@ -1153,9 +1331,14 @@ class ChannelCommentService:
                     if resume_at is not None:
                         return resume_at
                 self._validate_account(account)
-            idempotency_key = f"channel-comment:{run.id}:step:{run.step_index}"
+            content_key = f"channel-comment:{run.id}:step:{run.step_index}"
+            idempotency_key = content_key
+            if run.membership_gate_retry_count > 0:
+                idempotency_key = (
+                    f"{content_key}:membership-gate-retry:{run.membership_gate_retry_count}"
+                )
             try:
-                text = render_spintax(step.text, seed=idempotency_key)
+                text = render_spintax(step.text, seed=content_key)
             except ContentError as exc:
                 raise ConflictError(str(exc)) from exc
             if is_message_edit:
@@ -1186,7 +1369,7 @@ class ChannelCommentService:
                         rule,
                         account,
                         text=text,
-                        selection_key=f"channel-comment:{run.id}:hidden-mentions",
+                        selection_key=f"{content_key}:hidden-mentions",
                     )
                 html_text = append_hidden_mentions(
                     text=text,
@@ -1729,6 +1912,16 @@ class ChannelCommentService:
         code = failure_code(exc, "delivery_failed")
         if code in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES:
             await self._runner.handle_external_account_failure(account_id, exc)
+        replaced = False
+        if code in AUTO_REPLACE_PRIMARY_ACCOUNT_CODES:
+            replaced = await self._try_auto_replace_primary_account(
+                run_id=run_id,
+                lease_token=lease_token,
+                failed_account_id=account_id,
+                exc=exc,
+            )
+        if replaced:
+            return
         if (
             code == "post_deleted_by_moderation"
             and getattr(exc, "external_message_id", None) is not None
@@ -1737,9 +1930,26 @@ class ChannelCommentService:
             # still consumes this account's workload for the day.
             await self._runner.record_external_account_send(
                 account_id,
-                operation_key=f"channel-comment:{run_id}:moderated",
+                operation_key=(
+                    f"channel-comment:{run_id}:moderated:{int(exc.external_message_id)}"
+                ),
             )
             await self._finalize_moderated_hidden_mentions(run_id, lease_token)
+            recovery = await self._recover_membership_gate(run_id, lease_token, account_id, exc)
+            if recovery is not None and recovery.detected:
+                if recovery.recovered and await self._schedule_membership_gate_retry(
+                    run_id,
+                    lease_token,
+                    account_id,
+                    recovery,
+                ):
+                    return
+                exc = PermanentGatewayError(
+                    "membership gate recovery failed: "
+                    f"{recovery.error or 'retry window is no longer available'}",
+                    code="post_deleted_by_moderation",
+                    external_message_id=getattr(exc, "external_message_id", None),
+                )
         if code in {
             "flood_wait",
             "slow_mode",
@@ -1767,6 +1977,89 @@ class ChannelCommentService:
             exc,
             permanent=(isinstance(exc, ConflictError) or getattr(exc, "retryable", True) is False),
         )
+
+    async def _recover_membership_gate(
+        self,
+        run_id: int,
+        lease_token: str,
+        account_id: int,
+        exc: BaseException,
+    ) -> MembershipGateRecovery | None:
+        """Resolve an explicit gate in the actual discussion group for this comment."""
+
+        deleted_message_id = getattr(exc, "external_message_id", None)
+        recover = getattr(self._gateway, "recover_channel_comment_membership_gate", None)
+        if recover is None or deleted_message_id is None:
+            return None
+        async with self._session_factory() as session:
+            run = await self._require_running(session, run_id, lease_token)
+            rule = await session.get(ChannelCommentRule, run.rule_id)
+            account = await session.get(Account, account_id)
+        if rule is None or account is None:
+            return None
+        try:
+            result = await recover(
+                account=account,
+                channel_ref=rule.channel_ref,
+                channel_post_id=int(run.source_post_id),
+                deleted_message_id=int(deleted_message_id),
+            )
+        except GatewayError as recovery_exc:
+            return MembershipGateRecovery(
+                detected=True,
+                recovered=False,
+                error=safe_error_message(recovery_exc),
+            )
+        except Exception:  # noqa: BLE001 - the deleted comment remains authoritative
+            logger.exception("Membership-gate recovery failed for channel-comment run %s", run_id)
+            return MembershipGateRecovery(
+                detected=True,
+                recovered=False,
+                error="membership gate operation failed",
+            )
+        return result if isinstance(result, MembershipGateRecovery) else None
+
+    async def _schedule_membership_gate_retry(
+        self,
+        run_id: int,
+        lease_token: str,
+        account_id: int,
+        recovery: MembershipGateRecovery,
+    ) -> bool:
+        """Persist one completed gate flow and retry the exact comment step once."""
+
+        retry_at = utc_now() + timedelta(
+            seconds=int(getattr(self._settings, "membership_gate_retry_delay_seconds", 300))
+        )
+        async with self._session_factory() as session:
+            run = await self._require_running(session, run_id, lease_token)
+            if run.membership_gate_retry_count >= 1 or run.cancel_requested:
+                return False
+            expires_at = ensure_utc(run.expires_at)
+            if expires_at is not None and retry_at >= expires_at:
+                return False
+            run.membership_gate_retry_count = 1
+            run.status = ChannelCommentRunStatus.QUEUED
+            run.scheduled_for = retry_at
+            run.error = None
+            run.error_code = "membership_gate_retry"
+            run.attempt_count = max(0, run.attempt_count - 1)
+            self._release_lease(run)
+            add_audit_event(
+                session,
+                event_type="channel_comment.membership_gate_retry_scheduled",
+                entity_type="channel_comment_run",
+                entity_id=run.id,
+                details={
+                    "account_id": account_id,
+                    "retry_at": retry_at.isoformat(),
+                    "joined_channel_refs": list(recovery.joined_channel_refs),
+                    "verification_callback_count": recovery.verification_callback_count,
+                },
+                actor="channel-comment-worker",
+            )
+            await session.commit()
+            return True
 
     async def _defer_run(
         self,
@@ -2114,6 +2407,9 @@ class ChannelCommentService:
                 ),
                 reaction_failed=reaction_counts[int(rule.id)].get(ReactionTaskStatus.FAILED, 0),
                 reaction_skipped=reaction_counts[int(rule.id)].get(ReactionTaskStatus.SKIPPED, 0),
+                reaction_cancelled=reaction_counts[int(rule.id)].get(
+                    ReactionTaskStatus.CANCELLED, 0
+                ),
             )
             for rule in rules
         ]
@@ -2274,6 +2570,221 @@ class ChannelCommentService:
             )
             raise wrapped from exc
         return result
+
+    async def _try_auto_replace_primary_account(
+        self,
+        *,
+        failed_account_id: int,
+        exc: BaseException,
+        rule_id: int | None = None,
+        run_id: int | None = None,
+        lease_token: str | None = None,
+    ) -> bool:
+        """Move a safe, unstarted comment flow to a verified fallback sender.
+
+        A replacement is intentionally conservative: only the first step can
+        move, no other flow may be running, and a candidate is live-checked in
+        the channel before it becomes the new default sender.
+        """
+        if failure_code(exc) not in AUTO_REPLACE_PRIMARY_ACCOUNT_CODES:
+            return False
+        if run_id is None and rule_id is None:
+            return False
+        if run_id is not None and not lease_token:
+            return False
+
+        async with self._session_factory() as session:
+            run: ChannelCommentRun | None = None
+            if run_id is not None:
+                try:
+                    run = await self._require_running(session, run_id, str(lease_token))
+                except (ConflictError, NotFoundError):
+                    return False
+                rule = await self._active_rule(session, int(run.rule_id))
+            else:
+                rule = await self._active_rule(session, int(rule_id))
+            if rule is None or rule.primary_account_id != failed_account_id:
+                return False
+            if not await self._auto_replacement_is_safe(
+                session,
+                rule,
+                run=run,
+            ):
+                return False
+            candidate_conditions = [
+                Account.id != failed_account_id,
+                Account.status == AccountStatus.ACTIVE,
+                Account.ownership_confirmed.is_(True),
+            ]
+            if not self._settings.dry_run:
+                candidate_conditions.extend(
+                    [
+                        Account.authorized.is_(True),
+                        Account.session_encrypted.is_not(None),
+                        Account.api_id.is_not(None),
+                        Account.api_hash_encrypted.is_not(None),
+                    ]
+                )
+            candidates = list(
+                await session.scalars(
+                    select(Account).where(*candidate_conditions).order_by(Account.id)
+                )
+            )
+            channel_ref = rule.channel_ref
+
+        for candidate in candidates:
+            candidate_id = int(candidate.id)
+            try:
+                self._validate_account(candidate)
+                if rule.mode == ChannelCommentMode.DIALOGUE and (
+                    self._replacement_dialogue_steps(rule, candidate_id) is None
+                ):
+                    continue
+                preflight = await self._preflight_accounts([candidate], channel_ref)
+            except ConflictError:
+                # A candidate that cannot comment in this channel is not a
+                # fallback. Its own failure state has already been recorded by
+                # the preflight helper.
+                continue
+            except Exception:  # noqa: BLE001 - keep the failed route contained
+                logger.exception(
+                    "Auto replacement preflight failed for channel-comment rule %s", rule.id
+                )
+                continue
+
+            if await self._apply_auto_primary_replacement(
+                rule_id=int(rule.id),
+                failed_account_id=failed_account_id,
+                replacement_account_id=candidate_id,
+                exc=exc,
+                run_id=run_id,
+                lease_token=lease_token,
+                channel_title=preflight.title if preflight is not None else None,
+            ):
+                return True
+        return False
+
+    async def _auto_replacement_is_safe(
+        self,
+        session: AsyncSession,
+        rule: ChannelCommentRule,
+        *,
+        run: ChannelCommentRun | None,
+    ) -> bool:
+        if not rule.enabled or not rule.auto_replace_primary_account:
+            return False
+        if run is not None and (
+            run.rule_id != rule.id
+            or run.cancel_requested
+            or run.step_index != 0
+            or run.sent_steps != 0
+        ):
+            return False
+        running_condition = ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING
+        if run is not None:
+            running_condition = running_condition & (ChannelCommentRun.id != run.id)
+        another_started_run = await session.scalar(
+            select(ChannelCommentRun.id)
+            .where(
+                ChannelCommentRun.rule_id == rule.id,
+                or_(
+                    running_condition,
+                    (ChannelCommentRun.status == ChannelCommentRunStatus.QUEUED)
+                    & (ChannelCommentRun.sent_steps > 0),
+                ),
+            )
+            .limit(1)
+        )
+        return another_started_run is None
+
+    async def _apply_auto_primary_replacement(
+        self,
+        *,
+        rule_id: int,
+        failed_account_id: int,
+        replacement_account_id: int,
+        exc: BaseException,
+        run_id: int | None,
+        lease_token: str | None,
+        channel_title: str | None,
+    ) -> bool:
+        async with self._session_factory() as session:
+            rule = await self._active_rule(session, rule_id)
+            if rule is None or rule.primary_account_id != failed_account_id:
+                return False
+            run: ChannelCommentRun | None = None
+            if run_id is not None:
+                if not lease_token:
+                    return False
+                try:
+                    run = await self._require_running(session, run_id, lease_token)
+                except (ConflictError, NotFoundError):
+                    return False
+            if not await self._auto_replacement_is_safe(session, rule, run=run):
+                return False
+            replacement = await session.get(Account, replacement_account_id)
+            try:
+                self._validate_account(replacement)
+            except ConflictError:
+                return False
+
+            replacement_steps = self._replacement_dialogue_steps(rule, replacement_account_id)
+            if rule.mode == ChannelCommentMode.DIALOGUE and replacement_steps is None:
+                return False
+            rule.primary_account_id = replacement_account_id
+            if replacement_steps is not None:
+                rule.dialogue_steps_json = replacement_steps
+            if channel_title:
+                rule.channel_title = channel_title[:255]
+            rule.last_error = "основной аккаунт автоматически заменён после ошибки Telegram"
+            rule.last_error_code = "primary_account_auto_replaced"
+            rule.last_error_account_id = failed_account_id
+            if run is not None:
+                run.status = ChannelCommentRunStatus.QUEUED
+                run.scheduled_for = utc_now()
+                run.attempt_count = max(0, run.attempt_count - 1)
+                run.error = (
+                    "основной аккаунт автоматически заменён; комментарий поставлен в очередь"
+                )
+                run.error_code = "primary_account_auto_replaced"
+                self._release_lease(run)
+            add_audit_event(
+                session,
+                event_type="channel_comment_rule.primary_account_auto_replaced",
+                entity_type="channel_comment_rule",
+                entity_id=rule.id,
+                details={
+                    "previous_account_id": failed_account_id,
+                    "replacement_account_id": replacement_account_id,
+                    "trigger_code": failure_code(exc),
+                    "run_id": run_id,
+                },
+                actor="channel-comment-worker",
+            )
+            await session.commit()
+            return True
+
+    def _replacement_dialogue_steps(
+        self,
+        rule: ChannelCommentRule,
+        replacement_account_id: int,
+    ) -> str | None:
+        if rule.mode != ChannelCommentMode.DIALOGUE:
+            return rule.dialogue_steps_json
+        try:
+            steps = self._rule_steps(rule)
+            steps[0] = replace(steps[0], account_id=replacement_account_id)
+            validated_steps = parse_dialogue_steps(
+                serialize_dialogue_steps(steps),
+                primary_account_id=replacement_account_id,
+                primary_text=rule.primary_text,
+                reply_account_id=None,
+                reply_text="",
+                reply_delay_seconds=0,
+            )
+        except (ConflictError, ValueError):
+            return None
+        return serialize_dialogue_steps(validated_steps)
 
     async def _schedule_comment_reactions(
         self,
@@ -2531,6 +3042,18 @@ class ChannelCommentService:
         if not 1 <= len(normalized) <= 150:
             raise ConflictError("название должно содержать от 1 до 150 символов")
         return normalized
+
+    @classmethod
+    def _batch_rule_names(cls, base_name: str, count: int) -> list[str]:
+        """Keep rule names unique while preserving the operator's base name."""
+        if count == 1:
+            return [base_name]
+        names: list[str] = []
+        for index in range(1, count + 1):
+            suffix = f" · {index}"
+            prefix = base_name[: 150 - len(suffix)].rstrip()
+            names.append(cls._normalize_name(f"{prefix}{suffix}"))
+        return names
 
     @staticmethod
     def _normalize_channel_ref(value: str) -> str:

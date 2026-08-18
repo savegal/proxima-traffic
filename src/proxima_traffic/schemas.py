@@ -73,6 +73,9 @@ class TargetRead(ORMModel):
     manual_cooldown_seconds: int
     approved_by_operator: bool
     approved_at: datetime | None
+    # Present only when the target collection is filtered by target_list_id.
+    # Global approval is not a substitute for per-list enablement.
+    list_enabled: bool | None = None
     quality_status: str
     quality_score: int
     quality_reason: str | None
@@ -104,7 +107,10 @@ class TargetListRead(BaseModel):
 class MessageTemplateCreate(BaseModel):
     name: str = Field(min_length=1, max_length=150)
     primary_text: str = Field(min_length=1, max_length=4096)
-    reply_text: str = Field(min_length=1, max_length=4096)
+    # A reply is optional for broadcast-only templates.  The control-bot has
+    # supported this since its first wizard; the API must represent the same
+    # saved object instead of rejecting it at validation time.
+    reply_text: str = Field(max_length=4096)
 
     @model_validator(mode="after")
     def validate_template_spintax(self) -> "MessageTemplateCreate":
@@ -119,7 +125,7 @@ class MessageTemplateCreate(BaseModel):
 class MessageTemplateUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=150)
     primary_text: str | None = Field(default=None, min_length=1, max_length=4096)
-    reply_text: str | None = Field(default=None, min_length=1, max_length=4096)
+    reply_text: str | None = Field(default=None, max_length=4096)
     enabled: bool | None = None
 
     @model_validator(mode="after")
@@ -224,8 +230,7 @@ class CampaignCreate(BaseModel):
             if self.primary_account_id == self.reply_account_id:
                 raise ValueError("primary and reply accounts must be different")
             reply_is_captionless_media = bool(
-                self.dialogue_steps
-                and self.dialogue_steps[1].media_kind in {"voice", "video_note"}
+                self.dialogue_steps and self.dialogue_steps[1].media_kind in {"voice", "video_note"}
             )
             if not self.reply_text.strip() and not reply_is_captionless_media:
                 raise ValueError("для диалога нужен текст ответа")
@@ -423,6 +428,11 @@ class ActiveLaunchUpdate(BaseModel):
             raise ValueError("at least one active launch setting is required")
         if self.primary_text is not None and not self.primary_text.strip():
             raise ValueError("primary_text must contain non-whitespace characters")
+        if self.primary_text is not None:
+            try:
+                validate_spintax(self.primary_text)
+            except ContentError as exc:
+                raise ValueError(str(exc)) from exc
         return self
 
 

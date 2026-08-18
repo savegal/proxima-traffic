@@ -25,6 +25,11 @@ class AccountBulkNameState(StatesGroup):
     confirm = State()
 
 
+class AccountBulkAvatarState(StatesGroup):
+    photo = State()
+    confirm = State()
+
+
 class AccountAvatarEditState(StatesGroup):
     photo = State()
 
@@ -37,6 +42,16 @@ class AccountAboutEditState(StatesGroup):
 class AccountAboutBulkState(StatesGroup):
     text = State()
     confirm = State()
+
+
+class AccountGroupCreateState(StatesGroup):
+    name = State()
+    description = State()
+
+
+class AccountGroupEditState(StatesGroup):
+    name = State()
+    description = State()
 
 
 class TargetCreateState(StatesGroup):

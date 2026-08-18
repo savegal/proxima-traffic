@@ -40,8 +40,12 @@ from proxima_traffic.models import (
     DirectMessageTask,
     DirectMessageTaskStatus,
     MentionBlacklistEntry,
+    ProxyAssignment,
+    ProxyEndpoint,
+    ProxyStatus,
     Subscriber,
     SubscriberAccountPeer,
+    SubscriberInviteTask,
     SubscriberList,
     SubscriberListMember,
     SubscriberListStatus,
@@ -49,6 +53,7 @@ from proxima_traffic.models import (
     ensure_utc,
     utc_now,
 )
+from proxima_traffic.proxies import ProxyService
 from proxima_traffic.services import (
     AccountSendDeferred,
     CampaignRunner,
@@ -140,6 +145,8 @@ class DirectBlacklistAddResult:
     added: int
     already_present: int
     cancelled_tasks: int
+    cancelled_invite_tasks: int = 0
+    affected_invite_launch_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,12 +210,14 @@ class DirectMessageService:
         settings: Settings,
         *,
         worker_id: str,
+        proxy_service: ProxyService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._gateway = gateway
         self._runner = runner
         self._settings = settings
         self._worker_id = worker_id
+        self._proxy_service = proxy_service
         self._stop_event = asyncio.Event()
         self._running = False
         self._active_steps = 0
@@ -555,42 +564,81 @@ class DirectMessageService:
                 )
             )
             affected_rows: list[tuple[int, int]] = []
+            affected_invite_rows: list[tuple[int, int]] = []
             if subscriber_ids:
                 affected_rows = [
                     (int(row.launch_id), int(row.subscriber_id))
                     for row in (
                         await session.execute(
-                            select(
-                                DirectMessageTask.launch_id,
-                                DirectMessageTask.subscriber_id,
-                            ).where(
+                            update(DirectMessageTask)
+                            .where(
                                 DirectMessageTask.subscriber_id.in_(subscriber_ids),
                                 DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                            )
+                            .values(
+                                status=DirectMessageTaskStatus.SKIPPED,
+                                error_code="recipient_blacklisted",
+                                error="получатель добавлен в глобальный стоп-лист",
+                                finished_at=now,
+                                updated_at=now,
+                            )
+                            .returning(
+                                DirectMessageTask.launch_id,
+                                DirectMessageTask.subscriber_id,
+                            )
+                        )
+                    ).all()
+                ]
+                affected_invite_rows = [
+                    (int(row.launch_id), int(row.subscriber_id))
+                    for row in (
+                        await session.execute(
+                            update(SubscriberInviteTask)
+                            .where(
+                                SubscriberInviteTask.subscriber_id.in_(subscriber_ids),
+                                SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                            )
+                            .values(
+                                status=DirectMessageTaskStatus.SKIPPED,
+                                error_code="recipient_blacklisted",
+                                error="получатель добавлен в глобальный стоп-лист",
+                                finished_at=now,
+                                updated_at=now,
+                            )
+                            .returning(
+                                SubscriberInviteTask.launch_id,
+                                SubscriberInviteTask.subscriber_id,
                             )
                         )
                     ).all()
                 ]
                 if affected_rows:
                     affected_subscriber_ids = {row[1] for row in affected_rows}
+                    affected_launch_ids = {row[0] for row in affected_rows}
                     await session.execute(
-                        update(DirectMessageTask)
+                        update(Subscriber)
                         .where(
-                            DirectMessageTask.subscriber_id.in_(affected_subscriber_ids),
-                            DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                            Subscriber.id.in_(affected_subscriber_ids),
+                            Subscriber.reserved_direct_launch_id.in_(affected_launch_ids),
                         )
                         .values(
-                            status=DirectMessageTaskStatus.SKIPPED,
-                            error_code="recipient_blacklisted",
-                            error="получатель добавлен в глобальный стоп-лист",
-                            finished_at=now,
+                            reserved_direct_launch_id=None,
+                            last_error_code="recipient_blacklisted",
+                            last_error="получатель добавлен в глобальный стоп-лист",
                             updated_at=now,
                         )
                     )
+                if affected_invite_rows:
+                    affected_invite_subscriber_ids = {row[1] for row in affected_invite_rows}
+                    affected_invite_launch_ids = {row[0] for row in affected_invite_rows}
                     await session.execute(
                         update(Subscriber)
-                        .where(Subscriber.id.in_(affected_subscriber_ids))
+                        .where(
+                            Subscriber.id.in_(affected_invite_subscriber_ids),
+                            Subscriber.reserved_invite_launch_id.in_(affected_invite_launch_ids),
+                        )
                         .values(
-                            reserved_direct_launch_id=None,
+                            reserved_invite_launch_id=None,
                             last_error_code="recipient_blacklisted",
                             last_error="получатель добавлен в глобальный стоп-лист",
                             updated_at=now,
@@ -603,7 +651,9 @@ class DirectMessageService:
             requested=len(values),
             added=len(values) - len(existing),
             already_present=len(existing),
-            cancelled_tasks=len(affected_rows),
+            cancelled_tasks=len(affected_rows) + len(affected_invite_rows),
+            cancelled_invite_tasks=len(affected_invite_rows),
+            affected_invite_launch_ids=tuple(sorted({row[0] for row in affected_invite_rows})),
         )
 
     async def list_subscriber_lists(
@@ -636,8 +686,7 @@ class DirectMessageService:
         )
         async with self._session_factory() as session:
             total = int(
-                await session.scalar(select(func.count(SubscriberList.id)).where(*conditions))
-                or 0
+                await session.scalar(select(func.count(SubscriberList.id)).where(*conditions)) or 0
             )
             items = list(
                 await session.scalars(
@@ -832,21 +881,31 @@ class DirectMessageService:
         campaign: DirectCampaign,
     ) -> tuple[int, int, int, int]:
         cooldown_before = utc_now() - timedelta(days=campaign.contact_cooldown_days)
+        uncertain_delivery_before = utc_now() - timedelta(
+            days=max(1, campaign.contact_cooldown_days)
+        )
         base = [
             SubscriberListMember.subscriber_list_id == campaign.subscriber_list_id,
             Subscriber.do_not_contact.is_(False),
             self._segment_condition(campaign.segment),
             ~Subscriber.telegram_user_id.in_(select(MentionBlacklistEntry.telegram_user_id)),
         ]
-        recent_condition = (
-            or_(
-                Subscriber.last_contacted_at.is_not(None)
-                & (Subscriber.last_contacted_at > cooldown_before),
-                Subscriber.last_delivery_uncertain_at.is_not(None)
-                & (Subscriber.last_delivery_uncertain_at > cooldown_before),
-            )
+        recent_contact_condition = (
+            Subscriber.last_contacted_at.is_not(None)
+            & (Subscriber.last_contacted_at > cooldown_before)
             if campaign.contact_cooldown_days > 0
             else Subscriber.id.is_(None)
+        )
+        # A missing delivery receipt needs an independent, non-zero safety
+        # window even when the campaign has no normal repeat-contact pause.
+        # It expires deterministically instead of turning a transient outcome
+        # into a permanent, invisible exclusion.
+        uncertain_delivery_condition = Subscriber.last_delivery_uncertain_at.is_not(None) & (
+            Subscriber.last_delivery_uncertain_at > uncertain_delivery_before
+        )
+        recent_condition = or_(
+            recent_contact_condition,
+            uncertain_delivery_condition,
         )
         row = (
             await session.execute(
@@ -881,6 +940,7 @@ class DirectMessageService:
     ) -> DirectLaunch:
         if not consent_confirmed:
             raise ConflictError("нужно подтвердить, что получатели дали согласие на сообщения")
+        await self._refresh_live_proxy_routes(campaign_id)
         now = utc_now()
         async with self._session_factory() as session:
             campaign = await session.get(DirectCampaign, campaign_id)
@@ -902,7 +962,12 @@ class DirectMessageService:
             accounts = list(
                 await session.scalars(select(Account).where(Account.id.in_(account_ids)))
             )
+            healthy_proxy_account_ids = await self._healthy_proxy_account_ids(
+                session,
+                account_ids,
+            )
             ready_account_ids: list[int] = []
+            missing_proxy_count = 0
             for account in accounts:
                 try:
                     CampaignRunner._validate_sender(
@@ -911,27 +976,36 @@ class DirectMessageService:
                     )
                 except ConflictError:
                     continue
+                if int(account.id) not in healthy_proxy_account_ids:
+                    missing_proxy_count += 1
+                    continue
                 ready_account_ids.append(int(account.id))
             if not ready_account_ids:
+                if missing_proxy_count:
+                    raise ConflictError(
+                        "нет готовых аккаунтов-отправителей: обязательный прокси "
+                        "недоступен. Проверьте прокси выбранных аккаунтов и повторите запуск"
+                    )
                 raise ConflictError("нет готовых аккаунтов-отправителей")
 
             cooldown_before = now - timedelta(days=campaign.contact_cooldown_days)
+            uncertain_delivery_before = now - timedelta(days=max(1, campaign.contact_cooldown_days))
             conditions = [
                 SubscriberListMember.subscriber_list_id == campaign.subscriber_list_id,
                 Subscriber.do_not_contact.is_(False),
                 self._segment_condition(campaign.segment),
                 ~Subscriber.telegram_user_id.in_(select(MentionBlacklistEntry.telegram_user_id)),
                 Subscriber.reserved_direct_launch_id.is_(None),
+                or_(
+                    Subscriber.last_delivery_uncertain_at.is_(None),
+                    Subscriber.last_delivery_uncertain_at <= uncertain_delivery_before,
+                ),
             ]
             if campaign.contact_cooldown_days > 0:
                 conditions.append(
                     or_(
                         Subscriber.last_contacted_at.is_(None),
                         Subscriber.last_contacted_at <= cooldown_before,
-                    )
-                    & or_(
-                        Subscriber.last_delivery_uncertain_at.is_(None),
-                        Subscriber.last_delivery_uncertain_at <= cooldown_before,
                     )
                 )
             _, recent, reserved, _ = await self._eligibility_counts(session, campaign)
@@ -1145,6 +1219,15 @@ class DirectMessageService:
             if launch is None:
                 raise NotFoundError("запуск ЛС-рассылки не найден")
             launch.cancel_requested = True
+            queued_subscriber_ids = tuple(
+                int(value)
+                for value in await session.scalars(
+                    select(DirectMessageTask.subscriber_id).where(
+                        DirectMessageTask.launch_id == launch_id,
+                        DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                    )
+                )
+            )
             cancelled = await session.execute(
                 update(DirectMessageTask)
                 .where(
@@ -1159,11 +1242,15 @@ class DirectMessageService:
                     updated_at=now,
                 )
             )
-            await session.execute(
-                update(Subscriber)
-                .where(Subscriber.reserved_direct_launch_id == launch_id)
-                .values(reserved_direct_launch_id=None, updated_at=now)
-            )
+            if queued_subscriber_ids:
+                await session.execute(
+                    update(Subscriber)
+                    .where(
+                        Subscriber.id.in_(queued_subscriber_ids),
+                        Subscriber.reserved_direct_launch_id == launch_id,
+                    )
+                    .values(reserved_direct_launch_id=None, updated_at=now)
+                )
             running = int(
                 await session.scalar(
                     select(func.count(DirectMessageTask.id)).where(
@@ -1228,13 +1315,52 @@ class DirectMessageService:
         now = utc_now()
         lease_token = uuid4().hex
         lease_until = now + timedelta(seconds=max(30, self._settings.worker_lease_seconds))
+        recovered_launch_ids: set[int] = set()
         async with self._session_factory() as session:
+            # A task that was running when its launch was cancelled cannot be
+            # returned to QUEUED: the claim query deliberately excludes the
+            # launch, which would otherwise strand both task and recipient
+            # reservation forever.  We do not know whether a dead worker had
+            # already reached Telegram, so retain an explicit unknown-outcome
+            # failure rather than claiming that the message was not sent.
+            cancelled_expired_tasks = list(
+                await session.scalars(
+                    select(DirectMessageTask)
+                    .join(DirectLaunch, DirectLaunch.id == DirectMessageTask.launch_id)
+                    .where(
+                        DirectMessageTask.status == DirectMessageTaskStatus.RUNNING,
+                        DirectMessageTask.lease_until.is_not(None),
+                        DirectMessageTask.lease_until <= now,
+                        DirectLaunch.cancel_requested.is_(True),
+                    )
+                )
+            )
+            cancelled_task_ids = [int(task.id) for task in cancelled_expired_tasks]
+            for task in cancelled_expired_tasks:
+                task.status = DirectMessageTaskStatus.FAILED
+                task.error_code = "cancelled_outcome_unknown"
+                task.error = (
+                    "worker завершился после отмены запуска; результат уже начатой "
+                    "отправки в Telegram неизвестен"
+                )
+                task.finished_at = now
+                self._release_task_lease(task)
+                await session.execute(
+                    update(Subscriber)
+                    .where(
+                        Subscriber.id == task.subscriber_id,
+                        Subscriber.reserved_direct_launch_id == task.launch_id,
+                    )
+                    .values(reserved_direct_launch_id=None, updated_at=now)
+                )
+                recovered_launch_ids.add(int(task.launch_id))
             await session.execute(
                 update(DirectMessageTask)
                 .where(
                     DirectMessageTask.status == DirectMessageTaskStatus.RUNNING,
                     DirectMessageTask.lease_until.is_not(None),
                     DirectMessageTask.lease_until <= now,
+                    DirectMessageTask.id.not_in(cancelled_task_ids),
                 )
                 .values(
                     status=DirectMessageTaskStatus.QUEUED,
@@ -1273,10 +1399,26 @@ class DirectMessageService:
                     started_at=func.coalesce(DirectMessageTask.started_at, now),
                     updated_at=now,
                 )
-                .returning(DirectMessageTask.id)
+                .returning(DirectMessageTask.id, DirectMessageTask.launch_id)
             )
-            task_id = claimed.scalar_one_or_none()
+            claim = claimed.one_or_none()
+            task_id = int(claim.id) if claim is not None else None
+            if claim is not None:
+                await session.execute(
+                    update(DirectLaunch)
+                    .where(
+                        DirectLaunch.id == claim.launch_id,
+                        DirectLaunch.status == DirectLaunchStatus.QUEUED,
+                    )
+                    .values(
+                        status=DirectLaunchStatus.RUNNING,
+                        started_at=func.coalesce(DirectLaunch.started_at, now),
+                        updated_at=now,
+                    )
+                )
             await session.commit()
+        for launch_id in recovered_launch_ids:
+            await self._refresh_launch(launch_id)
         if task_id is None:
             return None
         async with self._session_factory() as session:
@@ -1340,7 +1482,12 @@ class DirectMessageService:
                     )
                 )
             }
-
+        await self._refresh_live_proxy_routes_for_accounts(account_ids)
+        async with self._session_factory() as session:
+            healthy_proxy_account_ids = await self._healthy_proxy_account_ids(
+                session,
+                account_ids,
+            )
         operation_key = f"direct-message:{task_id}"
         try:
             delivery_text = render_spintax(launch.primary_text_snapshot, seed=operation_key)
@@ -1350,7 +1497,7 @@ class DirectMessageService:
                 else None
             )
         except ContentError as exc:
-            return await self._fail_launch_for_content(
+            return await self._fail_launch(
                 task_id,
                 lease_token,
                 "content_invalid",
@@ -1358,6 +1505,7 @@ class DirectMessageService:
             )
 
         candidates: list[tuple[datetime | None, Account, SubscriberAccountPeer | None]] = []
+        has_proxy_blocked_sender = False
         for account in accounts:
             peer = peers.get(int(account.id))
             if peer is not None and peer.send_blocked:
@@ -1369,8 +1517,18 @@ class DirectMessageService:
                 )
             except ConflictError:
                 continue
+            if int(account.id) not in healthy_proxy_account_ids:
+                has_proxy_blocked_sender = True
+                continue
             candidates.append((self._sender_ready_at(account), account, peer))
         if not candidates:
+            if has_proxy_blocked_sender:
+                return await self._fail_launch(
+                    task_id,
+                    lease_token,
+                    "proxy_unavailable",
+                    "обязательный прокси выбранного аккаунта недоступен",
+                )
             return await self._finish_task(
                 task_id,
                 lease_token,
@@ -1396,6 +1554,7 @@ class DirectMessageService:
             username=subscriber.username,
             access_hash=peer.access_hash if peer is not None else None,
         )
+
         async def send() -> DirectMessageDelivery:
             stop_code = await self._pre_send_stop_code(
                 task_id,
@@ -1482,7 +1641,7 @@ class DirectMessageService:
         if code in ACCOUNT_WIDE_CODES:
             await self._runner.handle_external_account_failure(account_id, exc)
         if code in DIRECT_CONTENT_FAILURE_CODES:
-            return await self._fail_launch_for_content(task_id, lease_token, code, message)
+            return await self._fail_launch(task_id, lease_token, code, message)
         if code == "launch_cancelled":
             return await self._finish_task(
                 task_id,
@@ -1530,16 +1689,19 @@ class DirectMessageService:
             task = await self._require_task(session, task_id, lease_token)
             next_attempt = task.attempt_count + 1
             max_attempts = task.max_attempts
-        if next_attempt >= max_attempts and (
-            code in DIRECT_RECIPIENT_ROUTE_CODES or code in ACCOUNT_WIDE_CODES
-        ):
+        if next_attempt >= max_attempts:
             return await self._finish_task(
                 task_id,
                 lease_token,
-                status=DirectMessageTaskStatus.SKIPPED,
+                status=(
+                    DirectMessageTaskStatus.SKIPPED
+                    if code in DIRECT_RECIPIENT_ROUTE_CODES or code in ACCOUNT_WIDE_CODES
+                    else DirectMessageTaskStatus.FAILED
+                ),
                 error_code=code,
                 error=message,
                 sender_account_id=account_id,
+                attempt_count=next_attempt,
             )
         if not exc.retryable and code not in DIRECT_RECIPIENT_ROUTE_CODES | ACCOUNT_WIDE_CODES:
             return await self._finish_task(
@@ -1752,6 +1914,7 @@ class DirectMessageService:
         error: str,
         sender_account_id: int | None = None,
         conservative_cooldown: bool = False,
+        attempt_count: int | None = None,
     ) -> DirectMessageTask:
         if status not in DIRECT_MESSAGE_TERMINAL_STATUSES:
             raise ValueError("terminal task status required")
@@ -1765,6 +1928,8 @@ class DirectMessageService:
             task.status = status
             task.error_code = error_code
             task.error = error[:500]
+            if attempt_count is not None:
+                task.attempt_count = max(task.attempt_count, attempt_count)
             if sender_account_id is not None:
                 task.sender_account_id = sender_account_id
             task.finished_at = now
@@ -1791,19 +1956,34 @@ class DirectMessageService:
         await self._refresh_launch(launch_id)
         return task
 
-    async def _fail_launch_for_content(
+    async def _fail_launch(
         self,
         task_id: int,
         lease_token: str,
         code: str,
         error: str,
     ) -> DirectMessageTask:
+        """Stop a launch-wide unsafe condition and release every pending recipient.
+
+        This is used for invalid content and for the case where every selected
+        sender lost its mandatory proxy route after the launch was created.
+        Neither condition can become safe by retrying the same queued entries.
+        """
         now = utc_now()
         async with self._session_factory() as session:
             task = await self._require_task(session, task_id, lease_token)
             launch = await session.get(DirectLaunch, task.launch_id)
             if launch is None:
                 raise NotFoundError("запуск ЛС-рассылки не найден")
+            queued_subscriber_ids = tuple(
+                int(value)
+                for value in await session.scalars(
+                    select(DirectMessageTask.subscriber_id).where(
+                        DirectMessageTask.launch_id == launch.id,
+                        DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                    )
+                )
+            )
             task.status = DirectMessageTaskStatus.FAILED
             task.error_code = code
             task.error = error[:500]
@@ -1825,7 +2005,10 @@ class DirectMessageService:
             )
             await session.execute(
                 update(Subscriber)
-                .where(Subscriber.reserved_direct_launch_id == launch.id)
+                .where(
+                    Subscriber.id.in_((*queued_subscriber_ids, int(task.subscriber_id))),
+                    Subscriber.reserved_direct_launch_id == launch.id,
+                )
                 .values(reserved_direct_launch_id=None, updated_at=now)
             )
             launch.cancel_requested = True
@@ -1890,6 +2073,99 @@ class DirectMessageService:
         task.lease_owner = None
         task.lease_token = None
         task.lease_until = None
+
+    async def _healthy_proxy_account_ids(
+        self,
+        session: AsyncSession,
+        account_ids: Sequence[int],
+    ) -> set[int]:
+        """Return sender IDs that have a usable mandatory proxy route.
+
+        A direct-message launch must never reserve recipients for an account
+        whose configured live route is already marked unavailable.  The worker
+        repeats the same check because a proxy can fail after a launch was made.
+        Test runs intentionally bypass the live-route requirement.
+        """
+
+        normalized_ids = tuple(dict.fromkeys(int(value) for value in account_ids if int(value) > 0))
+        if not normalized_ids:
+            return set()
+        if self._settings.dry_run or not self._settings.account_require_proxy:
+            return set(normalized_ids)
+        assignment_keys = tuple(f"account:{account_id}" for account_id in normalized_ids)
+        healthy_keys = set(
+            await session.scalars(
+                select(ProxyAssignment.assignment_key)
+                .join(ProxyEndpoint, ProxyEndpoint.id == ProxyAssignment.proxy_id)
+                .where(
+                    ProxyAssignment.assignment_key.in_(assignment_keys),
+                    ProxyEndpoint.enabled.is_(True),
+                    ProxyEndpoint.status == ProxyStatus.HEALTHY,
+                )
+            )
+        )
+        return {
+            account_id for account_id in normalized_ids if f"account:{account_id}" in healthy_keys
+        }
+
+    async def _refresh_live_proxy_routes(self, campaign_id: int) -> None:
+        """Verify and, when possible, replace live routes before reservation."""
+
+        if (
+            self._settings.dry_run
+            or not self._settings.account_require_proxy
+            or self._proxy_service is None
+        ):
+            return
+        async with self._session_factory() as session:
+            account_ids = tuple(
+                int(value)
+                for value in await session.scalars(
+                    select(DirectCampaignAccount.account_id).where(
+                        DirectCampaignAccount.campaign_id == campaign_id
+                    )
+                )
+            )
+        await self._refresh_live_proxy_routes_for_accounts(account_ids)
+
+    async def _refresh_live_proxy_routes_for_accounts(self, account_ids: Sequence[int]) -> None:
+        """Keep selected senders on freshly checked proxy-only routes.
+
+        ``ensure_account_route`` performs the recovery atomically.  A failed
+        recovery is deliberately not fatal here: the normal sender filter below
+        gives the operator one clear ``proxy_unavailable`` result if no selected
+        sender can be recovered.
+        """
+
+        if (
+            self._settings.dry_run
+            or not self._settings.account_require_proxy
+            or self._proxy_service is None
+        ):
+            return
+        normalized_ids = tuple(dict.fromkeys(int(value) for value in account_ids if int(value) > 0))
+        if not normalized_ids:
+            return
+        semaphore = asyncio.Semaphore(6)
+
+        async def ensure_route(account_id: int) -> object:
+            async with semaphore:
+                return await self._proxy_service.ensure_account_route(
+                    account_id,
+                    actor="direct-message-route-recovery",
+                )
+
+        results = await asyncio.gather(
+            *(ensure_route(account_id) for account_id in normalized_ids),
+            return_exceptions=True,
+        )
+        for account_id, result in zip(normalized_ids, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Could not recover proxy route for direct sender %s: %s",
+                    account_id,
+                    result,
+                )
 
     @staticmethod
     def _account_ids(raw: str) -> tuple[int, ...]:

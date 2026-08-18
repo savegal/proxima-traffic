@@ -1,10 +1,15 @@
+import asyncio
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import event, inspect, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from proxima_traffic.models import Base
+from proxima_traffic.instance_lock import BotInstanceAlreadyRunning, BotInstanceLock
 
 
 class Database:
@@ -15,6 +20,7 @@ class Database:
             if database_path and database_path != ":memory:":
                 Path(database_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
+        self._url = url
         self.engine = create_async_engine(url, pool_pre_ping=True)
         if url.startswith("sqlite+aiosqlite:"):
             event.listen(self.engine.sync_engine, "connect", self._enable_sqlite_foreign_keys)
@@ -25,23 +31,49 @@ class Database:
         )
 
     async def create_schema(self) -> None:
-        async with self.engine.begin() as connection:
-            existing_tables = await connection.run_sync(
-                lambda sync_connection: set(inspect(sync_connection).get_table_names())
-            )
-            await connection.run_sync(Base.metadata.create_all)
-            if not existing_tables:
-                from proxima_traffic.maintenance import (  # noqa: PLC0415
-                    expected_migration_revision,
-                )
+        """Bring the SQLite database to the bundled Alembic head safely.
 
-                await connection.execute(
-                    text("CREATE TABLE alembic_version (version_num VARCHAR(64) NOT NULL)")
-                )
-                await connection.execute(
-                    text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
-                    {"revision": expected_migration_revision()},
-                )
+        ``metadata.create_all()`` followed by stamping the revision is not a
+        migration: it silently skips data migrations.  It also lets the API
+        and control bot race when both are started against a fresh database.
+        A short OS-level lock serialises the actual Alembic upgrade across
+        processes; calling upgrade again after another process completed is a
+        safe no-op.
+        """
+
+        lock = BotInstanceLock(self._schema_lock_path())
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                lock.acquire()
+                break
+            except BotInstanceAlreadyRunning:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "timed out waiting for the database migration lock"
+                    ) from None
+                await asyncio.sleep(0.05)
+        try:
+            async with self.engine.begin() as connection:
+                await connection.run_sync(self._upgrade_schema)
+        finally:
+            lock.release()
+
+    def _schema_lock_path(self) -> Path:
+        sqlite_prefix = "sqlite+aiosqlite:///"
+        if not self._url.startswith(sqlite_prefix):
+            raise ValueError("automatic schema creation currently supports only SQLite")
+        database_path = Path(self._url.removeprefix(sqlite_prefix)).expanduser().resolve()
+        return database_path.with_name(f"{database_path.name}.schema.lock")
+
+    def _upgrade_schema(self, connection: Connection) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        config = Config(str(project_root / "alembic.ini"))
+        config.set_main_option("script_location", str(project_root / "migrations"))
+        config.set_main_option("sqlalchemy.url", self._url.replace("%", "%%"))
+        config.attributes["database_url"] = self._url
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
 
     async def sessions(self) -> AsyncIterator[AsyncSession]:
         async with self.session_factory() as session:
@@ -63,6 +95,7 @@ class Database:
 
         from proxima_traffic.maintenance import (  # noqa: PLC0415
             REQUIRED_COLUMNS,
+            REQUIRED_SEEDED_ROW_COUNTS,
             REQUIRED_TABLES,
             expected_migration_revision,
         )
@@ -78,6 +111,10 @@ class Database:
                 revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
                 if revision != expected_revision:
                     return False
+                for table_name, minimum_row_count in REQUIRED_SEEDED_ROW_COUNTS.items():
+                    row_count = await connection.scalar(text(f"SELECT COUNT(*) FROM {table_name}"))
+                    if int(row_count or 0) < minimum_row_count:
+                        return False
 
                 def missing_required_columns(sync_connection: object) -> bool:
                     inspector = inspect(sync_connection)

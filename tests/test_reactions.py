@@ -166,6 +166,71 @@ async def test_reactions_exclude_author_and_are_processed(app) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reaction_pacing_deferrals_do_not_consume_delivery_attempts(app, monkeypatch) -> None:
+    async with app.state.database.session_factory() as session:
+        source = Account(label="paced-reaction-source", authorized=True, ownership_confirmed=True)
+        reactor = Account(label="paced-reactor", authorized=True, ownership_confirmed=True)
+        target = Target(chat_ref="@paced_reactions", title="Paced reactions")
+        session.add_all([source, reactor, target])
+        await session.flush()
+        campaign = Campaign(
+            name="Paced reactions",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=source.id,
+            target_id=target.id,
+            primary_text="test",
+            reactions_enabled=True,
+        )
+        session.add(campaign)
+        await session.flush()
+        run = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            sender_account_id=source.id,
+            request_key="paced-reaction-run",
+            status=RunStatus.SUCCEEDED,
+        )
+        session.add(run)
+        await session.flush()
+        task = ReactionTask(
+            campaign_id=campaign.id,
+            run_id=run.id,
+            target_id=target.id,
+            source_account_id=source.id,
+            reactor_account_id=reactor.id,
+            message_id=333,
+            emoji="🔥",
+            scheduled_for=utc_now() - timedelta(seconds=1),
+        )
+        session.add(task)
+        await session.commit()
+        task_id = int(task.id)
+
+    monkeypatch.setattr(
+        app.state.campaign_runner,
+        "account_resume_at",
+        lambda _account: utc_now() + timedelta(minutes=3),
+    )
+    assert await app.state.reactions.process_next() is True
+    async with app.state.database.session_factory() as session:
+        task = await session.get(ReactionTask, task_id)
+        assert task is not None
+        assert task.status == ReactionTaskStatus.QUEUED
+        assert task.attempt_count == 0
+        assert task.error_code == "account_pacing"
+        task.scheduled_for = utc_now() - timedelta(seconds=1)
+        await session.commit()
+
+    monkeypatch.setattr(app.state.campaign_runner, "account_resume_at", lambda _account: None)
+    assert await app.state.reactions.process_next() is True
+    async with app.state.database.session_factory() as session:
+        task = await session.get(ReactionTask, task_id)
+        assert task is not None
+        assert task.status == ReactionTaskStatus.SUCCEEDED
+        assert task.attempt_count == 1
+
+
+@pytest.mark.asyncio
 async def test_reaction_worker_recovers_expired_lease(app) -> None:
     async with app.state.database.session_factory() as session:
         account = Account(label="expired-reactor", authorized=True, ownership_confirmed=True)
@@ -193,17 +258,17 @@ async def test_reaction_worker_recovers_expired_lease(app) -> None:
         session.add_all(
             [
                 ReactionTask(
-                campaign_id=campaign.id,
-                run_id=run.id,
-                target_id=target.id,
-                source_account_id=account.id,
-                reactor_account_id=account.id,
-                message_id=77,
-                emoji="👍",
-                status=ReactionTaskStatus.RUNNING,
-                lease_owner="dead-worker",
-                lease_token="expired",
-                lease_until=utc_now() - timedelta(seconds=1),
+                    campaign_id=campaign.id,
+                    run_id=run.id,
+                    target_id=target.id,
+                    source_account_id=account.id,
+                    reactor_account_id=account.id,
+                    message_id=77,
+                    emoji="👍",
+                    status=ReactionTaskStatus.RUNNING,
+                    lease_owner="dead-worker",
+                    lease_token="expired",
+                    lease_until=utc_now() - timedelta(seconds=1),
                 ),
                 ReactionTask(
                     campaign_id=campaign.id,

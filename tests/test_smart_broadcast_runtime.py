@@ -1314,6 +1314,11 @@ async def test_active_smart_launch_text_frequency_and_deadline_are_editable(
         assert completed is not None and completed.finished_at is not None
 
         before = utc_now()
+        with pytest.raises(ConflictError, match="Spintax"):
+            await app.state.run_queue.update_active_launch(
+                completed.id,
+                primary_text="{broken",
+            )
         updated = await app.state.run_queue.update_active_launch(
             completed.id,
             primary_text="Updated advertisement",

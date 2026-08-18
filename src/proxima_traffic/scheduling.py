@@ -107,7 +107,14 @@ def estimate_capacity(
     micro_break_every: int,
     micro_break_seconds: float,
 ) -> CapacityEstimate:
-    accounts = max(1, account_count)
+    accounts = max(0, account_count)
+    targets = max(0, target_count)
+    if accounts == 0 or targets == 0:
+        return CapacityEstimate(
+            messages_per_day=0,
+            requested_per_day=0,
+            full_round_seconds=None,
+        )
     effective_seconds = max(0.0, pace_seconds)
     if micro_break_every > 0:
         effective_seconds += max(0.0, micro_break_seconds) / micro_break_every
@@ -116,11 +123,9 @@ def estimate_capacity(
     if daily_limit > 0:
         per_account = daily_limit if per_account is None else min(per_account, daily_limit)
     messages_per_day = per_account * accounts if per_account is not None else None
-    requested_per_day = max(1, target_count) * max(1, floor(86400 / max(60, interval_seconds)))
+    requested_per_day = targets * max(1, floor(86400 / max(60, interval_seconds)))
     full_round_seconds = (
-        None
-        if messages_per_day is None
-        else max(1, round(max(1, target_count) * 86400 / messages_per_day))
+        None if messages_per_day is None else max(1, round(targets * 86400 / messages_per_day))
     )
     return CapacityEstimate(
         messages_per_day=messages_per_day,

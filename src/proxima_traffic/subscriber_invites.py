@@ -12,11 +12,12 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -301,17 +302,31 @@ class SubscriberInviteService:
         campaign: SubscriberInviteCampaign,
     ) -> tuple[int, int, int]:
         cooldown_before = utc_now() - timedelta(days=campaign.contact_cooldown_days)
+        uncertain_delivery_before = utc_now() - timedelta(
+            days=max(1, campaign.contact_cooldown_days)
+        )
         base = [
             SubscriberListMember.subscriber_list_id == campaign.subscriber_list_id,
             Subscriber.do_not_contact.is_(False),
             self._segment_condition(campaign.segment),
             ~Subscriber.telegram_user_id.in_(select(MentionBlacklistEntry.telegram_user_id)),
         ]
-        recent = (
-            Subscriber.last_invite_attempt_at.is_not(None)
-            & (Subscriber.last_invite_attempt_at > cooldown_before)
-            if campaign.contact_cooldown_days > 0
-            else Subscriber.id.is_(None)
+        uncertain_delivery = and_(
+            Subscriber.last_invited_target_ref.is_not(None),
+            Subscriber.last_invited_target_ref == "delivery_unconfirmed",
+            or_(
+                Subscriber.last_invite_attempt_at.is_(None),
+                Subscriber.last_invite_attempt_at > uncertain_delivery_before,
+            ),
+        )
+        recent = or_(
+            (
+                Subscriber.last_invite_attempt_at.is_not(None)
+                & (Subscriber.last_invite_attempt_at > cooldown_before)
+                if campaign.contact_cooldown_days > 0
+                else Subscriber.id.is_(None)
+            ),
+            uncertain_delivery,
         )
         row = (
             await session.execute(
@@ -391,8 +406,7 @@ class SubscriberInviteService:
             diagnostics = "\n".join(f"• {item}" for item in preflight_failures[:8])
             suffix = f":\n{diagnostics}" if diagnostics else ""
             raise ConflictError(
-                "ни один выбранный аккаунт не является готовым администратором этой цели"
-                + suffix
+                "ни один выбранный аккаунт не является готовым администратором этой цели" + suffix
             )
 
         now = utc_now()
@@ -402,12 +416,22 @@ class SubscriberInviteService:
             if campaign is None or not campaign.enabled:
                 raise ConflictError("приглашение недоступно")
             cooldown_before = now - timedelta(days=campaign.contact_cooldown_days)
+            uncertain_delivery_before = now - timedelta(days=max(1, campaign.contact_cooldown_days))
+            uncertain_delivery = and_(
+                Subscriber.last_invited_target_ref.is_not(None),
+                Subscriber.last_invited_target_ref == "delivery_unconfirmed",
+                or_(
+                    Subscriber.last_invite_attempt_at.is_(None),
+                    Subscriber.last_invite_attempt_at > uncertain_delivery_before,
+                ),
+            )
             conditions = [
                 SubscriberListMember.subscriber_list_id == campaign.subscriber_list_id,
                 Subscriber.do_not_contact.is_(False),
                 self._segment_condition(campaign.segment),
                 ~Subscriber.telegram_user_id.in_(select(MentionBlacklistEntry.telegram_user_id)),
                 Subscriber.reserved_invite_launch_id.is_(None),
+                ~uncertain_delivery,
             ]
             if campaign.contact_cooldown_days > 0:
                 conditions.append(
@@ -540,6 +564,12 @@ class SubscriberInviteService:
                 raise NotFoundError("запуск приглашений не найден")
             return await self._launch_view(session, launch)
 
+    async def refresh_launches(self, launch_ids: Iterable[int]) -> None:
+        """Refresh status after a shared stop-list cancels queued invitations."""
+
+        for launch_id in sorted({int(value) for value in launch_ids if int(value) > 0}):
+            await self._refresh_launch(launch_id)
+
     @staticmethod
     async def _launch_view(
         session: AsyncSession, launch: SubscriberInviteLaunch
@@ -636,6 +666,15 @@ class SubscriberInviteService:
             if launch is None:
                 raise NotFoundError("запуск приглашений не найден")
             launch.cancel_requested = True
+            queued_subscriber_ids = tuple(
+                int(value)
+                for value in await session.scalars(
+                    select(SubscriberInviteTask.subscriber_id).where(
+                        SubscriberInviteTask.launch_id == launch_id,
+                        SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                    )
+                )
+            )
             cancelled = await session.execute(
                 update(SubscriberInviteTask)
                 .where(
@@ -650,11 +689,15 @@ class SubscriberInviteService:
                     updated_at=now,
                 )
             )
-            await session.execute(
-                update(Subscriber)
-                .where(Subscriber.reserved_invite_launch_id == launch_id)
-                .values(reserved_invite_launch_id=None, updated_at=now)
-            )
+            if queued_subscriber_ids:
+                await session.execute(
+                    update(Subscriber)
+                    .where(
+                        Subscriber.id.in_(queued_subscriber_ids),
+                        Subscriber.reserved_invite_launch_id == launch_id,
+                    )
+                    .values(reserved_invite_launch_id=None, updated_at=now)
+                )
             running = int(
                 await session.scalar(
                     select(func.count(SubscriberInviteTask.id)).where(
@@ -718,6 +761,42 @@ class SubscriberInviteService:
         lease_until = now + timedelta(seconds=max(30, self._settings.worker_lease_seconds))
         recovered_launch_ids: set[int] = set()
         async with self._session_factory() as session:
+            # These tasks have not reached the non-idempotent Telegram RPC yet,
+            # so a cancelled launch can safely terminalise them.  Without this
+            # branch the generic lease recovery makes them QUEUED while the
+            # claim query excludes cancelled launches forever.
+            cancelled_pre_rpc_tasks = list(
+                await session.scalars(
+                    select(SubscriberInviteTask)
+                    .join(
+                        SubscriberInviteLaunch,
+                        SubscriberInviteLaunch.id == SubscriberInviteTask.launch_id,
+                    )
+                    .where(
+                        SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
+                        SubscriberInviteTask.lease_until.is_not(None),
+                        SubscriberInviteTask.lease_until <= now,
+                        SubscriberInviteTask.delivery_attempted_at.is_(None),
+                        SubscriberInviteLaunch.cancel_requested.is_(True),
+                    )
+                )
+            )
+            cancelled_task_ids = [int(task.id) for task in cancelled_pre_rpc_tasks]
+            for task in cancelled_pre_rpc_tasks:
+                task.status = DirectMessageTaskStatus.CANCELLED
+                task.error_code = "invite_launch_cancelled"
+                task.error = "запуск остановлен оператором до приглашения"
+                task.finished_at = now
+                self._release_task_lease(task)
+                await session.execute(
+                    update(Subscriber)
+                    .where(
+                        Subscriber.id == task.subscriber_id,
+                        Subscriber.reserved_invite_launch_id == task.launch_id,
+                    )
+                    .values(reserved_invite_launch_id=None, updated_at=now)
+                )
+                recovered_launch_ids.add(int(task.launch_id))
             uncertain_tasks = list(
                 await session.scalars(
                     select(SubscriberInviteTask).where(
@@ -764,6 +843,7 @@ class SubscriberInviteService:
                     SubscriberInviteTask.lease_until.is_not(None),
                     SubscriberInviteTask.lease_until <= now,
                     SubscriberInviteTask.delivery_attempted_at.is_(None),
+                    SubscriberInviteTask.id.not_in(cancelled_task_ids),
                 )
                 .values(
                     status=DirectMessageTaskStatus.QUEUED,
@@ -1412,6 +1492,15 @@ class SubscriberInviteService:
             launch = await session.get(SubscriberInviteLaunch, task.launch_id)
             if launch is None:
                 raise NotFoundError("запуск приглашений не найден")
+            queued_subscriber_ids = tuple(
+                int(value)
+                for value in await session.scalars(
+                    select(SubscriberInviteTask.subscriber_id).where(
+                        SubscriberInviteTask.launch_id == launch.id,
+                        SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                    )
+                )
+            )
             task.status = DirectMessageTaskStatus.FAILED
             task.error_code = code
             task.error = error[:500]
@@ -1433,7 +1522,10 @@ class SubscriberInviteService:
             )
             await session.execute(
                 update(Subscriber)
-                .where(Subscriber.reserved_invite_launch_id == launch.id)
+                .where(
+                    Subscriber.id.in_((*queued_subscriber_ids, int(task.subscriber_id))),
+                    Subscriber.reserved_invite_launch_id == launch.id,
+                )
                 .values(reserved_invite_launch_id=None, updated_at=now)
             )
             launch.cancel_requested = True

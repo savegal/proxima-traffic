@@ -6,6 +6,8 @@ from collections.abc import Awaitable
 from contextlib import suppress
 from uuid import uuid4
 
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand
 
 from proxima_traffic.accounts import AccountService
@@ -34,6 +36,37 @@ from proxima_traffic.subscriber_invites import SubscriberInviteService
 from proxima_traffic.worker_supervision import WorkerSupervisor
 
 logger = logging.getLogger(__name__)
+
+
+async def _notify_control_bot_ready(bot: Bot, admin_ids: frozenset[int]) -> None:
+    """Confirm a completed control-bot restart to every configured operator.
+
+    This is intentionally best-effort: an administrator may have blocked the
+    bot or never opened a private chat, and that must not turn a healthy
+    restart into an unavailable control panel for the remaining operators.
+    """
+
+    message = (
+        "🟢 <b>Proxima перезапущен и готов к работе.</b>\n\n"
+        "Панель управления и фоновые сервисы запущены."
+    )
+    results = await asyncio.gather(
+        *(bot.send_message(chat_id=admin_id, text=message) for admin_id in sorted(admin_ids)),
+        return_exceptions=True,
+    )
+    for admin_id, result in zip(sorted(admin_ids), results, strict=True):
+        if isinstance(result, TelegramAPIError):
+            logger.warning(
+                "Could not send ready notification to administrator %s: %s",
+                admin_id,
+                result,
+            )
+        elif isinstance(result, Exception):  # noqa: BLE001 - readiness notice must stay best-effort
+            logger.warning(
+                "Unexpected error sending ready notification to administrator %s: %s",
+                admin_id,
+                result,
+            )
 
 
 async def _finish_background_task(
@@ -168,6 +201,7 @@ async def _run_control_bot(
         runner,
         settings,
         worker_id=f"bot-direct-messages-{uuid4().hex[:10]}",
+        proxy_service=proxy_service,
     )
     subscriber_invites = SubscriberInviteService(
         database.session_factory,
@@ -205,6 +239,7 @@ async def _run_control_bot(
         concurrency=settings.worker_concurrency,
     )
     repository = AdminRepository(database.session_factory)
+    await repository.ensure_system_account_groups(actor="bot-startup")
     bot = create_bot(token)
 
     async def send_worker_health_alert(text: str) -> None:
@@ -280,6 +315,7 @@ async def _run_control_bot(
         "enabled" if subscriber_invites_task is not None else "disabled",
         settings.shutdown_grace_seconds,
     )
+    await _notify_control_bot_ready(bot, admin_ids)
     logger.info("Starting Proxima control bot for %d administrator(s)", len(admin_ids))
     try:
         await dispatcher.start_polling(

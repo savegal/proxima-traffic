@@ -4,24 +4,43 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
+from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine
 
 from proxima_traffic.config import get_settings
 from proxima_traffic.models import Base
 
 SQLITE_PREFIX = "sqlite+aiosqlite:///"
+REQUIRED_SEEDED_ROW_COUNTS = {"mention_blacklist_entries": 1057}
 REQUIRED_TABLES = frozenset((*Base.metadata.tables, "alembic_version"))
 REQUIRED_COLUMNS = {
     table_name: frozenset(column.name for column in table.columns)
     for table_name, table in Base.metadata.tables.items()
 }
+
+
+def _missing_seed_data(
+    connection: sqlite3.Connection,
+    tables: set[str],
+) -> list[str]:
+    missing: list[str] = []
+    for table_name, minimum_row_count in REQUIRED_SEEDED_ROW_COUNTS.items():
+        count = 0
+        if table_name in tables:
+            row = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+            count = int(row[0]) if row else 0
+        if count < minimum_row_count:
+            missing.append(
+                f"{table_name}: expected at least {minimum_row_count} rows, found {count}"
+            )
+    return missing
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +54,7 @@ class DoctorReport:
     migration_current: bool
     missing_tables: list[str]
     missing_columns: list[str]
+    missing_seed_data: list[str]
 
     @property
     def healthy(self) -> bool:
@@ -45,6 +65,7 @@ class DoctorReport:
             and self.migration_current
             and not self.missing_tables
             and not self.missing_columns
+            and not self.missing_seed_data
         )
 
 
@@ -155,11 +176,28 @@ def create_clean_database(
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    sync_engine = create_engine(f"sqlite:///{destination.as_posix()}")
-    try:
-        Base.metadata.create_all(sync_engine)
-    finally:
-        sync_engine.dispose()
+    project_root = Path(__file__).resolve().parents[2]
+    config = Config(str(project_root / "alembic.ini"))
+    config.set_main_option("script_location", str(project_root / "migrations"))
+    destination_url = f"sqlite+aiosqlite:///{destination.as_posix()}"
+    config.set_main_option("sqlalchemy.url", destination_url.replace("%", "%%"))
+    config.attributes["database_url"] = destination_url
+    migration_error: list[BaseException] = []
+
+    def upgrade_clean_database() -> None:
+        try:
+            # Alembic's async env owns an event loop.  This maintenance API is
+            # intentionally synchronous and can be called from the control
+            # bot's running loop, so execute the upgrade in its own thread.
+            command.upgrade(config, "head")
+        except BaseException as exc:  # noqa: BLE001 - re-raise in the caller thread
+            migration_error.append(exc)
+
+    migration_thread = threading.Thread(target=upgrade_clean_database, daemon=True)
+    migration_thread.start()
+    migration_thread.join()
+    if migration_error:
+        raise migration_error[0]
 
     copied_rows: dict[str, int] = {}
     with sqlite3.connect(source_path) as source, sqlite3.connect(destination) as target:
@@ -167,8 +205,6 @@ def create_clean_database(
         revision_row = source.execute("SELECT version_num FROM alembic_version").fetchone()
         if revision_row is None or not isinstance(revision_row[0], str):
             raise ValueError("source database has no Alembic revision")
-        target.execute("CREATE TABLE alembic_version (version_num VARCHAR(64) NOT NULL)")
-        target.execute("INSERT INTO alembic_version (version_num) VALUES (?)", (revision_row[0],))
         for table_name in ("accounts", "proxy_groups", "proxy_endpoints", "proxy_assignments"):
             copied_rows[table_name] = _copy_sqlite_table(source, target, table_name)
         copied_rows["targets"] = _copy_targets_as_standalone_chats(source, target)
@@ -305,6 +341,25 @@ def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
                     raw_paths.add(media_path)
                 raw_paths.update(_media_paths_from_json(media_json))
                 raw_paths.update(_media_paths_from_json(variants_json))
+        if "direct_campaigns" in tables:
+            for (media_path,) in connection.execute(
+                "SELECT primary_media_path FROM direct_campaigns"
+            ):
+                if isinstance(media_path, str):
+                    raw_paths.add(media_path)
+        if "direct_launches" in tables:
+            for (media_path,) in connection.execute(
+                "SELECT primary_media_path_snapshot FROM direct_launches"
+            ):
+                if isinstance(media_path, str):
+                    raw_paths.add(media_path)
+        if "channel_comment_rules" in tables:
+            for media_path, dialogue_steps_json in connection.execute(
+                "SELECT primary_media_path, dialogue_steps_json FROM channel_comment_rules"
+            ):
+                if isinstance(media_path, str):
+                    raw_paths.add(media_path)
+                raw_paths.update(_media_paths_from_json(dialogue_steps_json))
     return frozenset(
         resolved
         for raw_path in raw_paths
@@ -360,6 +415,7 @@ def inspect_sqlite(database_url: str) -> DoctorReport:
             False,
             sorted(REQUIRED_TABLES),
             [],
+            sorted(REQUIRED_SEEDED_ROW_COUNTS),
         )
     with sqlite3.connect(path) as connection:
         integrity_row = connection.execute("PRAGMA integrity_check").fetchone()
@@ -379,6 +435,7 @@ def inspect_sqlite(database_url: str) -> DoctorReport:
                 continue
             present = {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
             missing_columns.extend(f"{table}.{column}" for column in sorted(required - present))
+        missing_seed_data = _missing_seed_data(connection, tables)
     return DoctorReport(
         database_path=str(path),
         exists=True,
@@ -389,6 +446,7 @@ def inspect_sqlite(database_url: str) -> DoctorReport:
         migration_current=revision == expected_revision,
         missing_tables=sorted(REQUIRED_TABLES - tables),
         missing_columns=sorted(missing_columns),
+        missing_seed_data=missing_seed_data,
     )
 
 

@@ -1,4 +1,6 @@
+import asyncio
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -6,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
 
-from proxima_traffic.accounts import AccountProfileError
+from proxima_traffic.accounts import AccountProfileError, build_telethon_transport
 from proxima_traffic.models import (
     Account,
     AccountSessionSource,
@@ -17,6 +19,7 @@ from proxima_traffic.models import (
 )
 from proxima_traffic.profile_names import ProfileName
 from proxima_traffic.proxies import (
+    ProxyCheckResult,
     ProxyFilter,
     ProxyInputError,
     ProxyRouteUnavailable,
@@ -42,6 +45,56 @@ def test_proxy_parser_supports_common_formats_and_rejects_unsafe_values() -> Non
         parse_proxy("ftp://proxy.example:21")
     with pytest.raises(ProxyInputError, match="path"):
         parse_proxy("http://proxy.example:8080/path")
+
+
+def test_proxy_parser_accepts_mtproto_links_without_exposing_the_secret() -> None:
+    secret = "dd0123456789abcdef0123456789abcdef"
+    parsed = parse_proxy(f"tg://proxy?server=mtproxy.example&port=443&secret={secret}")
+    canonical = parse_proxy(f"mtproto://mtproxy.example:443?secret={secret}")
+
+    assert parsed.protocol.value == "mtproto"
+    assert parsed.password == secret
+    assert parsed.masked_endpoint == "mtproto://mtproxy.example:443"
+    assert secret not in parsed.masked_endpoint
+    assert canonical.fingerprint == parsed.fingerprint
+
+    with pytest.raises(ProxyInputError, match="secret"):
+        parse_proxy("mtproto://mtproxy.example:443")
+
+
+async def test_mtproto_health_check_uses_telegram_probe_and_builds_special_transport(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = app.state.proxy_service
+    secret = "dd0123456789abcdef0123456789abcdef"
+    view = await service.add_proxy(
+        f"tg://proxy?server=mtproxy.example&port=443&secret={secret}",
+        label="Temporary MTProto",
+    )
+    async with app.state.database.session_factory() as session:
+        stored = await session.get(ProxyEndpoint, view.proxy.id)
+        assert stored is not None
+        assert stored.password_encrypted is not None
+        assert secret not in stored.password_encrypted
+    calls: list[tuple[str, int, str]] = []
+
+    async def fake_probe(host: str, port: int, supplied_secret: str) -> _ProxyProbeResult:
+        calls.append((host, port, supplied_secret))
+        return _ProxyProbeResult(True, 73, None, None)
+
+    monkeypatch.setattr(service, "_probe_mtproto_proxy", fake_probe)
+    result = await service.check_proxy(view.proxy.id)
+
+    assert result.healthy is True
+    assert result.observed_ip is None
+    assert calls == [("mtproxy.example", 443, secret)]
+    await service.assign_proxy(view.proxy.id, "account:42")
+    route = await service.require_account_route(42)
+    transport = build_telethon_transport(route)
+    assert transport.connection is not None
+    assert transport.proxy == ("mtproxy.example", 443, secret)
+    assert secret not in repr(transport)
 
 
 async def test_proxy_lifecycle_encrypts_secrets_and_enforces_assignments(app: FastAPI) -> None:
@@ -262,6 +315,87 @@ async def test_proxy_rotation_url_is_encrypted_and_triggers_provider_link(
         await service.rotate_proxy(created.proxy.id)
 
 
+async def test_proxy_rotation_never_claims_success_without_an_ip_change(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            del url
+            return FakeResponse()
+
+    async def unchanged_probe(proxy_url: str) -> _ProxyProbeResult:
+        assert "127.0.0.1:8082" in proxy_url
+        return _ProxyProbeResult(True, 55, "203.0.113.50", None)
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("proxima_traffic.proxies.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(app.state.proxy_service, "_probe_proxy_url", unchanged_probe)
+    monkeypatch.setattr("proxima_traffic.proxies.asyncio.sleep", no_wait)
+    created = await app.state.proxy_service.add_proxy(
+        "http://127.0.0.1:8082", rotation_url="https://mobile.example/rotate"
+    )
+    async with app.state.database.session_factory() as session:
+        endpoint = await session.get(ProxyEndpoint, created.proxy.id)
+        assert endpoint is not None
+        endpoint.status = ProxyStatus.HEALTHY
+        endpoint.observed_ip = "203.0.113.50"
+        await session.commit()
+
+    with pytest.raises(ConflictError, match="ротация не подтверждена"):
+        await app.state.proxy_service.rotate_proxy(created.proxy.id)
+
+    checked = await app.state.proxy_service.get_proxy(created.proxy.id)
+    assert checked.proxy.status == ProxyStatus.HEALTHY
+    assert checked.proxy.last_rotated_at is None
+
+
+async def test_shared_account_route_checks_use_one_inflight_proxy_probe(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def slow_check(proxy_id: int, *, actor: str = "control-bot") -> ProxyCheckResult:
+        nonlocal calls
+        del actor
+        calls += 1
+        await asyncio.sleep(0.01)
+        return ProxyCheckResult(
+            proxy_id=proxy_id,
+            healthy=True,
+            status=ProxyStatus.HEALTHY,
+            latency_ms=20,
+            observed_ip="203.0.113.60",
+            error=None,
+        )
+
+    service = app.state.proxy_service
+    monkeypatch.setattr(service, "check_proxy", slow_check)
+
+    results = await asyncio.gather(
+        *(service._check_proxy_for_route(77, actor="bulk-session-check") for _ in range(5))
+    )
+
+    assert calls == 1
+    assert all(result.healthy for result in results)
+
+
 async def test_account_route_is_fail_closed_and_uses_remote_dns(app: FastAPI) -> None:
     service = app.state.proxy_service
 
@@ -302,6 +436,106 @@ async def test_account_route_is_fail_closed_and_uses_remote_dns(app: FastAPI) ->
     assert route.masked_endpoint == "socks5h://alice:***@proxy.example:1080"
 
 
+async def test_account_route_check_due_normalizes_legacy_naive_sqlite_time(
+    app: FastAPI,
+) -> None:
+    """A live preflight must accept old SQLite timestamps without crashing."""
+
+    service = app.state.proxy_service
+    view = await service.add_proxy("socks5://proxy.example:1080", label="Legacy route")
+    await service.assign_proxy(view.proxy.id, "account:42")
+    async with app.state.database.session_factory() as session:
+        endpoint = await session.get(ProxyEndpoint, view.proxy.id)
+        assert endpoint is not None
+        endpoint.status = ProxyStatus.HEALTHY
+        endpoint.last_checked_at = datetime.now(UTC).replace(tzinfo=None)
+        await session.commit()
+
+    assert await service.account_route_check_due(42, max_age_seconds=60) is False
+
+
+async def test_account_route_auto_replaces_only_after_verifying_the_proxy_pool(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = app.state.proxy_service
+    async with app.state.database.session_factory() as session:
+        account = Account(label="auto-replace-route", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    assert account.id is not None
+
+    failed = await service.add_proxy("socks5://failed.proxy.test:1080", label="Failed")
+    fallback = await service.add_proxy("socks5://healthy.proxy.test:1080", label="Fallback")
+    await service.assign_proxy(failed.proxy.id, f"account:{account.id}")
+
+    async def fake_probe(proxy_url: str) -> _ProxyProbeResult:
+        if "failed.proxy.test" in proxy_url:
+            return _ProxyProbeResult(
+                healthy=False,
+                latency_ms=None,
+                observed_ip=None,
+                error="ConnectError: соединение через прокси не установлено",
+            )
+        assert "healthy.proxy.test" in proxy_url
+        return _ProxyProbeResult(True, 43, "203.0.113.72", None)
+
+    monkeypatch.setattr(service, "_probe_proxy_url", fake_probe)
+
+    route = await service.ensure_account_route(account.id, actor="test-auto-replace")
+
+    assert route.proxy_id == fallback.proxy.id
+    assigned = await service.proxy_for_assignment(f"account:{account.id}")
+    assert assigned is not None and assigned.proxy.id == fallback.proxy.id
+    assert (await service.get_proxy(failed.proxy.id)).proxy.status == ProxyStatus.UNHEALTHY
+    replacement = await service.get_proxy(fallback.proxy.id)
+    assert replacement.proxy.status == ProxyStatus.HEALTHY
+    assert replacement.proxy.latency_ms == 43
+    async with app.state.database.session_factory() as session:
+        stored_account = await session.get(Account, account.id)
+        # Assignment plus failed-route invalidation plus the replacement each
+        # invalidate any cached Telegram client.
+        assert stored_account is not None and stored_account.connection_generation == 3
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.event_type == "proxy.account_auto_replaced")
+        )
+        assert audit is not None
+
+
+async def test_account_route_reports_a_missing_working_proxy_without_direct_fallback(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = app.state.proxy_service
+    async with app.state.database.session_factory() as session:
+        account = Account(label="no-fallback-route", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    assert account.id is not None
+    failed = await service.add_proxy("http://failed.only.test:8080", label="Only failed")
+    await service.assign_proxy(failed.proxy.id, f"account:{account.id}")
+
+    async def failed_probe(proxy_url: str) -> _ProxyProbeResult:
+        assert "failed.only.test" in proxy_url
+        return _ProxyProbeResult(
+            healthy=False,
+            latency_ms=None,
+            observed_ip=None,
+            error="ConnectError: соединение через прокси не установлено",
+        )
+
+    monkeypatch.setattr(service, "_probe_proxy_url", failed_probe)
+
+    with pytest.raises(ProxyRouteUnavailable, match="Добавьте рабочий HTTP"):
+        await service.ensure_account_route(account.id, actor="test-no-fallback")
+
+    assigned = await service.proxy_for_assignment(f"account:{account.id}")
+    assert assigned is not None and assigned.proxy.id == failed.proxy.id
+    assert (await service.get_proxy(failed.proxy.id)).proxy.status == ProxyStatus.UNHEALTHY
+
+
 async def test_deleting_account_releases_its_proxy_slot(app: FastAPI) -> None:
     async with app.state.database.session_factory() as session:
         account = Account(label="delete-with-proxy", ownership_confirmed=True)
@@ -334,6 +568,7 @@ async def test_clearing_account_session_preserves_history_row_and_revokes_access
             api_id=12345,
             api_hash_encrypted="encrypted-hash",
             username="private_name",
+            about="private bio",
             authorized=True,
         )
         session.add(account)
@@ -355,6 +590,7 @@ async def test_clearing_account_session_preserves_history_row_and_revokes_access
     assert cleared.api_id is None
     assert cleared.api_hash_encrypted is None
     assert cleared.username is None
+    assert cleared.about is None
     assert cleared.authorized is False
     assert await app.state.proxy_service.proxy_for_assignment(f"account:{account_id}") is None
 
@@ -568,9 +804,14 @@ async def test_proxy_api_route_changes_close_assigned_account_clients(
     fake_gateway = FakeGateway()
     app.state.gateway = fake_gateway
 
+    probe_count = 0
+
     async def fake_probe(proxy_url: str) -> _ProxyProbeResult:
+        nonlocal probe_count
         assert proxy_url.startswith("http://")
-        return _ProxyProbeResult(True, 80, "203.0.113.20", None)
+        probe_count += 1
+        observed_ip = "203.0.113.20" if probe_count == 1 else "203.0.113.21"
+        return _ProxyProbeResult(True, 80, observed_ip, None)
 
     monkeypatch.setattr(app.state.proxy_service, "_probe_proxy_url", fake_probe)
     rotation_url = "https://mobile.example/rotate?token=api-secret"

@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from proxima_traffic.bot.repository import Page, TargetListView
+from proxima_traffic.bot.ui import screen_title, section, themed_keyboard
 from proxima_traffic.failure_policy import failure_hint, failure_label
 from proxima_traffic.models import Account, ParticipantReactionTask, ParticipantReactionTaskStatus
 from proxima_traffic.participant_reactions import ParticipantReactionRuleView
@@ -177,14 +178,19 @@ def participant_reaction_confirm_menu(
 
 def participant_reactions_text(views: list[ParticipantReactionRuleView], total: int) -> str:
     text = (
-        "<b>👍 Авто-реакции в чатах</b>\n"
-        "<i>Выборочные реакции только на новые сообщения обычных участников.</i>\n\n"
-        "<b>Как это работает</b>\n"
+        screen_title(
+            "Авто-реакции в чатах",
+            "Выборочные реакции только на новые сообщения обычных участников.",
+        )
+        + "\n\n"
+        f"{section('Как это работает')}\n"
         "• для каждого правила выбираются список чатов, набор аккаунтов, эмодзи и частота;\n"
-        "• одну реакцию ставит один свободный аккаунт из выбранного набора;\n"
+        "• одну реакцию ставит один свободный аккаунт <b>строго из выбранного набора</b>; "
+        "другие аккаунты не используются;\n"
         "• боты, каналы, собственные аккаунты, старые сообщения и недавние получатели "
         "автоматически исключаются;\n"
         "• причины пропуска и ошибки остаются в истории правила.\n\n"
+        f"\n{section('Состояние')}\n"
         f"Правил: <b>{total}</b>"
     )
     return (
@@ -205,15 +211,18 @@ def participant_reaction_details_text(
     rule = view.rule
     frequency = _sample_frequency(rule.sample_numerator, rule.sample_denominator)
     lines = [
-        f"<b>👍 {escape(rule.name)}</b>",
-        f"<b>{'🟢 Правило включено' if rule.enabled else '⏸ Правило остановлено'}</b>\n",
-        "<b>Где и кем</b>",
+        screen_title(
+            escape(rule.name),
+            "🟢 Правило включено" if rule.enabled else "⏸ Правило остановлено",
+        ),
+        "",
+        section("Где и кем"),
         f"🎯 Список чатов: <b>{escape(view.target_list_name)}</b> · {view.target_count} чатов",
-        f"👥 Аккаунты: {accounts}\n",
-        "<b>Как реагировать</b>",
+        f"👥 Только эти аккаунты: {accounts}\n",
+        section("Как реагировать"),
         f"Реакция: <b>{rule.emoji}</b>",
         f"Частота: <b>{frequency}</b>\n",
-        "<b>Результаты</b>",
+        section("Результаты"),
         f"🕒 В очереди: <b>{view.queued}</b> · выполняется: <b>{view.running}</b>",
         f"✅ Готово: <b>{view.succeeded}</b> · ⏭ Пропущено: <b>{view.skipped}</b> "
         f"· ❌ Ошибки: <b>{view.failed}</b>",
@@ -236,15 +245,15 @@ def participant_reaction_draft_text(
     numerator = int(data.get("pr_numerator", 1))
     denominator = int(data.get("pr_denominator", 10))
     return (
-        "<b>👍 Новое правило авто-реакций</b>\n"
-        "<i>Проверьте настройки перед включением.</i>\n\n"
+        screen_title("Новое правило авто-реакций", "Проверьте настройки перед включением.") + "\n\n"
         f"Название: <b>{escape(str(data.get('pr_name', '')))}</b>\n"
         f"Список чатов: <b>{escape(list_name)}</b>\n"
-        f"Аккаунты: {accounts}\n"
+        f"Только эти аккаунты: {accounts}\n"
         f"Реакция: <b>{data.get('pr_emoji', '👍')}</b>\n"
         f"Частота: <b>{_sample_frequency(numerator, denominator)}</b>\n\n"
         "<i>Первая проверка только запомнит текущую границу каждого чата. Старые "
-        "сообщения, боты, каналы и собственные аккаунты не получат реакций.</i>"
+        "сообщения, боты, каналы и собственные аккаунты не получат реакций. Реакцию "
+        "сможет поставить только аккаунт из указанного выше списка.</i>"
     )
 
 
@@ -262,7 +271,7 @@ def participant_reaction_runs_text(
         ParticipantReactionTaskStatus.FAILED: "❌ ошибка",
         ParticipantReactionTaskStatus.CANCELLED: "⏸ отменено",
     }
-    lines = ["<b>📋 Последние авто-реакции</b>", ""]
+    lines = [screen_title("Последние авто-реакции"), ""]
     account_labels = account_labels or {}
     target_labels = target_labels or {}
     for task in tasks:
@@ -293,3 +302,12 @@ def _sample_frequency(numerator: int, denominator: int) -> str:
     if numerator == 1:
         return f"примерно 1 из {denominator} новых сообщений"
     return f"примерно {numerator} из {denominator} новых сообщений"
+
+
+for _factory_name, _factory in tuple(globals().items()):
+    if (
+        not _factory_name.startswith("_")
+        and callable(_factory)
+        and _factory_name.endswith(("menu", "picker", "confirmation", "cancel"))
+    ):
+        globals()[_factory_name] = themed_keyboard(_factory)

@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     proxy_check_url: str = "https://api.ipify.org?format=json"
     proxy_check_timeout_seconds: float = 12.0
     proxy_quarantine_after_failures: int = 3
+    proxy_health_recheck_seconds: float = 60.0
     account_encryption_key: SecretStr | None = None
     telegram_api_id: int | None = None
     telegram_api_hash: SecretStr | None = None

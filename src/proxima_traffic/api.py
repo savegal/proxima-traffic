@@ -285,23 +285,29 @@ async def import_proxies(payload: ProxyBatchCreate, request: Request) -> ProxyIm
     )
 
 
-@router.get("/proxies", response_model=list[ProxyRead])
+@router.get("/proxies", response_model=PageRead[ProxyRead])
 async def list_proxies(
     request: Request,
     proxy_status: Annotated[ProxyStatus | None, Query(alias="status")] = None,
     proxy_filter: Annotated[ProxyFilter, Query(alias="filter")] = ProxyFilter.ALL,
     group_id: int | None = None,
-    limit: PageLimit = 100,
-) -> list[ProxyRead]:
+    page: PageNumber = 0,
+    page_size: PageLimit = 100,
+) -> PageRead[ProxyRead]:
     service: ProxyService = request.app.state.proxy_service
-    page = await service.list_proxies(
-        0,
-        limit,
+    results = await service.list_proxies(
+        page,
+        page_size,
         status=proxy_status,
         group_id=group_id,
         filter_name=proxy_filter,
     )
-    return [_proxy_read(item) for item in page.items]
+    return PageRead(
+        items=[_proxy_read(item) for item in results.items],
+        total=results.total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/proxies/{proxy_id}", response_model=ProxyRead)
@@ -569,9 +575,38 @@ async def create_target(payload: TargetCreate, session: SessionDep) -> Target:
 async def list_targets(
     session: SessionDep,
     include_list_members: bool = Query(default=False),
+    target_list_id: int | None = Query(default=None),
     page: PageNumber = 0,
     page_size: PageLimit = 100,
 ) -> PageRead[TargetRead]:
+    if target_list_id is not None:
+        list_exists = await session.get(TargetList, target_list_id)
+        if list_exists is None:
+            raise HTTPException(status_code=404, detail="target list not found")
+        statement = (
+            select(Target, TargetListItem.enabled)
+            .join(TargetListItem, TargetListItem.target_id == Target.id)
+            .where(TargetListItem.target_list_id == target_list_id)
+            .order_by(Target.id.desc())
+        )
+        total = int(
+            await session.scalar(
+                select(func.count(TargetListItem.target_id)).where(
+                    TargetListItem.target_list_id == target_list_id
+                )
+            )
+            or 0
+        )
+        rows = (await session.execute(statement.offset(page * page_size).limit(page_size))).all()
+        return PageRead(
+            items=[
+                TargetRead.model_validate(target).model_copy(update={"list_enabled": bool(enabled)})
+                for target, enabled in rows
+            ],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
     statement = select(Target).order_by(Target.id.desc())
     count_statement = select(func.count(Target.id))
     if not include_list_members:
@@ -964,16 +999,24 @@ async def enqueue_campaign(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/runs", response_model=list[RunRead])
+@router.get("/runs", response_model=PageRead[RunRead])
 async def list_runs(
     session: SessionDep,
     run_status: RunStatusFilter = None,
-    limit: PageLimit = 100,
-) -> list[CampaignRun]:
-    statement = select(CampaignRun).order_by(CampaignRun.id.desc()).limit(limit)
+    page: PageNumber = 0,
+    page_size: PageLimit = 100,
+) -> PageRead[RunRead]:
+    statement = select(CampaignRun).order_by(CampaignRun.id.desc())
+    count_statement = select(func.count(CampaignRun.id))
     if run_status is not None:
         statement = statement.where(CampaignRun.status == run_status)
-    return list(await session.scalars(statement))
+        count_statement = count_statement.where(CampaignRun.status == run_status)
+    return PageRead(
+        items=list(await session.scalars(statement.offset(page * page_size).limit(page_size))),
+        total=int(await session.scalar(count_statement) or 0),
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.post("/runs/{run_id}/cancel", response_model=RunRead)
@@ -1059,13 +1102,24 @@ async def get_run(run_id: int, session: SessionDep) -> RunDetails:
     return RunDetails(**RunRead.model_validate(run).model_dump(), actions=actions)
 
 
-@router.get("/audit", response_model=list[AuditEventRead])
+@router.get("/audit", response_model=PageRead[AuditEventRead])
 async def list_audit_events(
     session: SessionDep,
-    limit: PageLimit = 100,
-) -> list[AuditEvent]:
-    return list(
-        await session.scalars(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(limit))
+    page: PageNumber = 0,
+    page_size: PageLimit = 100,
+) -> PageRead[AuditEventRead]:
+    return PageRead(
+        items=list(
+            await session.scalars(
+                select(AuditEvent)
+                .order_by(AuditEvent.id.desc())
+                .offset(page * page_size)
+                .limit(page_size)
+            )
+        ),
+        total=int(await session.scalar(select(func.count(AuditEvent.id))) or 0),
+        page=page,
+        page_size=page_size,
     )
 
 

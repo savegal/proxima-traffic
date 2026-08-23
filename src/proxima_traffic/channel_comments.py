@@ -202,6 +202,7 @@ class ChannelCommentService:
         message_edit_initial_text: str | None = None,
         message_edit_initial_html: str | None = None,
         message_edit_delay_seconds: int | None = None,
+        preflight_failures: list[tuple[str, str]] | None = None,
         actor: str = "control-bot",
     ) -> list[ChannelCommentRule]:
         """Create identical comment rules for several channels atomically.
@@ -349,18 +350,30 @@ class ChannelCommentService:
 
         # One Telegram preflight per channel is intentional: discussion groups
         # and sender permissions may differ even when the flow is identical.
-        # Keep the exact channel in the error so a batch can be corrected
-        # without the operator having to discover which one failed by trial.
-        preflights: list[ChannelCommentPreflight | None] = []
-        for channel_ref in normalized_refs:
+        # A bad or private channel must not prevent every other selected
+        # channel from being armed.  Keep it out of this batch and report its
+        # exact reason to the operator; fail only if none can be enabled.
+        ready_rules: list[tuple[str, str, ChannelCommentPreflight | None]] = []
+        failures: list[tuple[str, str]] = []
+        for rule_name, channel_ref in zip(normalized_names, normalized_refs, strict=True):
             try:
-                preflights.append(
-                    await self._preflight_accounts(list(accounts.values()), channel_ref)
+                ready_rules.append(
+                    (
+                        rule_name,
+                        channel_ref,
+                        await self._preflight_accounts(list(accounts.values()), channel_ref),
+                    )
                 )
             except ConflictError as exc:
-                raise ConflictError(
-                    f"канал {channel_ref} не прошёл проверку: {exc}"
-                ) from exc
+                failures.append((channel_ref, str(exc)))
+        if preflight_failures is not None:
+            preflight_failures.extend(failures)
+        if not ready_rules:
+            details = "; ".join(f"{channel}: {reason}" for channel, reason in failures)
+            raise ConflictError(
+                "ни один канал не прошёл проверку"
+                + (f": {details}" if details else "")
+            )
         async with self._session_factory() as session:
             # Repeat the active-rule check in the write transaction: another
             # operator could have enabled or created a rule while preflight was
@@ -371,8 +384,12 @@ class ChannelCommentService:
                     select(ChannelCommentRule).where(
                         ChannelCommentRule.archived_at.is_(None),
                         or_(
-                            ChannelCommentRule.channel_ref.in_(normalized_refs),
-                            ChannelCommentRule.name.in_(normalized_names),
+                            ChannelCommentRule.channel_ref.in_(
+                                [channel_ref for _, channel_ref, _ in ready_rules]
+                            ),
+                            ChannelCommentRule.name.in_(
+                                [rule_name for rule_name, _, _ in ready_rules]
+                            ),
                         ),
                     )
                 )
@@ -459,12 +476,7 @@ class ChannelCommentService:
                     armed_at=utc_now(),
                     channel_title=preflight.title if preflight is not None else None,
                 )
-                for rule_name, channel_ref, preflight in zip(
-                    normalized_names,
-                    normalized_refs,
-                    preflights,
-                    strict=True,
-                )
+                for rule_name, channel_ref, preflight in ready_rules
             ]
             session.add_all(rules)
             try:

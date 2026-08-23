@@ -321,25 +321,28 @@ async def test_channel_comment_accepts_preview_links_and_explains_private_links(
 
 
 @pytest.mark.asyncio
-async def test_batch_rule_creation_does_not_write_when_one_channel_fails_preflight(
+async def test_batch_rule_creation_keeps_valid_channels_when_one_fails_preflight(
     app: FastAPI,
 ) -> None:
     gateway = FailingBatchPreflightGateway()
     service = _service(app, gateway)
     account = await _account(app, "batch-comment-failure-account")
 
-    with pytest.raises(ConflictError, match="@batch_comments_fail"):
-        await service.create_rules(
-            name="Пакет с ошибкой",
-            channel_refs=("@batch_comments_ok", "@batch_comments_fail"),
-            mode=ChannelCommentMode.SINGLE,
-            primary_account_id=int(account.id),
-            primary_text="Новый комментарий",
-            initial_delay_seconds=0,
-        )
+    failures: list[tuple[str, str]] = []
+    rules = await service.create_rules(
+        name="Пакет с ошибкой",
+        channel_refs=("@batch_comments_ok", "@batch_comments_fail"),
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Новый комментарий",
+        initial_delay_seconds=0,
+        preflight_failures=failures,
+    )
 
     async with app.state.database.session_factory() as session:
-        assert await session.scalar(select(func.count(ChannelCommentRule.id))) == 0
+        assert await session.scalar(select(func.count(ChannelCommentRule.id))) == 1
+    assert [rule.channel_ref for rule in rules] == ["@batch_comments_ok"]
+    assert failures and failures[0][0] == "@batch_comments_fail"
 
 
 @pytest.mark.asyncio

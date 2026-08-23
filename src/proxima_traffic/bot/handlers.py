@@ -14332,6 +14332,7 @@ async def create_channel_comment_rule(
 ) -> None:
     data = await state.get_data()
     mode = ChannelCommentMode(str(data["comment_mode"]))
+    skipped_channels: list[tuple[str, str]] = []
     try:
         steps = [
             DialogueStep(**item) for item in data.get("comment_steps", []) if isinstance(item, dict)
@@ -14380,6 +14381,7 @@ async def create_channel_comment_rule(
                 if mode == ChannelCommentMode.MESSAGE_EDIT
                 else None
             ),
+            preflight_failures=skipped_channels,
         )
     except (ConflictError, ValueError) as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
@@ -14389,7 +14391,8 @@ async def create_channel_comment_rule(
     await callback.answer(
         "Канал включён: новые посты будут отслеживаться"
         if count == 1
-        else f"Включено каналов: {count}",
+        else f"Включено каналов: {count}"
+        + (f" · пропущено: {len(skipped_channels)}" if skipped_channels else ""),
     )
     await _show_channel_comment_details(
         callback,
@@ -14399,6 +14402,16 @@ async def create_channel_comment_rule(
         rule_id=rules[0].id,
         page=0,
     )
+    if skipped_channels and callback.message is not None:
+        skipped_text = "\n".join(
+            f"• <code>{escape(channel_ref)}</code> — {escape(reason)}"
+            for channel_ref, reason in skipped_channels
+        )
+        await callback.message.answer(
+            "<b>Часть каналов не включена</b>\n\n"
+            "Остальные каналы уже работают. Проверьте эти адреса или доступ аккаунта:\n"
+            f"{skipped_text}"
+        )
 
 
 @router.callback_query(F.data.startswith("comments:details:"))

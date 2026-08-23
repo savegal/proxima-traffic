@@ -327,13 +327,15 @@ class ChannelCommentService:
                     self._validate_account(dialogue_account)
                     accounts[account_id] = dialogue_account
 
-        # Fail before any write if the requested set overlaps an active rule.
-        # The database constraints still protect this check from a concurrent
-        # operator creating a rule in the small window before the final flush.
+        # A paused rule is history, not a lock on the channel.  A new explicit
+        # launch replaces it after its Telegram preflight succeeds.  Only a
+        # currently enabled rule can create duplicate comments and must block
+        # this flow before making any Telegram calls.
         async with self._session_factory() as session:
             conflicting = await session.scalar(
                 select(ChannelCommentRule.id).where(
                     ChannelCommentRule.archived_at.is_(None),
+                    ChannelCommentRule.enabled.is_(True),
                     or_(
                         ChannelCommentRule.channel_ref.in_(normalized_refs),
                         ChannelCommentRule.name.in_(normalized_names),
@@ -341,7 +343,9 @@ class ChannelCommentService:
                 )
             )
         if conflicting is not None:
-            raise ConflictError("один из каналов или названий уже добавлен")
+            raise ConflictError(
+                "этот канал уже отслеживается активным правилом; сначала остановите его"
+            )
 
         # One Telegram preflight per channel is intentional: discussion groups
         # and sender permissions may differ even when the flow is identical.
@@ -358,6 +362,78 @@ class ChannelCommentService:
                     f"канал {channel_ref} не прошёл проверку: {exc}"
                 ) from exc
         async with self._session_factory() as session:
+            # Repeat the active-rule check in the write transaction: another
+            # operator could have enabled or created a rule while preflight was
+            # running.  Disabled predecessors are archived atomically so the
+            # partial unique indexes release their channel/name before insert.
+            overlapping_rules = list(
+                await session.scalars(
+                    select(ChannelCommentRule).where(
+                        ChannelCommentRule.archived_at.is_(None),
+                        or_(
+                            ChannelCommentRule.channel_ref.in_(normalized_refs),
+                            ChannelCommentRule.name.in_(normalized_names),
+                        ),
+                    )
+                )
+            )
+            if any(rule.enabled for rule in overlapping_rules):
+                raise ConflictError(
+                    "этот канал уже отслеживается активным правилом; сначала остановите его"
+                )
+
+            retired_at = utc_now()
+            for predecessor in overlapping_rules:
+                predecessor.enabled = False
+                predecessor.archived_at = retired_at
+                queued_ids = list(
+                    await session.scalars(
+                        select(ChannelCommentRun.id).where(
+                            ChannelCommentRun.rule_id == predecessor.id,
+                            ChannelCommentRun.status == ChannelCommentRunStatus.QUEUED,
+                        )
+                    )
+                )
+                await session.execute(
+                    update(ChannelCommentRun)
+                    .where(
+                        ChannelCommentRun.rule_id == predecessor.id,
+                        ChannelCommentRun.status == ChannelCommentRunStatus.QUEUED,
+                    )
+                    .values(
+                        status=ChannelCommentRunStatus.CANCELLED,
+                        finished_at=retired_at,
+                        error="правило заменено новым запуском",
+                        error_code="rule_replaced",
+                    )
+                )
+                await session.execute(
+                    update(ChannelCommentRun)
+                    .where(
+                        ChannelCommentRun.rule_id == predecessor.id,
+                        ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
+                    )
+                    .values(cancel_requested=True)
+                )
+                if queued_ids:
+                    await self._release_mention_reservations(session, run_ids=queued_ids)
+                await self._cancel_rule_reactions(
+                    session,
+                    int(predecessor.id),
+                    reason="channel comment rule replaced",
+                    code="rule_replaced",
+                )
+                add_audit_event(
+                    session,
+                    event_type="channel_comment_rule.replaced",
+                    entity_type="channel_comment_rule",
+                    entity_id=predecessor.id,
+                    details={"channel_ref": predecessor.channel_ref},
+                    actor=actor,
+                )
+            # Flush updates first: SQLite/PostgreSQL partial unique indexes
+            # must see the predecessors archived before inserting replacements.
+            await session.flush()
             rules = [
                 ChannelCommentRule(
                     name=rule_name,

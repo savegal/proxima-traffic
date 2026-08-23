@@ -244,6 +244,65 @@ async def test_batch_rule_creation_reuses_one_flow_for_each_channel(app: FastAPI
 
 
 @pytest.mark.asyncio
+async def test_new_launch_replaces_a_paused_rule_for_the_same_channel(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "replace-paused-comment-account")
+
+    old_rule = await service.create_rule(
+        name="Старый запуск",
+        channel_ref="@replace_paused_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Старый текст",
+        initial_delay_seconds=0,
+    )
+    await service.set_rule_enabled(int(old_rule.id), False)
+
+    new_rule = await service.create_rule(
+        name="Новый запуск",
+        channel_ref="@replace_paused_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Новый текст",
+        initial_delay_seconds=0,
+    )
+
+    async with app.state.database.session_factory() as session:
+        archived_old_rule = await session.get(ChannelCommentRule, old_rule.id)
+    assert archived_old_rule is not None
+    assert archived_old_rule.archived_at is not None
+    assert new_rule.enabled is True
+    assert new_rule.primary_text == "Новый текст"
+
+
+@pytest.mark.asyncio
+async def test_new_launch_rejects_an_enabled_rule_for_the_same_channel(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "active-conflict-comment-account")
+
+    await service.create_rule(
+        name="Активный запуск",
+        channel_ref="@active_conflict_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Текст",
+        initial_delay_seconds=0,
+    )
+
+    with pytest.raises(ConflictError, match="активным правилом"):
+        await service.create_rule(
+            name="Попытка дубля",
+            channel_ref="@active_conflict_channel",
+            mode=ChannelCommentMode.SINGLE,
+            primary_account_id=int(account.id),
+            primary_text="Новый текст",
+            initial_delay_seconds=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_channel_comment_accepts_preview_links_and_explains_private_links(
     app: FastAPI,
 ) -> None:

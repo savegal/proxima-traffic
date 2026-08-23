@@ -69,7 +69,13 @@ from proxima_traffic.proxies import (
     ProxyService,
     mtproto_connection_type,
 )
-from proxima_traffic.services import ConflictError, DomainError, NotFoundError, add_audit_event
+from proxima_traffic.services import (
+    ConflictError,
+    DomainError,
+    NotFoundError,
+    add_audit_event,
+    safe_error_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +263,32 @@ class AccountBulkCheckSummary:
         return tuple(
             entry for entry in self.entries if not entry.ready and not entry.session_revoked
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AccountInvalidSessionCleanupIssue:
+    """One account deliberately left untouched during batch cleanup."""
+
+    account_id: int
+    label: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class AccountInvalidSessionCleanupSummary:
+    """Result of a fresh check followed by safe removal of dead access."""
+
+    check_summary: AccountBulkCheckSummary
+    removed: tuple[AccountRemovalResult, ...]
+    skipped: tuple[AccountInvalidSessionCleanupIssue, ...]
+
+    @property
+    def deleted(self) -> tuple[AccountRemovalResult, ...]:
+        return tuple(result for result in self.removed if result.deleted)
+
+    @property
+    def preserved_for_history(self) -> tuple[AccountRemovalResult, ...]:
+        return tuple(result for result in self.removed if result.preserved_for_history)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1069,8 +1101,40 @@ class AccountService:
     async def check_account(
         self, account_id: int, *, actor: str = "control-bot"
     ) -> AccountCheckResult:
-        """Connect through the assigned proxy and confirm the session is alive."""
-        decrypted = await self.load_session(account_id)
+        """Connect through the assigned proxy and confirm the session is alive.
+
+        An unreadable local session is deliberately recorded as a diagnostic,
+        rather than escaping only from the bulk-check flow.  It is not proof
+        that Telegram revoked the account, so the last known authorization is
+        preserved and the safe cleanup action will never remove it.
+        """
+        try:
+            decrypted = await self.load_session(account_id)
+        except NotFoundError:
+            raise
+        except AccountImportError as exc:
+            return await self._record_check(
+                account_id,
+                authorized=None,
+                me=None,
+                error=_safe_account_error(exc),
+                failure_code="session_material_invalid",
+                actor=actor,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep a damaged local cipher actionable
+            logger.warning(
+                "Unable to read session material for account %s: %s",
+                account_id,
+                _safe_account_error(exc),
+            )
+            return await self._record_check(
+                account_id,
+                authorized=None,
+                me=None,
+                error=_safe_account_error(exc),
+                failure_code="session_material_invalid",
+                actor=actor,
+            )
         transport = TelethonTransport(proxy=None)
         if self._proxy_service is not None:
             try:
@@ -1120,6 +1184,7 @@ class AccountService:
         *,
         actor: str = "control-bot",
         concurrency: int = 3,
+        on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> AccountBulkCheckSummary:
         """Verify every stored Telegram session without sending any messages.
 
@@ -1138,6 +1203,20 @@ class AccountService:
             )
 
         semaphore = asyncio.Semaphore(max(1, min(int(concurrency), 5)))
+        total = len(accounts)
+        completed = 0
+        progress_lock = asyncio.Lock()
+
+        async def report_progress() -> None:
+            nonlocal completed
+            if on_progress is None:
+                return
+            async with progress_lock:
+                completed += 1
+                await on_progress(completed, total)
+
+        if on_progress is not None:
+            await on_progress(0, total)
 
         async def run_check(account_id: int, label: str) -> AccountBulkCheckEntry:
             try:
@@ -1150,7 +1229,11 @@ class AccountService:
                     error=_safe_account_error(exc),
                 )
             except Exception as exc:  # noqa: BLE001 - one bad session must not stop the batch
-                logger.exception("Bulk session check failed for account %s", account_id)
+                logger.warning(
+                    "Bulk session check failed for account %s: %s",
+                    account_id,
+                    _safe_account_error(exc),
+                )
                 return AccountBulkCheckEntry(
                     account_id=account_id,
                     label=label,
@@ -1166,7 +1249,10 @@ class AccountService:
 
         async def check_one(account_id: int, label: str) -> AccountBulkCheckEntry:
             async with semaphore:
-                return await run_check(account_id, label)
+                try:
+                    return await run_check(account_id, label)
+                finally:
+                    await report_progress()
 
         # gather preserves database order, so the report remains easy to
         # reconcile with the account list despite parallel checks.
@@ -1174,6 +1260,76 @@ class AccountService:
             *(check_one(int(account_id), str(label)) for account_id, label in accounts)
         )
         return AccountBulkCheckSummary(entries=tuple(entries))
+
+    async def remove_confirmed_invalid_sessions(
+        self,
+        *,
+        actor: str = "control-bot",
+        concurrency: int = 3,
+    ) -> AccountInvalidSessionCleanupSummary:
+        """Recheck all stored sessions, then remove only Telegram-confirmed dead access.
+
+        The result of a previous screen must not be trusted for a destructive
+        action: a proxy can recover and an operator can restore a session while
+        the confirmation prompt is open. A fresh check also guarantees that
+        timeouts, proxy failures and flood waits are merely reported, never
+        converted into account deletion.
+        """
+        check_summary = await self.check_all_sessions(actor=actor, concurrency=concurrency)
+        removed: list[AccountRemovalResult] = []
+        skipped: list[AccountInvalidSessionCleanupIssue] = []
+        for entry in check_summary.session_revoked:
+            try:
+                removed.append(await self.remove_account_safely(entry.account_id, actor=actor))
+            except ConflictError:
+                try:
+                    plan = await self.account_removal_plan(entry.account_id)
+                except NotFoundError:
+                    skipped.append(
+                        AccountInvalidSessionCleanupIssue(
+                            account_id=entry.account_id,
+                            label=entry.label,
+                            reason="запись уже удалена другой операцией",
+                        )
+                    )
+                else:
+                    active_work = "; ".join(plan.active_work)
+                    skipped.append(
+                        AccountInvalidSessionCleanupIssue(
+                            account_id=entry.account_id,
+                            label=entry.label,
+                            reason=(
+                                "появилась активная задача"
+                                + (f": {active_work}" if active_work else "")
+                            ),
+                        )
+                    )
+            except NotFoundError:
+                skipped.append(
+                    AccountInvalidSessionCleanupIssue(
+                        account_id=entry.account_id,
+                        label=entry.label,
+                        reason="запись уже удалена другой операцией",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the remaining confirmed entries safe
+                logger.warning(
+                    "Could not remove confirmed invalid account %s: %s",
+                    entry.account_id,
+                    _safe_account_error(exc),
+                )
+                skipped.append(
+                    AccountInvalidSessionCleanupIssue(
+                        account_id=entry.account_id,
+                        label=entry.label,
+                        reason=_safe_account_error(exc),
+                    )
+                )
+        return AccountInvalidSessionCleanupSummary(
+            check_summary=check_summary,
+            removed=tuple(removed),
+            skipped=tuple(skipped),
+        )
 
     async def update_profile_name(
         self,
@@ -1521,6 +1677,7 @@ class AccountService:
         source: AccountSessionSource,
         converted: _ConvertedSession,
     ) -> Account:
+        self._require_dedicated_account_encryption_key()
         encrypted_session = self._cipher.encrypt(converted.session_string)
         encrypted_hash = self._cipher.encrypt(converted.api_hash)
         async with self._session_factory() as session:
@@ -1650,6 +1807,7 @@ class AccountService:
         username = getattr(me, "username", None)
         is_premium = _telegram_premium_value(me)
         checked_at = utc_now()
+        recovered_expired_cooldown = False
         async with self._session_factory() as session:
             account = await session.get(Account, account_id)
             if account is None:
@@ -1662,6 +1820,27 @@ class AccountService:
                 account.status = AccountStatus.DISABLED
                 account.cooldown_reason = failure_code
             if authorized is True:
+                # Older runs could leave a successfully connected account in
+                # ``disabled`` after a temporary FloodWait had already
+                # elapsed.  A fresh successful session check is sufficient
+                # evidence to restore only those temporary states; definitive
+                # Telegram/@SpamBot bans remain disabled.
+                cooldown_until = ensure_utc(account.cooldown_until)
+                if (
+                    account.status is AccountStatus.DISABLED
+                    and account.cooldown_reason
+                    in {
+                        "account_restricted",
+                        "flood_escalation",
+                        "flood_wait",
+                        "peer_flood",
+                    }
+                    and (cooldown_until is None or cooldown_until <= checked_at)
+                ):
+                    account.status = AccountStatus.ACTIVE
+                    account.cooldown_until = None
+                    account.cooldown_reason = None
+                    recovered_expired_cooldown = True
                 if telegram_user_id is not None and account.telegram_user_id is None:
                     account.telegram_user_id = telegram_user_id
                 if phone:
@@ -1682,6 +1861,7 @@ class AccountService:
                     "authorized": authorized,
                     "authorization_known": authorized is not None,
                     "failure_code": failure_code,
+                    "recovered_expired_cooldown": recovered_expired_cooldown,
                 },
                 actor=actor,
             )
@@ -1877,6 +2057,16 @@ class AccountService:
                 "для импорта аккаунта нужны PROXIMA_TELEGRAM_API_ID и PROXIMA_TELEGRAM_API_HASH"
             )
         return api
+
+    def _require_dedicated_account_encryption_key(self) -> None:
+        """Prevent new Telegram sessions from using the public dev fallback key."""
+
+        key = self._settings.account_encryption_key
+        if key is None or len(key.get_secret_value()) < 16:
+            raise AccountImportError(
+                "для импорта сессий задайте отдельный PROXIMA_ACCOUNT_ENCRYPTION_KEY "
+                "длиной не менее 16 символов"
+            )
 
     def _configured_two_factor_password(self, supplied: str | None) -> str | None:
         if supplied is not None:
@@ -2576,8 +2766,9 @@ def _telethon_proxy(route: object) -> tuple[object, str, int, bool, str | None, 
 
 
 def _safe_account_error(error: BaseException) -> str:
-    message = str(error) or type(error).__name__
-    return message.replace("\x00", "")[:500]
+    """Persist account-check errors without exposing proxy credentials."""
+
+    return safe_error_message(error)[:500]
 
 
 def _account_check_failure_code(error: BaseException) -> str:
@@ -2585,6 +2776,8 @@ def _account_check_failure_code(error: BaseException) -> str:
     error_name = type(error).__name__
     rpc_message = str(getattr(error, "message", "") or "").upper()
     fatal_names = {
+        "ApiIdPublishedFloodError",
+        "AuthKeyError",
         "AuthKeyDuplicatedError",
         "AuthKeyInvalidError",
         "AuthKeyUnregisteredError",
@@ -2598,7 +2791,9 @@ def _account_check_failure_code(error: BaseException) -> str:
     fatal_messages = {
         "AUTH_KEY_DUPLICATED",
         "AUTH_KEY_INVALID",
+        "AUTH_KEY_PERM_EMPTY",
         "AUTH_KEY_UNREGISTERED",
+        "AUTH_KEY_UNSYNCHRONIZED",
         "PHONE_NUMBER_BANNED",
         "SESSION_EXPIRED",
         "SESSION_REVOKED",

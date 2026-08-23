@@ -90,8 +90,9 @@ def test_channel_comment_settings_have_bounded_safe_defaults() -> None:
 def test_typing_settings_have_short_safe_defaults() -> None:
     settings = Settings(worker_enabled=False)
     assert settings.account_typing_enabled is True
-    assert settings.account_typing_min_seconds == 2
-    assert settings.account_typing_max_seconds == 4
+    assert settings.account_typing_min_seconds == 1
+    assert settings.account_typing_max_seconds == 6
+    assert settings.account_typing_characters_per_second == 18
 
     with pytest.raises(ValidationError, match="TYPING_MAX_SECONDS"):
         Settings(
@@ -101,6 +102,40 @@ def test_typing_settings_have_short_safe_defaults() -> None:
         )
     with pytest.raises(ValidationError, match="must not exceed 15"):
         Settings(worker_enabled=False, account_typing_max_seconds=16)
+
+
+def test_live_auto_join_requires_a_real_join_budget() -> None:
+    with pytest.raises(ValidationError, match="JOIN_DAILY_LIMIT"):
+        Settings(
+            dry_run=False,
+            worker_enabled=False,
+            account_auto_join=True,
+            account_join_daily_limit=0,
+            account_join_min_interval_seconds=120,
+        )
+    with pytest.raises(ValidationError, match="JOIN_MIN_INTERVAL"):
+        Settings(
+            dry_run=False,
+            worker_enabled=False,
+            account_auto_join=True,
+            account_join_daily_limit=8,
+            account_join_min_interval_seconds=0,
+        )
+    settings = Settings(
+        dry_run=False,
+        worker_enabled=False,
+        account_auto_join=True,
+        account_join_daily_limit=8,
+        account_join_min_interval_seconds=120,
+    )
+    assert settings.account_auto_join is True
+
+
+def test_preflight_limits_are_bounded() -> None:
+    with pytest.raises(ValidationError, match="PREFLIGHT_MAX_PAIRS"):
+        Settings(worker_enabled=False, preflight_max_pairs=5001)
+    with pytest.raises(ValidationError, match="PREFLIGHT_ACCOUNT_CONCURRENCY"):
+        Settings(worker_enabled=False, preflight_account_concurrency=0)
 
 
 def test_membership_gate_retry_settings_are_bounded() -> None:
@@ -153,3 +188,18 @@ def test_production_environment_is_normalized_before_safety_checks() -> None:
 def test_worker_retry_base_must_be_positive() -> None:
     with pytest.raises(ValidationError, match="RETRY_BASE"):
         Settings(worker_enabled=False, worker_retry_base_seconds=0)
+
+
+def test_worker_campaign_scope_is_explicit_and_validated() -> None:
+    settings = Settings(worker_enabled=False, worker_campaign_ids="16, 22, 16")
+    assert settings.worker_campaign_id_scope == frozenset({16, 22})
+
+    assert Settings(worker_enabled=False).worker_campaign_id_scope is None
+    with pytest.raises(ValidationError, match="WORKER_CAMPAIGN_IDS"):
+        Settings(worker_enabled=False, worker_campaign_ids="16, not-a-number")
+    with pytest.raises(ValidationError, match="positive campaign IDs"):
+        Settings(worker_enabled=False, worker_campaign_ids="0")
+
+
+def test_worker_lease_allows_a_normal_telegram_join_or_permission_check() -> None:
+    assert Settings(worker_enabled=False).worker_lease_seconds == 120

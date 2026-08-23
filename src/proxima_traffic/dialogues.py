@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from proxima_traffic.content import ALLOWED_MEDIA_KINDS, validate_spintax
+from proxima_traffic.content import ALLOWED_MEDIA_KINDS, ContentError, validate_telegram_text
 
 MAX_DIALOGUE_STEPS = 20
 MAX_DIALOGUE_STEP_DELAY_SECONDS = 24 * 3600
@@ -20,6 +20,7 @@ class DialogueStep:
     media_kind: str | None = None
     media_name: str | None = None
     media_size: int | None = None
+    html_text: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -33,6 +34,7 @@ def validate_dialogue_steps(raw_steps: list[dict[str, Any]]) -> list[DialogueSte
         try:
             account_id = int(raw["account_id"])
             text = str(raw["text"]).strip()
+            html_text = str(raw["html_text"]) if raw.get("html_text") is not None else None
             delay_seconds = int(raw.get("delay_seconds", 0))
             raw_reply_to_previous = raw.get("reply_to_previous", index > 0)
             if not isinstance(raw_reply_to_previous, bool):
@@ -60,15 +62,20 @@ def validate_dialogue_steps(raw_steps: list[dict[str, Any]]) -> list[DialogueSte
             raise ValueError(
                 f"сообщение диалога № {index + 1} должно содержать от 1 до {maximum_text} символов"
             )
-        if media_kind == "video_note" and text:
+        if media_kind == "video_note" and (text or html_text):
             raise ValueError(f"к видеокружку в шаге № {index + 1} нельзя добавить подпись")
         if media_size is not None and media_size < 0:
             raise ValueError(f"у сообщения диалога № {index + 1} неверный размер медиа")
         if media_name is not None and len(media_name) > 255:
             raise ValueError(f"у сообщения диалога № {index + 1} слишком длинное имя медиа")
         try:
-            validate_spintax(text)
-        except ValueError as exc:
+            validate_telegram_text(
+                text,
+                html_text,
+                has_media=media_kind is not None,
+                allow_empty=allows_empty_text,
+            )
+        except ContentError as exc:
             raise ValueError(f"сообщение диалога № {index + 1}: {exc}") from exc
         if not 0 <= delay_seconds <= MAX_DIALOGUE_STEP_DELAY_SECONDS:
             raise ValueError(
@@ -82,6 +89,7 @@ def validate_dialogue_steps(raw_steps: list[dict[str, Any]]) -> list[DialogueSte
             DialogueStep(
                 account_id=account_id,
                 text=text,
+                html_text=html_text,
                 delay_seconds=delay_seconds,
                 reply_to_previous=reply_to_previous,
                 media_path=media_path,

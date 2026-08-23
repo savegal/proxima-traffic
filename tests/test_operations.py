@@ -91,6 +91,84 @@ async def test_terminal_run_notification_is_sent_once(app: FastAPI) -> None:
     assert "Notify campaign" in messages[0]
 
 
+async def test_finite_launch_emits_one_summary_after_all_tasks_finish(app: FastAPI) -> None:
+    async with app.state.database.session_factory() as session:
+        account = Account(label="launch-summary", ownership_confirmed=True)
+        target = Target(
+            chat_ref="@launch_summary",
+            title="Launch summary target",
+            approved_by_operator=True,
+        )
+        session.add_all([account, target])
+        await session.flush()
+        campaign = Campaign(
+            name="Launch summary campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=account.id,
+            target_id=target.id,
+            target_list_id=None,
+            primary_text="Summary",
+            reply_text="",
+        )
+        session.add(campaign)
+        await session.flush()
+        first = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            request_key="launch-summary-one",
+            launch_key="launch-summary-key",
+            status=RunStatus.SUCCEEDED,
+            next_step=RunStep.PRIMARY,
+            primary_message_id=301,
+        )
+        second = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            request_key="launch-summary-two",
+            launch_key="launch-summary-key",
+            status=RunStatus.CANCELLED,
+            next_step=RunStep.PRIMARY,
+        )
+        third = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            request_key="launch-summary-three",
+            launch_key="launch-summary-key",
+            status=RunStatus.QUEUED,
+            next_step=RunStep.PRIMARY,
+        )
+        session.add_all([first, second, third])
+        await session.commit()
+        run_ids = [first.id, second.id, third.id]
+
+    messages: list[str] = []
+
+    async def sender(text: str) -> None:
+        messages.append(text)
+
+    notifier = RunNotifier(app.state.database.session_factory, sender)
+    assert await notifier.process_pending() == 0
+    assert messages == []
+
+    async with app.state.database.session_factory() as session:
+        final_run = await session.get(CampaignRun, run_ids[-1])
+        assert final_run is not None
+        final_run.status = RunStatus.FAILED
+        final_run.error_code = "peer_flood"
+        final_run.finished_at = utc_now()
+        await session.commit()
+
+    assert await notifier.process_pending() == 1
+    assert len(messages) == 1
+    assert "Рассылка завершена" in messages[0]
+    assert "Отправлено: <b>1</b>" in messages[0]
+    assert "Ошибок: <b>1</b>" in messages[0]
+
+    async with app.state.database.session_factory() as session:
+        stored = [await session.get(CampaignRun, run_id) for run_id in run_ids]
+    assert all(run is not None and run.notified_at is not None for run in stored)
+
+
 async def test_concurrent_notifiers_claim_one_terminal_run_once(app: FastAPI) -> None:
     async with app.state.database.session_factory() as session:
         account = Account(label="notify-lease", ownership_confirmed=True)

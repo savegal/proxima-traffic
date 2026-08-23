@@ -226,6 +226,98 @@ async def test_global_stop_preserves_running_reaction_lease_until_telegram_retur
     await app.state.database.dispose()
 
 
+async def test_campaign_delivery_stop_cancels_only_current_chat_publications_and_reactions(
+    app,
+) -> None:
+    """The campaigns-screen stop keeps its scope separate from the global emergency stop."""
+
+    async with app.state.database.session_factory() as session:
+        sender = Account(label="campaign-stop-sender", authorized=True, ownership_confirmed=True)
+        reactor = Account(label="campaign-stop-reactor", authorized=True, ownership_confirmed=True)
+        target = Target(chat_ref="@campaign_stop", title="Campaign stop")
+        session.add_all([sender, reactor, target])
+        await session.flush()
+        campaign = Campaign(
+            name="Campaign stop",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=sender.id,
+            target_id=target.id,
+            primary_text="Message",
+        )
+        session.add(campaign)
+        await session.flush()
+        queued_run = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            sender_account_id=sender.id,
+            request_key="campaign-stop-queued",
+            status=RunStatus.QUEUED,
+        )
+        running_run = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            sender_account_id=sender.id,
+            request_key="campaign-stop-running",
+            status=RunStatus.RUNNING,
+            lease_owner="worker",
+            lease_token="campaign-stop-token",
+            lease_until=utc_now() + timedelta(minutes=1),
+        )
+        session.add_all([queued_run, running_run])
+        await session.flush()
+        queued_reaction = ReactionTask(
+            campaign_id=campaign.id,
+            run_id=queued_run.id,
+            target_id=target.id,
+            source_account_id=sender.id,
+            reactor_account_id=reactor.id,
+            message_id=801,
+            emoji="👍",
+            scheduled_for=utc_now(),
+            status=ReactionTaskStatus.QUEUED,
+        )
+        running_reaction = ReactionTask(
+            campaign_id=campaign.id,
+            run_id=running_run.id,
+            target_id=target.id,
+            source_account_id=sender.id,
+            reactor_account_id=reactor.id,
+            message_id=802,
+            emoji="🔥",
+            scheduled_for=utc_now(),
+            status=ReactionTaskStatus.RUNNING,
+            lease_owner="reaction-worker",
+            lease_token="campaign-stop-reaction-token",
+            lease_until=utc_now() + timedelta(minutes=1),
+        )
+        session.add_all([queued_reaction, running_reaction])
+        await session.commit()
+
+    summary = await app.state.run_queue.cancel_all_campaign_deliveries()
+    assert summary.queued_runs == 1
+    assert summary.running_runs == 1
+    assert summary.queued_reactions == 1
+    assert summary.running_reactions == 1
+
+    async with app.state.database.session_factory() as session:
+        stored_queued_run = await session.get(CampaignRun, queued_run.id)
+        stored_running_run = await session.get(CampaignRun, running_run.id)
+        stored_queued_reaction = await session.get(ReactionTask, queued_reaction.id)
+        stored_running_reaction = await session.get(ReactionTask, running_reaction.id)
+        assert stored_queued_run is not None
+        assert stored_queued_run.status == RunStatus.CANCELLED
+        assert stored_queued_run.cancel_requested is True
+        assert stored_running_run is not None
+        assert stored_running_run.status == RunStatus.RUNNING
+        assert stored_running_run.cancel_requested is True
+        assert stored_queued_reaction is not None
+        assert stored_queued_reaction.status == ReactionTaskStatus.CANCELLED
+        assert stored_queued_reaction.cancel_requested is True
+        assert stored_running_reaction is not None
+        assert stored_running_reaction.status == ReactionTaskStatus.RUNNING
+        assert stored_running_reaction.cancel_requested is True
+
+
 async def test_global_stop_cancels_direct_messages_and_subscriber_invites(app) -> None:
     """The emergency stop must cover every delivery queue, not only chat posts."""
 

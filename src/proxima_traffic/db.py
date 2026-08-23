@@ -59,6 +59,21 @@ class Database:
         finally:
             lock.release()
 
+    async def migrate_to_head_if_needed(self) -> bool:
+        """Upgrade only a database that is not already ready for this checkout.
+
+        Alembic is still the authoritative path for a fresh or older database,
+        but repeatedly invoking it against a healthy production SQLite file
+        can hold the startup lock while it re-inspects a large schema.  The
+        readiness check already verifies the revision, required tables,
+        columns and seed rows, so it is safe to skip that no-op upgrade.
+        """
+
+        if await self.ready():
+            return False
+        await self.create_schema()
+        return True
+
     def _schema_lock_path(self) -> Path:
         sqlite_prefix = "sqlite+aiosqlite:///"
         if not self._url.startswith(sqlite_prefix):

@@ -23,6 +23,7 @@ from proxima_traffic.models import (
     AccountStatus,
     Campaign,
     Target,
+    TargetAccountState,
     TelegramDeliveryReceipt,
     utc_now,
 )
@@ -212,7 +213,13 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
         errors.ChatSendPlainForbiddenError(None), context="send"
     )
     assert isinstance(write_forbidden, PermanentGatewayError)
-    assert write_forbidden.code == "account_banned_in_chat"
+    assert write_forbidden.code == "account_send_forbidden"
+
+    folder_limit = gateway._map_rpc_error(
+        errors.RPCError(None, "CHATLISTS_TOO_MUCH", 400), context="join"
+    )
+    assert isinstance(folder_limit, PermanentGatewayError)
+    assert folder_limit.code == "account_chatlist_limit"
 
     admin_required = gateway._map_rpc_error(errors.ChatAdminRequiredError(None), context="send")
     assert isinstance(admin_required, PermanentGatewayError)
@@ -304,6 +311,10 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
     assert isinstance(premium_send, PermanentGatewayError)
     assert premium_send.code == "target_unavailable"
 
+    invalid_premium_emoji = gateway._map_rpc_error(errors.EmojiInvalidError(None), context="send")
+    assert isinstance(invalid_premium_emoji, PermanentGatewayError)
+    assert invalid_premium_emoji.code == "premium_emoji_unavailable"
+
     broadcast_reaction = gateway._map_rpc_error(
         errors.BroadcastForbiddenError(None),
         context="reaction",
@@ -341,7 +352,7 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
 
     lost_after_send = gateway._map_rpc_error(errors.ChannelPrivateError(None), context="verify")
     assert isinstance(lost_after_send, PermanentGatewayError)
-    assert lost_after_send.code == "account_banned_in_chat"
+    assert lost_after_send.code == "account_chat_access_lost"
 
     docs_forbidden = gateway._map_rpc_error(
         errors.RPCError(None, "CHAT_SEND_DOCS_FORBIDDEN", 403), context="send"
@@ -432,6 +443,45 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
     assert edit_window_expired.code == "comment_edit_unavailable"
 
 
+async def test_unresolvable_public_target_is_classified_as_unavailable(tmp_path) -> None:
+    class Client:
+        async def get_entity(self, target_ref: object) -> object:
+            assert target_ref == "@removed_public_chat"
+            raise ValueError("No user has @removed_public_chat as username")
+
+    gateway = _channel_gateway(_settings(tmp_path, "unavailable-target.db"))
+    gateway._entity_cache = {}
+
+    with pytest.raises(PermanentGatewayError) as exc_info:
+        await gateway._resolve_entity(Client(), 77, "@removed_public_chat")
+
+    assert exc_info.value.code == "target_unavailable"
+
+
+async def test_folder_preflight_normalizes_frozen_account_error(tmp_path) -> None:
+    """A folder RPC must not leak Telegram's opaque 420 code into pair reports."""
+
+    gateway = _gateway(_settings(tmp_path, "folder-frozen-account.db"))
+
+    async def resolve_folder(*args: object, **kwargs: object) -> tuple[object, bool]:
+        del args, kwargs
+        raise errors.FrozenMethodInvalidError(None)
+
+    gateway._resolve_folder_target = resolve_folder  # type: ignore[method-assign]
+    target = Target(
+        id=52,
+        chat_ref="@folder_chat",
+        title="Folder chat",
+        folder_slug="folder-slug",
+        telegram_peer_id=5200,
+    )
+
+    with pytest.raises(TemporaryGatewayError) as raised:
+        await gateway._resolve_preflight_entity(object(), 51, target)
+
+    assert raised.value.code == "account_restricted"
+
+
 @pytest.mark.asyncio
 async def test_direct_access_hash_resolution_still_loads_full_profile() -> None:
     class Client:
@@ -458,6 +508,41 @@ async def test_direct_access_hash_resolution_still_loads_full_profile() -> None:
     assert entity.user_id == 99001
     assert profile.username == "resolved_user"
     assert len(client.resolved) == 1
+
+
+@pytest.mark.asyncio
+async def test_invite_recipient_resolution_uses_determinate_invite_codes() -> None:
+    class UnknownClient:
+        async def get_input_entity(self, telegram_user_id: int) -> object:
+            del telegram_user_id
+            raise ValueError("unknown peer")
+
+    with pytest.raises(PermanentGatewayError) as unresolved:
+        await TelethonGateway._resolve_direct_recipient(
+            UnknownClient(),
+            DirectRecipient(telegram_user_id=99002),
+            for_invite=True,
+        )
+    assert unresolved.value.code == "invite_recipient_unresolvable"
+
+    class DeletedClient:
+        async def get_entity(self, username: str) -> object:
+            assert username == "gone_user"
+            return SimpleNamespace(
+                id=99003,
+                username=username,
+                bot=False,
+                deleted=True,
+                self=False,
+            )
+
+    with pytest.raises(PermanentGatewayError) as unavailable:
+        await TelethonGateway._resolve_direct_recipient(
+            DeletedClient(),
+            DirectRecipient(telegram_user_id=99003, username="gone_user"),
+            for_invite=True,
+        )
+    assert unavailable.value.code == "invite_recipient_unavailable"
 
 
 async def test_delivery_verification_detects_missing_message(tmp_path) -> None:
@@ -509,6 +594,21 @@ async def test_duplicate_recovery_uses_the_rendered_html_text(tmp_path) -> None:
     assert sent.message_id == 778
 
 
+async def test_telethon_parser_preserves_premium_emoji_entities(tmp_path) -> None:
+    gateway = _gateway(_settings(tmp_path, "premium-emoji-parser.db"))
+    emoji_id = 543210987654321
+
+    text, entities = await gateway._parse_html_message(
+        object(),
+        f'<b>Готово</b> <tg-emoji emoji-id="{emoji_id}">⭐</tg-emoji>',
+    )
+
+    assert text == "Готово ⭐"
+    custom = [entity for entity in entities if isinstance(entity, types.MessageEntityCustomEmoji)]
+    assert len(custom) == 1
+    assert custom[0].document_id == emoji_id
+
+
 async def test_duplicate_recovery_reuses_the_first_durable_attempt_time(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'durable-receipt.db'}")
     await database.create_schema()
@@ -555,24 +655,63 @@ async def test_channel_comment_send_keeps_its_error_context(tmp_path) -> None:
     assert raised.value.code == "comments_unavailable"
 
 
-async def test_typing_status_precedes_the_short_composition_pause(tmp_path, monkeypatch) -> None:
-    gateway = _gateway(_settings(tmp_path, "typing.db"))
+async def test_channel_comment_rejects_mismatched_formatted_text_before_network(tmp_path) -> None:
+    gateway = _gateway(_settings(tmp_path, "comment-formatted-mismatch.db"))
+
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway.send_channel_comment(
+            account=Account(id=91, label="commenter", ownership_confirmed=True),
+            channel_ref="@comment_channel",
+            channel_post_id=7,
+            text="Обычный текст",
+            html_text="Другой текст",
+            idempotency_key="comment-formatted-mismatch",
+        )
+
+    assert raised.value.code == "comment_invalid"
+
+
+async def test_typing_status_uses_the_visible_text_length(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path, "typing.db")
+    settings.account_typing_min_seconds = 0
+    settings.account_typing_max_seconds = 10
+    settings.account_typing_characters_per_second = 10
+    gateway = _gateway(settings)
     client = TypingClient()
     pauses: list[float] = []
 
     async def capture_pause(seconds: float) -> None:
         pauses.append(seconds)
 
-    monkeypatch.setattr("proxima_traffic.live_gateway.random.uniform", lambda _a, _b: 2.5)
     monkeypatch.setattr("proxima_traffic.live_gateway.asyncio.sleep", capture_pause)
 
-    await gateway._show_typing_before_send(client, types.InputPeerSelf())
+    await gateway._show_typing_before_send(client, types.InputPeerSelf(), text="x" * 25)
 
     assert len(client.requests) == 1
     request = client.requests[0]
     assert isinstance(request, functions.messages.SetTypingRequest)
     assert isinstance(request.action, types.SendMessageTypingAction)
     assert pauses == [2.5]
+
+
+async def test_typing_status_refreshes_for_long_visible_text(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path, "typing-long.db")
+    settings.account_typing_min_seconds = 0
+    settings.account_typing_max_seconds = 10
+    settings.account_typing_characters_per_second = 10
+    gateway = _gateway(settings)
+    client = TypingClient()
+    pauses: list[float] = []
+
+    async def capture_pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr("proxima_traffic.live_gateway.asyncio.sleep", capture_pause)
+
+    await gateway._show_typing_before_send(client, types.InputPeerSelf(), text="x" * 65)
+
+    assert len(client.requests) == 2
+    assert pauses == [4.0, 2.5]
 
 
 async def test_typing_status_can_be_disabled(tmp_path) -> None:
@@ -778,6 +917,38 @@ async def test_channel_comment_preflight_checks_discussion_and_send_rights(tmp_p
     assert checked_entities == [discussion_entity]
 
 
+async def test_channel_comment_preflight_allows_a_new_empty_channel(tmp_path) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "empty-comment-preflight.db"))
+    channel = SimpleNamespace(broadcast=True, title="Новый канал")
+
+    class EmptyPreflightClient:
+        async def iter_messages(self, entity: object, **kwargs: object):
+            assert entity is channel
+            assert kwargs == {"limit": 20}
+            if False:
+                yield None
+
+    async def ensure_client(account_id: int) -> EmptyPreflightClient:
+        assert account_id == 99
+        return EmptyPreflightClient()
+
+    async def resolve_entity(*args: object) -> object:
+        del args
+        return channel
+
+    gateway._ensure_client = ensure_client  # type: ignore[method-assign]
+    gateway._resolve_entity = resolve_entity  # type: ignore[method-assign]
+
+    result = await gateway.preflight_channel_comments(
+        account=Account(id=99, label="empty-channel", ownership_confirmed=True),
+        channel_ref="@empty_channel",
+    )
+
+    assert result.title == "Новый канал"
+    assert result.channel_post_id == 0
+    assert result.discussion_root_message_id == 0
+
+
 async def test_channel_comment_reaction_uses_the_linked_discussion_peer(
     tmp_path,
     monkeypatch,
@@ -794,6 +965,21 @@ async def test_channel_comment_reaction_uses_the_linked_discussion_peer(
         async def __call__(self, request: object) -> object:
             self.requests.append(request)
             return True
+
+        async def get_messages(self, entity: object, *, ids: int) -> object:
+            del entity
+            return SimpleNamespace(
+                id=ids,
+                reactions=SimpleNamespace(
+                    results=[
+                        SimpleNamespace(
+                            reaction=SimpleNamespace(emoticon="🔥"),
+                            chosen_order=0,
+                            count=1,
+                        )
+                    ]
+                ),
+            )
 
     client = ReactionClient()
 
@@ -838,6 +1024,137 @@ async def test_channel_comment_reaction_uses_the_linked_discussion_peer(
     assert request.peer == ("peer", discussion_entity)
     assert request.msg_id == 702
     assert request.reaction == [types.ReactionEmoji(emoticon="🔥")]
+
+
+async def test_reaction_uses_the_auto_join_route_when_enabled(tmp_path, monkeypatch) -> None:
+    gateway = _channel_gateway(
+        _settings(tmp_path, "reaction-auto-join.db").model_copy(update={"account_auto_join": True})
+    )
+    entity = object()
+    joined: list[tuple[int, int]] = []
+
+    class ReactionClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def __call__(self, request: object) -> object:
+            self.requests.append(request)
+            return True
+
+        async def get_messages(self, entity: object, *, ids: int) -> object:
+            del entity
+            return SimpleNamespace(
+                id=ids,
+                reactions=SimpleNamespace(
+                    results=[
+                        SimpleNamespace(
+                            reaction=SimpleNamespace(emoticon="🔥"),
+                            chosen_order=0,
+                            count=1,
+                        )
+                    ]
+                ),
+            )
+
+    client = ReactionClient()
+
+    async def ensure_client(account_id: int) -> ReactionClient:
+        assert account_id == 96
+        return client
+
+    async def join_and_resolve(_client: object, account_id: int, target: Target) -> object:
+        joined.append((account_id, int(target.id)))
+        return entity
+
+    gateway._ensure_client = ensure_client  # type: ignore[method-assign]
+    gateway._join_and_resolve = join_and_resolve  # type: ignore[method-assign]
+    monkeypatch.setattr("telethon.utils.get_input_peer", lambda value: ("peer", value))
+
+    await gateway.send_reaction(
+        account=Account(id=96, label="reactor", ownership_confirmed=True),
+        target=Target(id=97, chat_ref="@reaction_auto_join", title="Reaction auto join"),
+        message_id=703,
+        emoji="🔥",
+    )
+
+    assert joined == [(96, 97)]
+    assert len(client.requests) == 1
+    assert isinstance(client.requests[0], functions.messages.SendReactionRequest)
+
+
+async def test_reaction_is_retried_when_telegram_does_not_confirm_its_visibility(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    gateway = _channel_gateway(
+        _settings(tmp_path, "reaction-unconfirmed.db").model_copy(
+            update={"account_delivery_verify_confirm_delay_seconds": 0}
+        )
+    )
+    entity = object()
+
+    class UnconfirmedReactionClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def __call__(self, request: object) -> object:
+            self.requests.append(request)
+            return True
+
+        async def get_messages(self, resolved_entity: object, *, ids: int) -> object:
+            del resolved_entity
+            return SimpleNamespace(id=ids, reactions=SimpleNamespace(results=[]))
+
+    client = UnconfirmedReactionClient()
+
+    async def ensure_client(account_id: int) -> UnconfirmedReactionClient:
+        assert account_id == 96
+        return client
+
+    async def resolve_entity(*args: object) -> object:
+        del args
+        return entity
+
+    gateway._ensure_client = ensure_client  # type: ignore[method-assign]
+    gateway._resolve_entity = resolve_entity  # type: ignore[method-assign]
+    monkeypatch.setattr("telethon.utils.get_input_peer", lambda value: ("peer", value))
+
+    with pytest.raises(TemporaryGatewayError) as raised:
+        await gateway.send_reaction(
+            account=Account(id=96, label="reactor", ownership_confirmed=True),
+            target=Target(id=97, chat_ref="@reaction_check", title="Reaction check"),
+            message_id=704,
+            emoji="🔥",
+        )
+
+    assert raised.value.code == "reaction_delivery_unconfirmed"
+    assert len(client.requests) == 1
+
+
+async def test_reaction_uses_an_ordinary_fallback_only_after_telegram_rejects_the_choice(
+    tmp_path,
+) -> None:
+    gateway = _gateway(_settings(tmp_path, "reaction-fallback.db"))
+    attempts: list[str] = []
+
+    async def send_and_verify(
+        client: object,
+        entity: object,
+        message_id: int,
+        emoji: str,
+    ) -> None:
+        del client, entity
+        assert message_id == 705
+        attempts.append(emoji)
+        if emoji == "⚡":
+            raise PermanentGatewayError("reaction: BAD_REQUEST", code="reaction_unavailable")
+
+    gateway._send_and_verify_reaction = send_and_verify  # type: ignore[method-assign]
+
+    actual = await gateway._send_reaction_with_fallback(object(), object(), 705, "⚡")
+
+    assert actual == "👍"
+    assert attempts == ["⚡", "👍"]
 
 
 async def test_participant_scan_bootstrap_reads_only_the_current_newest_message(tmp_path) -> None:
@@ -1167,6 +1484,92 @@ async def test_membership_gate_joins_button_channels_and_clicks_verify_once(tmp_
     )
 
 
+async def test_membership_gate_joins_admin_bot_text_links_and_confirms(tmp_path) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "membership-gate-text-links.db"))
+    gate_message = SimpleNamespace(
+        id=778,
+        message=(
+            "Чтобы писать в чате, подпишитесь на каналы https://t.me/required_news и "
+            "@required_extra, затем нажмите «Я подписался»."
+        ),
+        sender=SimpleNamespace(bot=True),
+        reply_markup=types.ReplyInlineMarkup(
+            rows=[
+                types.KeyboardButtonRow(
+                    buttons=[types.KeyboardButtonCallback("Я подписался", b"membership-check")]
+                )
+            ]
+        ),
+    )
+    client = MembershipGateClient(gate_message)
+    target_entity = types.InputPeerSelf()
+    channel_entities = {
+        "@required_news": types.Channel(
+            123,
+            "Required news",
+            types.ChatPhotoEmpty(),
+            None,
+            access_hash=456,
+            username="required_news",
+        ),
+        "@required_extra": types.Channel(
+            124,
+            "Required extra",
+            types.ChatPhotoEmpty(),
+            None,
+            access_hash=457,
+            username="required_extra",
+        ),
+    }
+    joined_accounts: list[int] = []
+
+    async def ensure_client(account_id: int) -> MembershipGateClient:
+        assert account_id == 93
+        return client
+
+    async def resolve_entity(
+        resolved_client: object,
+        account_id: int,
+        chat_ref: str,
+    ) -> object:
+        assert resolved_client is client
+        assert account_id == 93
+        return target_entity if chat_ref == "@target_chat" else channel_entities[chat_ref]
+
+    async def enforce_join_limit(account_id: int) -> None:
+        assert account_id == 93
+
+    async def record_join(account_id: int) -> None:
+        joined_accounts.append(account_id)
+
+    gateway._ensure_client = ensure_client  # type: ignore[method-assign]
+    gateway._resolve_entity = resolve_entity  # type: ignore[method-assign]
+    gateway._enforce_join_limit = enforce_join_limit  # type: ignore[method-assign]
+    gateway._account_service = SimpleNamespace(record_join=record_join)
+    result = await gateway.recover_membership_gate(
+        account=Account(id=93, label="gate-account", ownership_confirmed=True),
+        target=Target(id=94, chat_ref="@target_chat", title="Gate target"),
+        deleted_message_id=777,
+    )
+
+    assert result.detected is True
+    assert result.recovered is True
+    assert result.joined_channel_refs == ("@required_news", "@required_extra")
+    assert result.verification_callback_count == 1
+    assert joined_accounts == [93, 93]
+    assert (
+        sum(
+            isinstance(request, functions.channels.JoinChannelRequest)
+            for request in client.requests
+        )
+        == 2
+    )
+    assert any(
+        isinstance(request, functions.messages.GetBotCallbackAnswerRequest)
+        for request in client.requests
+    )
+
+
 async def test_membership_gate_ignores_non_bot_and_mismatched_bot_replies(tmp_path) -> None:
     gateway = _channel_gateway(_settings(tmp_path, "membership-gate-source.db"))
     markup = types.ReplyInlineMarkup(
@@ -1240,6 +1643,42 @@ async def test_membership_gate_ignores_a_bot_that_is_not_a_chat_admin(tmp_path) 
 
     assert found_message is None
     assert gate is None
+
+
+async def test_membership_gate_prefers_the_admin_bot_reply_to_the_removed_post(tmp_path) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "membership-gate-priority.db"))
+    markup = types.ReplyInlineMarkup(
+        rows=[
+            types.KeyboardButtonRow(
+                buttons=[types.KeyboardButtonUrl("Канал", "https://t.me/required_news")]
+            )
+        ]
+    )
+    messages = [
+        SimpleNamespace(
+            id=778,
+            message="Подпишитесь на канал, чтобы писать.",
+            sender=SimpleNamespace(bot=True),
+            reply_markup=markup,
+        ),
+        SimpleNamespace(
+            id=779,
+            message="Подпишитесь на канал, чтобы писать.",
+            sender=SimpleNamespace(bot=True),
+            reply_to=SimpleNamespace(reply_to_msg_id=777),
+            reply_markup=markup,
+        ),
+    ]
+
+    message, gate = await gateway._find_membership_gate(  # noqa: SLF001 - priority policy test
+        object(),
+        types.InputPeerSelf(),
+        messages,
+        after_message_id=777,
+    )
+
+    assert message is messages[1]
+    assert gate is not None and gate.channel_refs == ("@required_news",)
 
 
 async def test_delayed_verification_prioritizes_removed_post_over_later_chat_ban(tmp_path) -> None:
@@ -1645,6 +2084,55 @@ async def test_album_uploads_media_before_send_multi_media(tmp_path, monkeypatch
     assert sent.message_id == 8001
 
 
+async def test_uncertain_album_never_adopts_an_unrelated_caption_match(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from telethon import utils
+
+    gateway = _gateway(_settings(tmp_path, "album-uncertain.db"))
+
+    class AlbumClient:
+        async def upload_file(self, path: str):
+            return types.InputFile(id=1, parts=1, name=path, md5_checksum="")
+
+        async def __call__(self, request: object):
+            if isinstance(request, functions.messages.UploadMediaRequest):
+                return object()
+            assert isinstance(request, functions.messages.SendMultiMediaRequest)
+            raise errors.RandomIdDuplicateError(None)
+
+        async def iter_messages(self, entity: object, *, limit: int):
+            del entity, limit
+            yield SimpleNamespace(
+                id=999,
+                message="same caption",
+                reply_to=None,
+                date=utc_now(),
+                out=True,
+            )
+
+    monkeypatch.setattr(
+        utils,
+        "get_input_media",
+        lambda _: types.InputMediaPhoto(
+            id=types.InputPhoto(id=1, access_hash=1, file_reference=b"ref")
+        ),
+    )
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._send_album(
+            AlbumClient(),
+            types.InputPeerSelf(),
+            "same caption",
+            None,
+            "album-uncertain",
+            html_text=None,
+            media_items=[("one.jpg", "photo"), ("two.jpg", "photo")],
+        )
+
+    assert raised.value.code == "delivery_unconfirmed"
+
+
 async def test_account_unauthorized_error_auto_disables_account(tmp_path) -> None:
     app = create_app(
         settings=_settings(tmp_path, "account-disabled.db"),
@@ -1706,6 +2194,37 @@ def test_live_sender_requires_complete_imported_session() -> None:
     )
     with pytest.raises(ConflictError, match="API credentials"):
         CampaignRunner._validate_sender(account, require_live_session=True)
+
+
+async def test_persisted_write_restriction_is_not_relabelled_as_chat_ban(tmp_path) -> None:
+    settings = _settings(tmp_path, "preserve-write-restriction.db")
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = TelethonGateway(database.session_factory, settings)
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="restricted-route-account")
+            target = Target(chat_ref="@restricted_route", title="Restricted route")
+            session.add_all([account, target])
+            await session.flush()
+            session.add(
+                TargetAccountState(
+                    account_id=account.id,
+                    target_id=target.id,
+                    send_blocked=True,
+                    blocked_reason="account_send_forbidden",
+                )
+            )
+            await session.commit()
+            account_id = int(account.id)
+            target_id = int(target.id)
+
+        with pytest.raises(PermanentGatewayError) as error:
+            await gateway._respect_known_chat_timer(account_id, target_id)  # noqa: SLF001
+        assert error.value.code == "account_send_forbidden"
+    finally:
+        await gateway.close()
+        await database.dispose()
 
 
 async def _create_campaign_with_authorized_account(app) -> tuple[int, int]:

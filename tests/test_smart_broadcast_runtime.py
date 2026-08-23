@@ -24,6 +24,7 @@ from proxima_traffic.gateways import (
     PermanentGatewayError,
     SentMessage,
     TargetReadiness,
+    TemporaryGatewayError,
 )
 from proxima_traffic.main import create_app
 from proxima_traffic.models import (
@@ -128,6 +129,39 @@ class AlwaysFailGateway(RecordingGateway):
         raise PermanentGatewayError("sender is unavailable", code=self.error_code)
 
 
+class StaleAutoJoinMembershipGateway(RecordingGateway):
+    """Simulate Telegram evicting a sender after a cached successful route."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cached_membership = True
+        self.invalidations = 0
+
+    async def send_message(self, **kwargs: object) -> SentMessage:
+        account_id = _sent_by(kwargs)
+        self.account_ids.append(account_id)
+        if self.cached_membership:
+            raise PermanentGatewayError(
+                "cached membership is no longer valid",
+                code="target_not_joined",
+            )
+        return SentMessage(message_id=20_000 + len(self.account_ids))
+
+    async def invalidate_target_membership(self, **kwargs: object) -> bool:
+        del kwargs
+        self.invalidations += 1
+        if not self.cached_membership:
+            return False
+        self.cached_membership = False
+        return True
+
+
+class ActiveWindowThrottleGateway(RecordingGateway):
+    async def send_message(self, **kwargs: object) -> SentMessage:
+        del kwargs
+        raise TemporaryGatewayError("slow mode 120s", retry_after=120, code="slow_mode")
+
+
 class ModerationDeletedGateway(RecordingGateway):
     async def send_message(self, **kwargs: object) -> SentMessage:
         account_id = _sent_by(kwargs)
@@ -203,6 +237,7 @@ async def _smart_campaign(
     *,
     gateway: object,
     duration_seconds: int = 3600,
+    repeat_forever: bool = False,
     no_timer_interval_seconds: int = 900,
     backup_senders: int = 0,
     unselected_senders: int = 0,
@@ -212,6 +247,8 @@ async def _smart_campaign(
     activity_check_interval_seconds: int = 300,
     visibility_max_wait_seconds: int = 3600,
     sender_mode: str = "distributed",
+    account_auto_join: bool = False,
+    account_daily_limit: int = 0,
 ) -> AsyncIterator[tuple[object, dict[str, object], list[dict[str, object]], dict[str, object]]]:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'smart-runtime.db'}",
@@ -220,8 +257,9 @@ async def _smart_campaign(
         worker_enabled=False,
         account_pace_min_seconds=0,
         account_pace_max_seconds=0,
-        account_daily_limit=0,
+        account_daily_limit=account_daily_limit,
         account_micro_break_every=0,
+        account_auto_join=account_auto_join,
     )
     app = create_app(settings=settings, gateway=gateway)
     await app.state.database.create_schema()
@@ -268,7 +306,8 @@ async def _smart_campaign(
                     "repeat_count": 1,
                     "repeat_interval_seconds": 0,
                     "smart_timer_mode": True,
-                    "smart_duration_seconds": duration_seconds,
+                    "repeat_forever": repeat_forever,
+                    "smart_duration_seconds": 0 if repeat_forever else duration_seconds,
                     "smart_no_timer_interval_seconds": no_timer_interval_seconds,
                     "auto_sender_failover": auto_sender_failover,
                     "sender_mode": sender_mode,
@@ -335,6 +374,103 @@ async def test_independent_accounts_wait_while_managed_post_is_last_in_chat(
         assert second is not None and second.status == RunStatus.SUCCEEDED
         assert len(gateway.account_ids) == 2
         assert gateway.account_ids[0] != gateway.account_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_auto_join_recovers_one_stale_cached_membership_without_blocking_route(
+    tmp_path: Path,
+) -> None:
+    gateway = StaleAutoJoinMembershipGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        account_auto_join=True,
+    ) as (app, campaign, accounts, target):
+        runs = await _launch_runs(app, int(campaign["id"]), "stale-auto-join-route")
+
+        deferred = await app.state.queue_worker.process_next()
+        assert deferred is not None
+        assert deferred.id == runs[0].id
+        assert deferred.status is RunStatus.QUEUED
+        assert deferred.error_code == "target_not_joined"
+        assert deferred.attempt_count == 0
+        assert gateway.invalidations == 1
+
+        async with app.state.database.session_factory() as session:
+            stored = await session.get(CampaignRun, deferred.id)
+            assert stored is not None
+            stored.scheduled_for = utc_now()
+            await session.commit()
+
+        completed = await app.state.queue_worker.process_next()
+        assert completed is not None and completed.status is RunStatus.SUCCEEDED
+        async with app.state.database.session_factory() as session:
+            state = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.account_id == int(accounts[0]["id"]),
+                    TargetAccountState.target_id == int(target["id"]),
+                )
+            )
+            assert state is not None
+            assert state.membership_status is MembershipStatus.MEMBER
+            assert state.can_send is True
+            assert state.membership_error_code is None
+            assert state.send_blocked is False
+
+
+@pytest.mark.asyncio
+async def test_active_run_is_cancelled_immediately_when_a_throttle_exceeds_its_window(
+    tmp_path: Path,
+) -> None:
+    gateway = ActiveWindowThrottleGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        duration_seconds=60,
+    ) as (app, campaign, _, _):
+        runs = await _launch_runs(app, int(campaign["id"]), "active-window-throttle")
+
+        result = await app.state.queue_worker.process_next()
+
+        assert result is not None
+        assert result.id == runs[0].id
+        assert result.status is RunStatus.CANCELLED
+        assert result.error_code == "repeat_window_elapsed"
+        stored = await _stored_launch_runs(app, "active-window-throttle")
+        assert len(stored) == 1
+        assert not any(run.status is RunStatus.QUEUED for run in stored)
+
+
+@pytest.mark.asyncio
+async def test_active_launch_rejects_when_daily_capacity_starts_after_its_window(
+    tmp_path: Path,
+) -> None:
+    gateway = RecordingGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        duration_seconds=60,
+        account_daily_limit=1,
+    ) as (app, campaign, accounts, _):
+        async with app.state.database.session_factory() as session:
+            account = await session.get(Account, int(accounts[0]["id"]))
+            assert account is not None
+            account.day_window_start = utc_now()
+            account.sent_today = 1
+            await session.commit()
+
+        with pytest.raises(ConflictError, match="активная рассылка не может стартовать"):
+            await _launch_runs(app, int(campaign["id"]), "active-window-no-capacity")
+
+        async with app.state.database.session_factory() as session:
+            stored = list(
+                await session.scalars(
+                    select(CampaignRun).where(
+                        CampaignRun.launch_key == "active-window-no-capacity"
+                    )
+                )
+            )
+            assert stored == []
 
 
 @pytest.mark.asyncio
@@ -806,6 +942,53 @@ async def test_activity_aware_repeat_waits_until_post_is_buried(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_strict_visibility_never_uses_a_timer_before_the_message_threshold(
+    tmp_path: Path,
+) -> None:
+    gateway = ActivityGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        activity_aware=True,
+        min_messages_between_posts=10,
+        activity_check_interval_seconds=30,
+        visibility_max_wait_seconds=0,
+    ) as (app, campaign, _, _):
+        await _launch_runs(app, int(campaign["id"]), "strict-visibility-launch")
+        first = await app.state.queue_worker.process_next()
+        assert first is not None and first.status == RunStatus.SUCCEEDED
+        assert first.primary_message_id is not None
+
+        async with app.state.database.session_factory() as session:
+            successor = await session.scalar(
+                select(CampaignRun).where(
+                    CampaignRun.launch_key == "strict-visibility-launch",
+                    CampaignRun.cycle_index == 1,
+                )
+            )
+            assert successor is not None
+            successor.scheduled_for = utc_now()
+            await session.commit()
+
+        gateway.latest_message_id = int(first.primary_message_id) + 9
+        deferred = await app.state.queue_worker.process_next()
+        assert deferred is not None and deferred.status == RunStatus.QUEUED
+        assert deferred.error_code == "visibility_wait"
+        assert len(gateway.account_ids) == 1
+
+        async with app.state.database.session_factory() as session:
+            stored = await session.get(CampaignRun, deferred.id)
+            assert stored is not None
+            stored.scheduled_for = utc_now()
+            await session.commit()
+
+        gateway.latest_message_id = int(first.primary_message_id) + 10
+        second = await app.state.queue_worker.process_next()
+        assert second is not None and second.status == RunStatus.SUCCEEDED
+        assert len(gateway.account_ids) == 2
+
+
+@pytest.mark.asyncio
 async def test_idle_chat_guard_is_not_bypassed_by_visibility_deadline(
     tmp_path: Path,
 ) -> None:
@@ -1180,6 +1363,36 @@ async def test_smart_broadcast_keeps_only_one_queued_successor_per_chat(
 
 
 @pytest.mark.asyncio
+async def test_indefinite_smart_broadcast_keeps_a_single_cancellable_successor(
+    tmp_path: Path,
+) -> None:
+    gateway = RecordingGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        repeat_forever=True,
+        no_timer_interval_seconds=60,
+    ) as (app, campaign, _, _):
+        initial = await _launch_runs(app, int(campaign["id"]), "forever-launch")
+        assert initial[0].repeat_forever_snapshot is True
+        assert initial[0].repeat_until is None
+
+        completed = await app.state.queue_worker.process_next()
+        assert completed is not None and completed.status == RunStatus.SUCCEEDED
+        stored = await _stored_launch_runs(app, "forever-launch")
+        assert len(stored) == 2
+        successor = next(run for run in stored if run.status == RunStatus.QUEUED)
+        assert successor.repeat_forever_snapshot is True
+        assert successor.repeat_until is None
+
+        cancelled = await app.state.run_queue.cancel_launch(initial[0].id)
+        assert cancelled == 1
+        assert await app.state.queue_worker.process_next() is None
+        stored = await _stored_launch_runs(app, "forever-launch")
+        assert [run.status for run in stored].count(RunStatus.QUEUED) == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_code",
     [
@@ -1272,7 +1485,7 @@ async def test_blocked_account_route_is_remembered_and_skipped_by_future_launche
 
 
 @pytest.mark.asyncio
-async def test_all_remembered_chat_bans_create_clear_terminal_task(
+async def test_active_launch_with_all_remembered_chat_bans_is_rejected_before_enqueue(
     tmp_path: Path,
 ) -> None:
     gateway = RecordingGateway()
@@ -1295,16 +1508,49 @@ async def test_all_remembered_chat_bans_create_clear_terminal_task(
             )
             await session.commit()
 
-        runs = await _launch_runs(app, int(campaign["id"]), "all-chat-bans")
-        assert len(runs) == 1
-        assert runs[0].status == RunStatus.FAILED
-        assert runs[0].error_code == "all_senders_blocked"
-        assert runs[0].sender_account_id is None
+        with pytest.raises(ConflictError, match="активная рассылка не может стартовать"):
+            await _launch_runs(app, int(campaign["id"]), "all-chat-bans")
         assert await app.state.queue_worker.process_next() is None
 
 
 @pytest.mark.asyncio
-async def test_active_smart_launch_text_frequency_and_deadline_are_editable(
+async def test_smart_failover_does_not_probe_a_known_unready_backup(tmp_path: Path) -> None:
+    gateway = FailFirstGateway("account_dead")
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        backup_senders=1,
+        auto_sender_failover=True,
+    ) as (app, campaign, accounts, target):
+        primary_id = int(accounts[0]["id"])
+        backup_id = int(accounts[1]["id"])
+        async with app.state.database.session_factory() as session:
+            state = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.target_id == int(target["id"]),
+                    TargetAccountState.account_id == backup_id,
+                )
+            )
+            if state is None:
+                state = TargetAccountState(
+                    target_id=int(target["id"]),
+                    account_id=backup_id,
+                )
+                session.add(state)
+            state.membership_status = MembershipStatus.NOT_MEMBER
+            state.can_send = False
+            state.membership_checked_at = utc_now()
+            await session.commit()
+
+        await _launch_runs(app, int(campaign["id"]), "known-unready-failover")
+        result = await app.state.queue_worker.process_next()
+
+        assert result is not None and result.status == RunStatus.FAILED
+        assert gateway.account_ids == [primary_id]
+
+
+@pytest.mark.asyncio
+async def test_active_smart_launch_text_frequency_depth_and_deadline_are_editable(
     tmp_path: Path,
 ) -> None:
     gateway = RecordingGateway()
@@ -1323,6 +1569,8 @@ async def test_active_smart_launch_text_frequency_and_deadline_are_editable(
             completed.id,
             primary_text="Updated advertisement",
             no_timer_interval_seconds=60,
+            min_messages_between_posts=12,
+            visibility_max_wait_seconds=0,
             remaining_duration_seconds=7200,
         )
         assert updated == 1
@@ -1331,6 +1579,8 @@ async def test_active_smart_launch_text_frequency_and_deadline_are_editable(
         successor = next(run for run in stored if run.status == RunStatus.QUEUED)
         assert successor.primary_text_snapshot == "Updated advertisement"
         assert successor.no_timer_interval_seconds_snapshot == 60
+        assert successor.min_messages_between_posts_snapshot == 12
+        assert successor.visibility_max_wait_seconds_snapshot == 0
         assert ensure_utc(successor.scheduled_for) == ensure_utc(completed.finished_at) + timedelta(
             seconds=60
         )

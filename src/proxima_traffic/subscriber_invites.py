@@ -25,8 +25,14 @@ from proxima_traffic.config import Settings
 from proxima_traffic.direct_messages import (
     DIRECT_MESSAGE_MAX_RECIPIENTS,
     IMPORT_BATCH_SIZE,
+    DirectMessageService,
 )
-from proxima_traffic.failure_policy import ACCOUNT_WIDE_CODES, failure_code, failure_label
+from proxima_traffic.failure_policy import (
+    ACCOUNT_FATAL_CODES,
+    ACCOUNT_WIDE_CODES,
+    failure_code,
+    failure_label,
+)
 from proxima_traffic.gateways import (
     DirectRecipient,
     GatewayError,
@@ -98,7 +104,8 @@ def normalize_invite_destination_ref(value: str) -> tuple[str, str]:
     if not normalized or len(normalized) > 255 or any(ord(item) < 32 for item in normalized):
         raise ValueError("укажите ссылку или @username канала/супергруппы")
     public_match = re.fullmatch(
-        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,})/?",
+        r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:s/)?"
+        r"([A-Za-z0-9_]{5,})(?:/\d+)?/?(?:[?#].*)?",
         normalized,
         flags=re.IGNORECASE,
     )
@@ -110,8 +117,16 @@ def normalize_invite_destination_ref(value: str) -> tuple[str, str]:
         return normalized, normalized.casefold()
     # Private targets can be used only when every selected sender is already
     # an administrator. The actual Telegram preflight remains authoritative.
-    if re.fullmatch(r"https?://t\.me/(?:joinchat/|\+)[A-Za-z0-9_-]+/?", normalized, re.I):
-        return normalized, normalized.casefold().rstrip("/")
+    private_match = re.fullmatch(
+        r"https?://(?:www\.)?(?:t\.me|telegram\.me)/(?:joinchat/|\+)"
+        r"([A-Za-z0-9_-]+)/?(?:[?#].*)?",
+        normalized,
+        re.IGNORECASE,
+    )
+    if private_match:
+        invite_hash = private_match.group(1)
+        canonical = f"https://t.me/+{invite_hash}"
+        return canonical, canonical.casefold()
     raise ValueError("используйте @username или приватную ссылку t.me/+…")
 
 
@@ -143,6 +158,8 @@ class SubscriberInviteLaunchView:
     last_error_status: DirectMessageTaskStatus | None = None
     last_error_account_label: str | None = None
     last_error_recipient: str | None = None
+    issues: tuple[tuple[DirectMessageTaskStatus, str, int], ...] = ()
+    next_scheduled_for: datetime | None = None
 
     @property
     def active(self) -> int:
@@ -621,6 +638,41 @@ class SubscriberInviteService:
                 .limit(1)
             )
         ).first()
+        issue_rows = list(
+            (
+                await session.execute(
+                    select(
+                        SubscriberInviteTask.status,
+                        SubscriberInviteTask.error_code,
+                        func.count(SubscriberInviteTask.id),
+                    )
+                    .where(
+                        SubscriberInviteTask.launch_id == launch.id,
+                        SubscriberInviteTask.status.in_(
+                            (
+                                DirectMessageTaskStatus.QUEUED,
+                                DirectMessageTaskStatus.FAILED,
+                                DirectMessageTaskStatus.SKIPPED,
+                            )
+                        ),
+                        SubscriberInviteTask.error_code.is_not(None),
+                    )
+                    .group_by(SubscriberInviteTask.status, SubscriberInviteTask.error_code)
+                    .order_by(
+                        func.count(SubscriberInviteTask.id).desc(),
+                        SubscriberInviteTask.status,
+                        SubscriberInviteTask.error_code,
+                    )
+                    .limit(3)
+                )
+            ).all()
+        )
+        next_scheduled_for = await session.scalar(
+            select(func.min(SubscriberInviteTask.scheduled_for)).where(
+                SubscriberInviteTask.launch_id == launch.id,
+                SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+            )
+        )
         return SubscriberInviteLaunchView(
             launch=launch,
             campaign_name=str(campaign_name or f"Приглашение #{launch.campaign_id}"),
@@ -657,6 +709,16 @@ class SubscriberInviteService:
                     else None
                 )
             ),
+            issues=tuple(
+                (
+                    DirectMessageTaskStatus(row.status),
+                    str(row.error_code),
+                    int(row[2]),
+                )
+                for row in issue_rows
+                if row.error_code
+            ),
+            next_scheduled_for=ensure_utc(next_scheduled_for),
         )
 
     async def cancel_launch(self, launch_id: int) -> int:
@@ -1100,6 +1162,31 @@ class SubscriberInviteService:
             await self._runner.handle_external_account_failure(account_id, exc)
         if code in INVITE_GLOBAL_DESTINATION_CODES:
             return await self._fail_launch_for_destination(task_id, token, code, message)
+        if code in ACCOUNT_FATAL_CODES:
+            launch_id, all_selected_admins_blocked = await self._block_launch_account(
+                task_id,
+                token,
+                account_id=account_id,
+                code=code,
+                error=message,
+            )
+            if all_selected_admins_blocked:
+                return await self._fail_launch_for_destination(task_id, token, code, message)
+            logger.warning(
+                "Subscriber invite sender %s was removed from launch %s after fatal %s",
+                account_id,
+                launch_id,
+                code,
+            )
+            return await self._reschedule_task(
+                task_id,
+                token,
+                scheduled_for=utc_now(),
+                error_code=code,
+                error=message,
+                increment_attempt=False,
+                sender_account_id=account_id,
+            )
         if code in INVITE_LAUNCH_ACCOUNT_DESTINATION_CODES:
             launch_id, all_selected_admins_blocked = await self._block_launch_account(
                 task_id,
@@ -1169,7 +1256,14 @@ class SubscriberInviteService:
         async with self._session_factory() as session:
             task = await self._require_task(session, task_id, token)
             next_attempt = task.attempt_count + 1
-        if code in INVITE_ROUTE_CODES | ACCOUNT_WIDE_CODES | {"flood_wait"}:
+        if code in INVITE_ROUTE_CODES | ACCOUNT_WIDE_CODES | {
+            "flood_wait",
+            # These originate before InviteToChannelRequest: one process owns
+            # the Telegram account, or no usable proxy route was established.
+            # They therefore cannot mean the recipient was already invited.
+            "account_operation_busy",
+            "proxy_unavailable",
+        }:
             if next_attempt >= task.max_attempts:
                 return await self._finish_task(
                     task_id,
@@ -1367,10 +1461,18 @@ class SubscriberInviteService:
             subscriber.last_error_code = None
             subscriber.last_error = None
             if delivery.username:
+                profile_changed = subscriber.username != delivery.username
                 subscriber.username = delivery.username
+            else:
+                profile_changed = False
             if delivery.is_premium is not None:
+                profile_changed = profile_changed or subscriber.is_premium != delivery.is_premium
                 subscriber.is_premium = delivery.is_premium
                 subscriber.premium_checked_at = now
+            if profile_changed:
+                await DirectMessageService._refresh_list_counts_for_subscribers(
+                    session, {subscriber_id}
+                )
             statement = sqlite_insert(SubscriberInviteAccountRoute).values(
                 subscriber_id=subscriber_id,
                 account_id=account_id,
@@ -1426,6 +1528,10 @@ class SubscriberInviteService:
                 task.sender_account_id = sender_account_id
             task.error_code = error_code
             task.error = error[:500]
+            # A retry is scheduled only after a determinate local/Telegram
+            # result. The non-idempotent RPC boundary belongs to the previous
+            # attempt and must not poison a later crash as an unknown delivery.
+            task.delivery_attempted_at = None
             self._release_task_lease(task)
             await session.commit()
             await session.refresh(task)

@@ -77,8 +77,9 @@ class Settings(BaseSettings):
     account_pace_min_seconds: float = 0.0
     account_pace_max_seconds: float = 0.0
     account_typing_enabled: bool = True
-    account_typing_min_seconds: float = 2.0
-    account_typing_max_seconds: float = 4.0
+    account_typing_min_seconds: float = 1.0
+    account_typing_max_seconds: float = 6.0
+    account_typing_characters_per_second: float = 18.0
     account_auto_join: bool = False
     account_daily_limit: int = 200
     account_micro_break_every: int = 0
@@ -103,14 +104,20 @@ class Settings(BaseSettings):
     media_max_bytes: int = 50 * 1024 * 1024
     preflight_required_live: bool = True
     preflight_max_age_seconds: int = 3600
+    preflight_max_pairs: int = 5000
+    preflight_account_concurrency: int = 4
     dry_run: bool = True
     live_execution_armed: bool = False
     auto_create_schema: bool = True
     log_level: str = "INFO"
     worker_enabled: bool = True
+    worker_campaign_ids: str = ""
     api_worker_enabled: bool = False
     worker_poll_seconds: float = 1.0
-    worker_lease_seconds: int = 30
+    # Telegram joins and permission checks can legitimately take longer than
+    # one short network round-trip. Keep the lease above that window; the
+    # heartbeat still releases a stopped worker promptly on the next renewal.
+    worker_lease_seconds: int = 120
     worker_heartbeat_seconds: float = 5.0
     worker_step_timeout_seconds: float = 120.0
     worker_readiness_max_stale_seconds: float = 300.0
@@ -156,6 +163,33 @@ class Settings(BaseSettings):
                 raise ValueError("PROXIMA_BOT_ADMIN_IDS must contain positive Telegram IDs")
             values.add(parsed)
         return frozenset(values)
+
+    @property
+    def worker_campaign_id_scope(self) -> frozenset[int] | None:
+        """Optional campaign-only scope for an operator-controlled worker restart.
+
+        An empty value preserves normal behaviour and lets the worker process
+        every enabled campaign. A comma-separated list supports a one-off
+        recovery without changing campaign data or touching the rest of queue.
+        """
+
+        values: set[int] = set()
+        for raw_value in self.worker_campaign_ids.split(","):
+            value = raw_value.strip()
+            if not value:
+                continue
+            try:
+                parsed = int(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "PROXIMA_WORKER_CAMPAIGN_IDS must contain numeric campaign IDs"
+                ) from exc
+            if parsed <= 0:
+                raise ValueError(
+                    "PROXIMA_WORKER_CAMPAIGN_IDS must contain positive campaign IDs"
+                )
+            values.add(parsed)
+        return frozenset(values) or None
 
     def require_control_bot(self) -> tuple[str, frozenset[int]]:
         token = self.bot_token.get_secret_value().strip() if self.bot_token else ""
@@ -301,6 +335,10 @@ class Settings(BaseSettings):
             )
         if self.account_typing_max_seconds > 15:
             raise ValueError("PROXIMA_ACCOUNT_TYPING_MAX_SECONDS must not exceed 15")
+        if not 1 <= self.account_typing_characters_per_second <= 60:
+            raise ValueError(
+                "PROXIMA_ACCOUNT_TYPING_CHARACTERS_PER_SECOND must be between 1 and 60"
+            )
         if self.account_daily_limit < 0:
             raise ValueError("PROXIMA_ACCOUNT_DAILY_LIMIT must not be negative")
         if self.account_micro_break_every < 0:
@@ -316,6 +354,15 @@ class Settings(BaseSettings):
             raise ValueError("PROXIMA_ACCOUNT_JOIN_DAILY_LIMIT must not be negative")
         if self.account_join_min_interval_seconds < 0:
             raise ValueError("PROXIMA_ACCOUNT_JOIN_MIN_INTERVAL_SECONDS must not be negative")
+        if self.account_auto_join and not self.dry_run:
+            if self.account_join_daily_limit <= 0:
+                raise ValueError(
+                    "LIVE auto-join requires PROXIMA_ACCOUNT_JOIN_DAILY_LIMIT above zero"
+                )
+            if self.account_join_min_interval_seconds <= 0:
+                raise ValueError(
+                    "LIVE auto-join requires PROXIMA_ACCOUNT_JOIN_MIN_INTERVAL_SECONDS above zero"
+                )
         if self.flood_buffer_multiplier < 1:
             raise ValueError("PROXIMA_FLOOD_BUFFER_MULTIPLIER must be >= 1")
         if self.flood_escalation_threshold < 1:
@@ -340,6 +387,12 @@ class Settings(BaseSettings):
             raise ValueError("PROXIMA_MEDIA_MAX_BYTES must be positive")
         if self.preflight_max_age_seconds < 60:
             raise ValueError("PROXIMA_PREFLIGHT_MAX_AGE_SECONDS must be at least 60")
+        if not 1 <= self.preflight_max_pairs <= 5000:
+            raise ValueError("PROXIMA_PREFLIGHT_MAX_PAIRS must be between 1 and 5000")
+        if not 1 <= self.preflight_account_concurrency <= 16:
+            raise ValueError("PROXIMA_PREFLIGHT_ACCOUNT_CONCURRENCY must be between 1 and 16")
+        # Parse at startup so a typo cannot silently enable an unscoped recovery.
+        _ = self.worker_campaign_id_scope
         if self.worker_poll_seconds <= 0:
             raise ValueError("PROXIMA_WORKER_POLL_SECONDS must be positive")
         if self.worker_lease_seconds < 5:

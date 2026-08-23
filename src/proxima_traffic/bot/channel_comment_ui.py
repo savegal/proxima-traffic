@@ -679,6 +679,9 @@ def channel_comment_runs_text(
         error_details = ""
         if run.error_code:
             error_details = f"\nПричина: <b>{escape(failure_label(run.error_code))}</b>"
+            hint = failure_hint(run.error_code)
+            if hint:
+                error_details += f"\n💡 {escape(hint)}"
             if run.error and run.error_code not in _RUN_CODES_WITHOUT_RAW_DETAILS:
                 error_details += f"\n<code>{escape(run.error[:250])}</code>"
         elif run.error:

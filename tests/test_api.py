@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from sqlalchemy import text
 
@@ -91,6 +92,20 @@ async def test_worker_diagnostics_detect_a_stopped_background_worker(
     body = response.json()
     assert body["healthy"] is False
     assert body["background_workers"] == {"reactions": False}
+
+
+async def test_target_api_does_not_require_a_manual_chat_alias(
+    client: httpx.AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    response = await client.post(
+        "/api/v1/targets",
+        headers=admin_headers,
+        json={"chat_ref": "@telegram_named_api_target"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["title"] == "@telegram_named_api_target"
 
 
 async def test_two_account_reply_workflow_is_approved_logged_and_idempotent(
@@ -765,6 +780,46 @@ async def test_broadcast_api_launches_target_list_across_24h_sender_pool(
     assert deltas[0] == 0
     assert 43199 <= deltas[1] <= 43201
     assert 86399 <= deltas[2] <= 86401
+
+
+async def test_api_can_explicitly_schedule_a_preflight_ready_campaign_after_cooldown(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def enqueue_after_cooldown(
+        campaign_id: int,
+        request_key: str,
+        *,
+        allow_deferred_start: bool = False,
+    ) -> list[CampaignRun]:
+        captured.update(
+            campaign_id=campaign_id,
+            request_key=request_key,
+            allow_deferred_start=allow_deferred_start,
+        )
+        return []
+
+    monkeypatch.setattr(app.state.run_queue, "enqueue_campaign", enqueue_after_cooldown)
+
+    response = await client.post(
+        "/api/v1/campaigns/73/runs",
+        headers=admin_headers,
+        json={
+            "request_key": "schedule-after-cooldown",
+            "allow_deferred_start": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert captured == {
+        "campaign_id": 73,
+        "request_key": "schedule-after-cooldown",
+        "allow_deferred_start": True,
+    }
 
 
 async def test_broadcast_campaign_patch_replaces_sender_pool(

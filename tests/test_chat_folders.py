@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
-from telethon import functions, types, utils
+from telethon import errors, functions, types, utils
 
 from proxima_traffic.accounts import AccountService
 from proxima_traffic.config import Settings
@@ -228,6 +228,51 @@ async def test_folder_target_joins_only_selected_group(tmp_path) -> None:
     ]
     assert len(join_requests) == 1
     assert len(join_requests[0].peers) == 1
+    assert accounting.limit_checks == 1
+    assert accounting.recorded == 1
+
+
+async def test_public_folder_target_joins_directly_without_consuming_folder_slots(tmp_path) -> None:
+    group = _channel(
+        305,
+        "Public folder group",
+        megagroup=True,
+        username="public_folder_group",
+        left=True,
+    )
+    requests: list[object] = []
+
+    class PublicFolderClient:
+        async def get_entity(self, reference: object) -> object:
+            assert reference == "@public_folder_group"
+            return group
+
+        async def __call__(self, request: object) -> object:
+            requests.append(request)
+            if isinstance(request, functions.channels.GetParticipantRequest):
+                raise errors.UserNotParticipantError(None)
+            if isinstance(request, functions.channels.JoinChannelRequest):
+                return SimpleNamespace(chats=[group])
+            raise AssertionError(type(request).__name__)
+
+    accounting = _JoinAccounting(wait_seconds=0)
+    gateway = _gateway(tmp_path, accounting)
+    target = Target(
+        id=5,
+        chat_ref="@public_folder_group",
+        title="Public folder group",
+        chat_type="supergroup",
+        folder_slug="FolderToken",
+        telegram_peer_id=utils.get_peer_id(group),
+    )
+
+    resolved = await gateway._join_and_resolve(PublicFolderClient(), 9, target)
+
+    assert resolved is group
+    assert any(isinstance(item, functions.channels.JoinChannelRequest) for item in requests)
+    assert not any(
+        isinstance(item, functions.chatlists.JoinChatlistInviteRequest) for item in requests
+    )
     assert accounting.limit_checks == 1
     assert accounting.recorded == 1
 

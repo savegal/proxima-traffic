@@ -438,6 +438,43 @@ async def test_reimport_restores_preserved_account_card_and_disabled_card_cannot
     assert restored.authorized is True and restored.is_premium is False
 
 
+async def test_telegram_protective_pause_cannot_be_manually_bypassed(app: FastAPI) -> None:
+    repository = AdminRepository(app.state.database.session_factory)
+    paused = await _account(
+        repository,
+        "restricted pause",
+        7311,
+        ready=True,
+        status=AccountStatus.PAUSED,
+    )
+    disabled = await _account(
+        repository,
+        "revoked access",
+        7312,
+        ready=True,
+        status=AccountStatus.DISABLED,
+    )
+    async with repository._session_factory() as session:  # type: ignore[attr-defined]
+        stored_paused = await session.get(Account, paused.id)
+        stored_disabled = await session.get(Account, disabled.id)
+        assert stored_paused is not None and stored_disabled is not None
+        stored_paused.cooldown_reason = "spambot_temp_ban"
+        stored_disabled.authorized = False
+        stored_disabled.cooldown_reason = "account_dead"
+        await session.commit()
+
+    with pytest.raises(ConflictError, match="защитная пауза"):
+        await repository.toggle_account(paused.id)
+    with pytest.raises(ConflictError, match="доступ Telegram"):
+        await repository.toggle_account(disabled.id)
+
+    async with repository._session_factory() as session:  # type: ignore[attr-defined]
+        stored_paused = await session.get(Account, paused.id)
+        stored_disabled = await session.get(Account, disabled.id)
+    assert stored_paused is not None and stored_paused.status is AccountStatus.PAUSED
+    assert stored_disabled is not None and stored_disabled.status is AccountStatus.DISABLED
+
+
 async def test_system_premium_group_sync_is_safe_when_called_concurrently(app: FastAPI) -> None:
     """Startup and profile refreshes may reconcile the same system group together."""
 

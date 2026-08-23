@@ -26,6 +26,7 @@ from proxima_traffic.gateways import (
 from proxima_traffic.models import (
     Account,
     AccountStatus,
+    BroadcastSenderMode,
     Campaign,
     CampaignAccount,
     CampaignMode,
@@ -38,6 +39,7 @@ from proxima_traffic.models import (
     ReactionTaskStatus,
     Target,
     TargetAccountState,
+    ensure_utc,
     utc_now,
 )
 from proxima_traffic.services import (
@@ -66,12 +68,16 @@ class ReactionWorker:
         settings: Settings,
         *,
         worker_id: str,
+        campaign_id_scope: frozenset[int] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._gateway = gateway
         self._runner = runner
         self._settings = settings
         self._worker_id = worker_id
+        self._campaign_id_scope = (
+            frozenset(campaign_id_scope) if campaign_id_scope is not None else None
+        )
         self._stop_event = asyncio.Event()
 
     def stop(self) -> None:
@@ -140,14 +146,15 @@ class ReactionWorker:
         """Return work left RUNNING by a process restart back to the durable queue."""
         now = utc_now()
         async with self._session_factory() as session:
+            expired_filters = [
+                ReactionTask.status == ReactionTaskStatus.RUNNING,
+                ReactionTask.lease_until.is_not(None),
+                ReactionTask.lease_until < now,
+            ]
+            if self._campaign_id_scope is not None:
+                expired_filters.append(ReactionTask.campaign_id.in_(self._campaign_id_scope))
             expired = list(
-                await session.scalars(
-                    select(ReactionTask).where(
-                        ReactionTask.status == ReactionTaskStatus.RUNNING,
-                        ReactionTask.lease_until.is_not(None),
-                        ReactionTask.lease_until < now,
-                    )
-                )
+                await session.scalars(select(ReactionTask).where(*expired_filters))
             )
             for task in expired:
                 task.error = "reaction worker lease expired"
@@ -184,13 +191,16 @@ class ReactionWorker:
     async def _claim_next(self) -> tuple[int, str] | None:
         now = utc_now()
         async with self._session_factory() as session:
+            candidate_filters = [
+                ReactionTask.status == ReactionTaskStatus.QUEUED,
+                ReactionTask.scheduled_for <= now,
+                ReactionTask.cancel_requested.is_(False),
+            ]
+            if self._campaign_id_scope is not None:
+                candidate_filters.append(ReactionTask.campaign_id.in_(self._campaign_id_scope))
             task = await session.scalar(
                 select(ReactionTask)
-                .where(
-                    ReactionTask.status == ReactionTaskStatus.QUEUED,
-                    ReactionTask.scheduled_for <= now,
-                    ReactionTask.cancel_requested.is_(False),
-                )
+                .where(*candidate_filters)
                 .order_by(ReactionTask.scheduled_for, ReactionTask.id)
                 .limit(1)
             )
@@ -203,6 +213,11 @@ class ReactionWorker:
                     ReactionTask.id == task.id,
                     ReactionTask.status == ReactionTaskStatus.QUEUED,
                     ReactionTask.cancel_requested.is_(False),
+                    *(
+                        [ReactionTask.campaign_id.in_(self._campaign_id_scope)]
+                        if self._campaign_id_scope is not None
+                        else []
+                    ),
                 )
                 .values(
                     status=ReactionTaskStatus.RUNNING,
@@ -336,7 +351,7 @@ class ReactionWorker:
                         TargetAccountState.target_id == target.id,
                     )
                 )
-                if self._route_is_blocked(route_state):
+                if not self._route_is_ready(route_state):
                     needs_failover = True
                 else:
                     resume_at = self._runner.account_resume_at(account)
@@ -360,11 +375,11 @@ class ReactionWorker:
             await self._defer(task_id, token, resume_at, "account_pacing")
             return
 
-        async def deliver() -> None:
+        async def deliver() -> str | None:
             await self._record_delivery_attempt(task_id, token)
             if is_comment:
                 assert comment_run is not None and comment_rule is not None
-                await self._gateway.send_channel_comment_reaction(
+                delivered_emoji = await self._gateway.send_channel_comment_reaction(
                     account=account,
                     channel_ref=comment_rule.channel_ref,
                     channel_post_id=int(comment_run.source_post_id),
@@ -373,7 +388,7 @@ class ReactionWorker:
                 )
             else:
                 assert target is not None
-                await self._gateway.send_reaction(
+                delivered_emoji = await self._gateway.send_reaction(
                     account=account,
                     target=target,
                     message_id=task.message_id,
@@ -385,9 +400,10 @@ class ReactionWorker:
                     f"comment-reaction:{task.id}" if is_comment else f"campaign-reaction:{task.id}"
                 ),
             )
+            return delivered_emoji
 
         try:
-            await self._runner.run_account_send_operation(
+            delivered_emoji = await self._runner.run_account_send_operation(
                 account.id,
                 deliver,
             )
@@ -433,7 +449,15 @@ class ReactionWorker:
                 target_failure_recorded=target_failure_recorded,
             )
             return
-        await self._finish(task_id, token, ReactionTaskStatus.SUCCEEDED, None, None)
+        actual_emoji = delivered_emoji if isinstance(delivered_emoji, str) else task.emoji
+        await self._finish(
+            task_id,
+            token,
+            ReactionTaskStatus.SUCCEEDED,
+            None,
+            None,
+            actual_emoji=actual_emoji,
+        )
 
     async def _record_delivery_attempt(self, task_id: int, token: str) -> None:
         """Count only a real Telegram delivery attempt, never local deferrals."""
@@ -545,6 +569,14 @@ class ReactionWorker:
                     candidate_ids = [
                         int(step.account_id) for step in self._runner._dialogue_steps(run, campaign)
                     ]
+                elif run.sender_mode_snapshot == BroadcastSenderMode.INDEPENDENT:
+                    candidate_ids = list(
+                        await session.scalars(
+                            select(CampaignAccount.account_id)
+                            .where(CampaignAccount.campaign_id == campaign.id)
+                            .order_by(CampaignAccount.id)
+                        )
+                    )
                 elif run.sender_pool_snapshot_json:
                     try:
                         candidate_ids = [
@@ -617,7 +649,12 @@ class ReactionWorker:
                 if account_id in accounts_by_id
                 and self._account_is_active(accounts_by_id[account_id])
                 and account_id not in blocked_ids
-                and not self._route_is_blocked(states_by_account.get(account_id))
+                # Comment reactors are live-preflighted when the operator
+                # enables or changes their pool. They have no Target row—the
+                # destination is the discussion peer behind this channel post.
+                # Applying the ordinary campaign TargetAccountState gate here
+                # therefore made every live failover impossible.
+                and (is_comment or self._route_is_ready(states_by_account.get(account_id)))
             ]
             if not eligible:
                 return False
@@ -707,22 +744,27 @@ class ReactionWorker:
             and account.ownership_confirmed
         )
 
-    @staticmethod
-    def _route_is_blocked(state: TargetAccountState | None) -> bool:
-        if state is None:
+    def _route_is_ready(self, state: TargetAccountState | None) -> bool:
+        """Require a recent usable route, including a configured auto-join route."""
+
+        if self._settings.dry_run:
+            return state is None or not state.send_blocked
+        if state is None or state.send_blocked:
             return False
+        checked_at = ensure_utc(state.membership_checked_at)
+        if checked_at is None:
+            return False
+        maximum_age = timedelta(
+            seconds=max(1, int(self._settings.preflight_max_age_seconds))
+        )
+        if checked_at < utc_now() - maximum_age:
+            return False
+        if state.membership_status == MembershipStatus.MEMBER:
+            return state.can_send is True
         return bool(
-            state.send_blocked
-            or (
-                state.membership_checked_at is not None
-                and state.membership_status
-                in {
-                    MembershipStatus.BANNED,
-                    MembershipStatus.JOIN_PENDING,
-                    MembershipStatus.NOT_MEMBER,
-                    MembershipStatus.UNAVAILABLE,
-                }
-            )
+            self._settings.account_auto_join
+            and state.membership_status == MembershipStatus.NOT_MEMBER
+            and state.membership_error_code == "target_not_joined"
         )
 
     async def _defer(self, task_id: int, token: str, scheduled_for, reason: str) -> None:
@@ -748,9 +790,12 @@ class ReactionWorker:
         status: ReactionTaskStatus,
         error: str | None,
         code: str | None,
+        *,
+        actual_emoji: str | None = None,
     ) -> None:
         async with self._session_factory() as session:
             task = await self._require_running(session, task_id, token)
+            requested_emoji = task.emoji
             if task.cancel_requested:
                 if status == ReactionTaskStatus.SUCCEEDED:
                     error = "reaction completed while cancellation was being requested"
@@ -759,6 +804,8 @@ class ReactionWorker:
                     status = ReactionTaskStatus.CANCELLED
                     error = error or "cancel requested before reaction completed"
                     code = "cancelled_before_send"
+            if status == ReactionTaskStatus.SUCCEEDED and actual_emoji is not None:
+                task.emoji = actual_emoji
             task.status = status
             task.error = error
             task.error_code = code
@@ -774,6 +821,8 @@ class ReactionWorker:
                     "channel_comment_run_id": task.channel_comment_run_id,
                     "message_id": task.message_id,
                     "emoji": task.emoji,
+                    "requested_emoji": requested_emoji,
+                    "fallback_used": task.emoji != requested_emoji,
                     "error_code": code,
                 },
                 actor="reaction-worker",

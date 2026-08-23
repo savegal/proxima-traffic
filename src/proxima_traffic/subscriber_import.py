@@ -111,7 +111,9 @@ def iter_subscriber_records(
             if not raw_line:
                 import_stats.blank += 1
                 continue
-            if import_stats.total_lines == 1:
+            # Every ZIP member is an independent UTF-8 JSONL export and may
+            # carry its own BOM; using the global line count rejects member 2.
+            if line_number == 1:
                 raw_line = raw_line.removeprefix(b"\xef\xbb\xbf")
             try:
                 decoded = raw_line.decode("utf-8", errors="strict")

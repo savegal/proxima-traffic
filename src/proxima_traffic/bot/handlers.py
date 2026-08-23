@@ -100,6 +100,9 @@ from proxima_traffic.bot.keyboards import (
     account_bulk_avatar_result_menu,
     account_bulk_avatar_upload_menu,
     account_bulk_check_menu,
+    account_bulk_cleanup_confirmation,
+    account_bulk_cleanup_result_menu,
+    account_bulk_spambot_menu,
     account_delete_blocked_menu,
     account_delete_confirmation,
     account_details_menu,
@@ -127,6 +130,7 @@ from proxima_traffic.bot.keyboards import (
     bad_targets_menu,
     campaign_advanced_menu,
     campaign_audience_source_menu,
+    campaign_checked_target_picker,
     campaign_confirmation,
     campaign_content_edit_cancel,
     campaign_delete_confirmation,
@@ -136,16 +140,19 @@ from proxima_traffic.bot.keyboards import (
     campaign_mention_cooldown_menu,
     campaign_mode_picker,
     campaign_one_off_window_presets,
+    campaign_pause_confirmation,
     campaign_reactions_menu,
     campaign_repeat_count_presets,
     campaign_repeat_interval_presets,
     campaign_repeat_mode_picker,
     campaign_run_confirmation,
     campaign_schedule_mode_picker,
+    campaign_sender_mode_menu,
     campaign_sender_picker,
     campaign_smart_duration_presets,
     campaign_smart_interval_presets,
     campaign_standalone_target_picker,
+    campaign_stop_all_confirmation,
     campaign_target_list_picker,
     campaign_target_picker,
     campaign_variant_delete_confirmation,
@@ -169,8 +176,12 @@ from proxima_traffic.bot.keyboards import (
     order_back_menu,
     order_draft_menu,
     order_duration_presets,
+    order_engagement_menu,
     order_interval_presets,
     order_launch_confirmation,
+    order_mention_cooldown_menu,
+    order_schedule_mode_menu,
+    order_sender_mode_menu,
     order_sender_picker,
     order_spread_presets,
     order_target_list_activation_menu,
@@ -224,7 +235,11 @@ from proxima_traffic.bot.participant_reaction_ui import (
 )
 from proxima_traffic.bot.renderers import (
     account_avatar_text,
+    account_bulk_check_progress_text,
     account_bulk_check_text,
+    account_bulk_cleanup_text,
+    account_bulk_spambot_progress_text,
+    account_bulk_spambot_text,
     account_details_text,
     account_generated_names_preview_text,
     account_name_catalog_text,
@@ -239,9 +254,10 @@ from proxima_traffic.bot.renderers import (
     campaign_confirmation_text,
     campaign_details_text,
     campaign_launch_not_ready_text,
+    campaign_launch_review_text,
+    campaign_preflight_progress_text,
     campaign_preflight_text,
     campaign_reactions_text,
-    campaign_run_confirmation_text,
     campaign_variant_text,
     campaign_variants_text,
     campaigns_text,
@@ -252,6 +268,7 @@ from proxima_traffic.bot.renderers import (
     launches_text,
     order_advanced_text,
     order_draft_text,
+    order_schedule_mode_text,
     order_type_text,
     proxies_text,
     proxy_details_text,
@@ -354,6 +371,7 @@ from proxima_traffic.content import (
     resolve_media_path,
     store_media,
     validate_spintax,
+    validate_telegram_text,
 )
 from proxima_traffic.dialogues import DialogueStep, parse_dialogue_steps
 from proxima_traffic.direct_messages import (
@@ -371,7 +389,6 @@ from proxima_traffic.models import (
     BroadcastSenderMode,
     Campaign,
     CampaignMode,
-    CampaignRun,
     ChannelCommentMode,
     SubscriberSegment,
     utc_now,
@@ -388,13 +405,14 @@ from proxima_traffic.proxies import (
     ProxyFilter,
     ProxyInputError,
     ProxyNetworkRoute,
+    ProxySecretCipher,
     ProxyService,
     ProxyView,
     parse_proxy,
     validate_rotation_url,
 )
-from proxima_traffic.scheduling import broadcast_profile, estimate_capacity
-from proxima_traffic.services import ConflictError, NotFoundError, RunQueue
+from proxima_traffic.scheduling import CapacityEstimate, broadcast_profile, estimate_capacity
+from proxima_traffic.services import TARGET_QUALITY_BAD, ConflictError, NotFoundError, RunQueue
 from proxima_traffic.spambot import SpamBotStatus
 from proxima_traffic.spambot_checks import SpamBotCheckService
 from proxima_traffic.subscriber_import import (
@@ -421,6 +439,13 @@ AUDIENCE_PAGE_SIZE = 10
 TARGET_LIST_CHAT_PAGE_SIZE = 10
 DIRECT_MESSAGE_PAGE_SIZE = 7
 DIRECT_MESSAGE_PICKER_PAGE_SIZE = 7
+
+# A preflight can take a while for a large, legitimate audience.  Telegram can
+# deliver two taps on the same inline button before the first callback has
+# edited its message, so serialize the create → preflight transition per
+# operator.  This protects against duplicate campaign drafts without blocking
+# other administrators or existing campaign launches.
+_order_launch_locks: dict[int, asyncio.Lock] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +480,7 @@ def _dashboard(
         dry_run=settings.dry_run,
         require_proxy=settings.account_require_proxy,
         worker_health=worker_supervisor.snapshots(),
+        worker_campaign_scope=settings.worker_campaign_id_scope,
     )
 
 
@@ -1232,7 +1258,8 @@ async def channel_comment_name(message: Message, state: FSMContext) -> None:
     await state.set_state(ChannelCommentCreateState.channel)
     await message.answer(
         "<b>2 / 5 · Каналы</b>\n\n"
-        "Пришли публичные ссылки или @username каналов — по одному в строке.\n"
+        "Пришлите UTF-8 <code>.txt</code> или публичные ссылки / @username каналов "
+        "по одному в строке.\n"
         "Одинаковая настройка будет создана для каждого канала; сервис будет "
         "отслеживать только новые посты после включения.",
         reply_markup=cancel_menu(),
@@ -1245,10 +1272,32 @@ async def channel_comment_channel(
     state: FSMContext,
     repository: AdminRepository,
     settings: Settings,
+    bot: Bot,
 ) -> None:
-    values = [part.strip() for part in re.split(r"[\n,;]+", message.text or "") if part.strip()]
+    content = message.text or ""
+    document = message.document
+    if document is not None:
+        if not (document.file_name or "").lower().endswith(".txt"):
+            await message.answer(
+                "Нужен UTF-8 документ <code>.txt</code> или текстовый список каналов."
+            )
+            return
+        if document.file_size is not None and document.file_size > 1_048_576:
+            await message.answer("Файл больше 1 МБ.")
+            return
+        buffer = BytesIO()
+        await bot.download(document, destination=buffer)
+        try:
+            content = buffer.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await message.answer("Файл должен быть сохранён в UTF-8.")
+            return
+    values = _parse_channel_comment_refs(content)
     if not values:
-        await message.answer("Нужна хотя бы одна публичная ссылка на канал или @username.")
+        await message.answer(
+            "Нужна хотя бы одна публичная ссылка на канал или @username. "
+            "Приватные invite-ссылки для автокомментариев не подходят."
+        )
         return
     if len(values) > 25:
         await message.answer("За один раз можно настроить не больше 25 каналов.")
@@ -1268,6 +1317,16 @@ async def channel_comment_channel(
             pager_callback_prefix="comments:picker:primary",
         ),
     )
+
+
+def _parse_channel_comment_refs(content: str) -> list[str]:
+    """Read a pasted or TXT-imported channel batch without treating notes as links."""
+
+    return [
+        part.strip()
+        for part in re.split(r"[\n,;]+", content)
+        if part.strip() and not part.lstrip().startswith("#")
+    ]
 
 
 @router.callback_query(
@@ -1337,12 +1396,13 @@ async def channel_comment_primary_text(
     mode = ChannelCommentMode(str(data.get("comment_mode", "single")))
     if mode != ChannelCommentMode.MESSAGE_EDIT:
         try:
-            text, _html_text, media = await _extract_broadcast_content(message, bot, settings)
+            text, html_text, media = await _extract_broadcast_content(message, bot, settings)
         except ContentError as exc:
             await message.answer(escape(operator_error_message(exc)))
             return
         await state.update_data(
             primary_text=text,
+            primary_html=html_text,
             primary_media_path=media.path if media else None,
             primary_media_kind=media.kind if media else None,
             primary_media_name=media.name if media else None,
@@ -1360,6 +1420,7 @@ async def channel_comment_primary_text(
         first_step = {
             "account_id": int(data["primary_account_id"]),
             "text": text,
+            "html_text": html_text,
             "delay_seconds": 0,
             "reply_to_previous": False,
             "media_path": media.path if media else None,
@@ -1377,11 +1438,17 @@ async def channel_comment_primary_text(
         return
 
     text = (message.text or "").strip()
-    if not 1 <= len(text) <= 4096:
-        await message.answer("Текст должен быть от 1 до 4096 символов.")
+    html_text = message.html_text
+    try:
+        validate_telegram_text(text, html_text)
+    except ContentError as exc:
+        await message.answer(escape(operator_error_message(exc)))
         return
     if mode == ChannelCommentMode.MESSAGE_EDIT:
-        await state.update_data(message_edit_initial_text=text)
+        await state.update_data(
+            message_edit_initial_text=text,
+            message_edit_initial_html=html_text,
+        )
         await state.set_state(ChannelCommentCreateState.message_edit_final_text)
         await message.answer(
             "<b>5 / 6 · Текст после редактирования</b>\n\n"
@@ -1395,10 +1462,13 @@ async def channel_comment_primary_text(
 @router.message(ChannelCommentCreateState.message_edit_final_text)
 async def channel_comment_message_edit_final_text(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if not 1 <= len(text) <= 4096:
-        await message.answer("Текст должен быть от 1 до 4096 символов.")
+    html_text = message.html_text
+    try:
+        validate_telegram_text(text, html_text)
+    except ContentError as exc:
+        await message.answer(escape(operator_error_message(exc)))
         return
-    await state.update_data(primary_text=text)
+    await state.update_data(primary_text=text, primary_html=html_text)
     await state.set_state(ChannelCommentCreateState.message_edit_delay)
     await message.answer(
         "<b>6 / 6 · Задержка редактирования</b>\n\n"
@@ -1467,10 +1537,12 @@ async def begin_order_draft(
         order_require_authorized_session=not settings.dry_run,
         order_mode=mode,
         order_name=(f"Рассылка {short_id}" if mode == "broadcast" else f"Диалог {short_id}"),
+        order_selection_key=short_id,
         sender_account_ids=([account.id for account in accounts] if mode == "broadcast" else []),
         dialogue_steps=[],
         target_id=None,
         target_list_id=None,
+        order_selected_target_ids=[],
         primary_text="",
         primary_html=None,
         primary_media_path=None,
@@ -1478,16 +1550,25 @@ async def begin_order_draft(
         primary_media_name=None,
         primary_media_size=None,
         broadcast_profile="active",
-        smart_timer_mode=False,
+        # The order flow is the primary creation path. Its copy and controls
+        # say that an active broadcast is the default, so initialise the
+        # stored draft accordingly instead of silently creating a one-off run.
+        smart_timer_mode=mode == "broadcast",
+        repeat_forever=False,
         smart_duration_hours=default_profile.duration_hours,
         smart_no_timer_interval_minutes=default_profile.interval_minutes,
-        activity_aware=False,
+        activity_aware=mode == "broadcast",
         min_messages_between_posts=default_profile.min_messages_between_posts,
         activity_check_interval_seconds=default_profile.activity_check_interval_seconds,
         visibility_max_wait_seconds=default_profile.visibility_max_wait_seconds,
         auto_sender_failover=mode == "broadcast",
         sender_mode=(BroadcastSenderMode.DISTRIBUTED.value if mode == "broadcast" else None),
         spread_hours=0,
+        reactions_enabled=False,
+        reaction_count=0,
+        reaction_emoji="👍",
+        hidden_mentions_enabled=False,
+        mention_cooldown_days=30,
     )
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
@@ -1506,6 +1587,65 @@ async def _show_order_draft(
         order_draft_text(view),
         order_draft_menu(view),
         answer=answer,
+    )
+
+
+async def _inspect_campaign_with_visible_progress(
+    callback: CallbackQuery,
+    preflight_service: PreflightService,
+    campaign_id: int,
+) -> CampaignPreflightSummary:
+    """Run one read-only preflight and keep the operator's screen alive.
+
+    All launch entry points share the same bounded renderer.  The service
+    emits progress for every checked account/chat pair, but Telegram messages
+    are updated only at the start, end and roughly ten evenly spaced points.
+    This makes long checks visible without turning the control bot itself into
+    a source of rate-limit errors.
+    """
+
+    await _safe_callback_answer(callback, "Проверяю готовность чатов и аккаунтов…")
+    last_visible = -1
+    progress_lock = asyncio.Lock()
+
+    async def show_preflight_progress(
+        checked_pairs: int,
+        total_pairs: int,
+        checked_accounts: int,
+        total_accounts: int,
+    ) -> None:
+        nonlocal last_visible
+        update_every = max(1, ceil(total_pairs / 10)) if total_pairs else 1
+        if checked_pairs not in {0, total_pairs} and checked_pairs - last_visible < update_every:
+            return
+        async with progress_lock:
+            if (
+                checked_pairs != total_pairs
+                and checked_pairs != 0
+                and checked_pairs - last_visible < update_every
+            ):
+                return
+            last_visible = checked_pairs
+            try:
+                await _edit_callback(
+                    callback,
+                    campaign_preflight_progress_text(
+                        checked_pairs=checked_pairs,
+                        total_pairs=total_pairs,
+                        checked_accounts=checked_accounts,
+                        total_accounts=total_accounts,
+                    ),
+                    None,
+                    answer=False,
+                )
+            except TelegramAPIError:
+                # The read-only check is still valid if Telegram no longer
+                # lets us redraw this particular control-panel message.
+                logger.warning("Unable to render campaign preflight progress", exc_info=True)
+
+    return await preflight_service.inspect_campaign(
+        campaign_id,
+        on_progress=show_preflight_progress,
     )
 
 
@@ -1530,7 +1670,27 @@ async def _build_order_draft_view(
 
     view["audience_label"] = None
     view["audience_target_count"] = 0
-    if data.get("target_id") is not None:
+    selected_target_ids = {
+        int(target_id)
+        for target_id in data.get("order_selected_target_ids", [])
+        if str(target_id).isdigit() and int(target_id) > 0
+    }
+    if selected_target_ids:
+        targets = await repository.targets_by_ids(selected_target_ids)
+        available_ids = {
+            int(target.id)
+            for target in targets.values()
+            if target.is_standalone
+            and target.approved_by_operator
+            and target.quality_status != TARGET_QUALITY_BAD
+        }
+        if available_ids != selected_target_ids:
+            await state.update_data(order_selected_target_ids=sorted(available_ids))
+            view["order_selected_target_ids"] = sorted(available_ids)
+        if available_ids:
+            view["audience_label"] = f"Подборка · {len(available_ids)} чатов"
+            view["audience_target_count"] = len(available_ids)
+    elif data.get("target_id") is not None:
         try:
             target = await repository.get_target(int(data["target_id"]))
             if not target.approved_by_operator or not target.is_standalone:
@@ -1552,6 +1712,8 @@ async def _build_order_draft_view(
         except NotFoundError:
             await state.update_data(target_list_id=None)
             view["target_list_id"] = None
+    if data.get("audience_target_count") != view["audience_target_count"]:
+        await state.update_data(audience_target_count=view["audience_target_count"])
     return view
 
 
@@ -1592,7 +1754,11 @@ async def cancel_order_draft(
 async def explain_incomplete_order(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     missing: list[str] = []
-    if data.get("target_id") is None and data.get("target_list_id") is None:
+    if (
+        data.get("target_id") is None
+        and data.get("target_list_id") is None
+        and not data.get("order_selected_target_ids")
+    ):
         missing.append("аудитория")
     if data.get("order_mode") == "broadcast":
         if not data.get("sender_account_ids"):
@@ -1705,14 +1871,195 @@ async def _show_order_draft_from_message(
     )
 
 
-@router.callback_query(OrderDraftState.action, F.data == "order:schedule:toggle")
-async def toggle_order_schedule(
+def _order_engagement_text(data: dict[str, object]) -> str:
+    """Explain optional actions in the same place where they are configured."""
+
+    reactions_enabled = bool(data.get("reactions_enabled", False))
+    reaction_count = int(data.get("reaction_count") or 0)
+    reaction_emoji = escape(str(data.get("reaction_emoji") or "👍"))
+    mentions_enabled = bool(data.get("hidden_mentions_enabled", False))
+    cooldown_days = int(data.get("mention_cooldown_days") or 30)
+    sender_count = len(data.get("sender_account_ids", []))
+    reaction_state = (
+        f"<b>включены</b> · {reaction_emoji} × {reaction_count}"
+        if reactions_enabled and reaction_count
+        else "<b>выключены</b>"
+    )
+    mention_state = (
+        f"<b>включены</b> · без повтора {cooldown_days} дн. в каждом чате"
+        if mentions_enabled
+        else f"<b>выключены</b> · срок ротации {cooldown_days} дн."
+    )
+    warning = (
+        "\n\n⚠️ <b>Для реакций нужны минимум два выбранных отправителя.</b> "
+        "Автор публикации не может реагировать на собственный пост."
+        if reactions_enabled and sender_count < 2
+        else ""
+    )
+    return (
+        "<b>✨ Реакции и отметки</b>\n"
+        "<i>Необязательные действия для будущих публикаций этой рассылки.</i>\n\n"
+        f"👍 Реакции: {reaction_state}\n"
+        f"🔔 Отметки участников: {mention_state}\n\n"
+        "Реакции ставят другие выбранные аккаунты после публикации и не задерживают сам пост. "
+        "Отметки выбирают 5–10 подходящих участников скрыто; стоп-лист всегда исключается."
+        + warning
+    )
+
+
+@router.callback_query(F.data == "order:engagement")
+async def open_order_engagement(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("order_draft_active"):
+        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        return
+    await state.set_state(OrderDraftState.engagement)
+    await _edit_callback(
+        callback,
+        _order_engagement_text(data),
+        order_engagement_menu(data),
+    )
+
+
+@router.callback_query(
+    OrderDraftState.engagement,
+    F.data.regexp(r"^order:engagement:(reactions:toggle|emoji:[a-z]+|count:\d+|mentions:toggle)$"),
+)
+async def update_order_engagement(callback: CallbackQuery, state: FSMContext) -> None:
+    action = (callback.data or "").removeprefix("order:engagement:")
+    data = await state.get_data()
+    changes: dict[str, object]
+    if action == "reactions:toggle":
+        enabled = not bool(data.get("reactions_enabled", False))
+        changes = {
+            "reactions_enabled": enabled,
+            "reaction_count": max(1, int(data.get("reaction_count") or 0)) if enabled else 0,
+        }
+    elif action.startswith("emoji:"):
+        emojis = {"like": "👍", "fire": "🔥", "heart": "❤️", "bolt": "⚡"}
+        key = action.rsplit(":", 1)[1]
+        if key not in emojis:
+            await callback.answer("Неизвестная реакция", show_alert=True)
+            return
+        changes = {"reaction_emoji": emojis[key]}
+    elif action.startswith("count:"):
+        count = int(action.rsplit(":", 1)[1])
+        if not 1 <= count <= 10:
+            await callback.answer("Можно выбрать от 1 до 10 реакций", show_alert=True)
+            return
+        changes = {"reaction_count": count, "reactions_enabled": True}
+    elif action == "mentions:toggle":
+        changes = {"hidden_mentions_enabled": not bool(data.get("hidden_mentions_enabled", False))}
+    else:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    await state.update_data(**changes)
+    updated = await state.get_data()
+    await callback.answer("Настройка сохранена")
+    await _edit_callback(
+        callback,
+        _order_engagement_text(updated),
+        order_engagement_menu(updated),
+        answer=False,
+    )
+
+
+@router.callback_query(OrderDraftState.engagement, F.data == "order:engagement:mentions:cooldown")
+async def begin_order_mention_cooldown(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await _edit_callback(
+        callback,
+        "<b>🔄 Срок ротации отметок</b>\n\n"
+        "Участник не будет выбран повторно в том же чате в течение указанного срока. "
+        "Выберите готовый вариант или введите число от <b>1</b> до <b>365</b> дней.",
+        order_mention_cooldown_menu(int(data.get("mention_cooldown_days") or 30)),
+    )
+
+
+@router.callback_query(
+    OrderDraftState.engagement,
+    F.data.regexp(r"^order:engagement:mentions:days:\d+$"),
+)
+async def set_order_mention_cooldown_preset(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    days = int((callback.data or "").rsplit(":", 1)[1])
+    await state.update_data(mention_cooldown_days=days)
+    data = await state.get_data()
+    await callback.answer("Срок ротации сохранён")
+    await _edit_callback(
+        callback,
+        _order_engagement_text(data),
+        order_engagement_menu(data),
+        answer=False,
+    )
+
+
+@router.callback_query(OrderDraftState.engagement, F.data == "order:engagement:mentions:custom")
+async def begin_custom_order_mention_cooldown(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await state.set_state(OrderDraftState.mention_cooldown_days)
+    await _edit_callback(
+        callback,
+        "<b>🔄 Срок ротации отметок</b>\n\nОтправьте целое число дней от <b>1</b> до <b>365</b>.",
+        order_back_menu(),
+    )
+
+
+@router.message(OrderDraftState.mention_cooldown_days)
+async def save_custom_order_mention_cooldown(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    try:
+        days = int((message.text or "").strip())
+    except ValueError:
+        days = 0
+    if not 1 <= days <= 365:
+        await message.answer("Введите целое число дней от 1 до 365.")
+        return
+    await state.update_data(mention_cooldown_days=days)
+    await state.set_state(OrderDraftState.engagement)
+    data = await state.get_data()
+    await _edit_origin(
+        bot,
+        state,
+        _order_engagement_text(data),
+        order_engagement_menu(data),
+    )
+
+
+@router.callback_query(OrderDraftState.action, F.data == "order:schedule:choose")
+async def choose_order_schedule_mode(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    data = await state.get_data()
+    await callback.answer()
+    await _edit_callback(
+        callback,
+        order_schedule_mode_text(data),
+        order_schedule_mode_menu(data),
+        answer=False,
+    )
+
+
+@router.callback_query(OrderDraftState.action, F.data.startswith("order:schedule:set:"))
+async def set_order_schedule_mode(
     callback: CallbackQuery,
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
+    selected = (callback.data or "").rsplit(":", 1)[-1]
+    if selected not in {"once", "active"}:
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
+    smart = selected == "active"
     data = await state.get_data()
-    smart = not bool(data.get("smart_timer_mode", False))
     is_broadcast = data.get("order_mode") == "broadcast"
     distributed = (
         str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
@@ -1720,32 +2067,88 @@ async def toggle_order_schedule(
     )
     await state.update_data(
         smart_timer_mode=smart,
+        repeat_forever=False if not smart else bool(data.get("repeat_forever", False)),
         activity_aware=smart,
         auto_sender_failover=(
             bool(data.get("auto_sender_failover", True)) if is_broadcast and distributed else False
         ),
     )
+    await callback.answer(
+        "Активная рассылка включена" if smart else "Выбран один проход",
+    )
     await _show_order_draft(callback, state, repository)
 
 
-@router.callback_query(OrderDraftState.action, F.data == "order:sendermode:toggle")
-async def toggle_order_sender_mode(
+@router.callback_query(OrderDraftState.action, F.data == "order:schedule:toggle")
+async def redirect_legacy_order_schedule_toggle(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Keep cached keyboards usable, but never change the mode without an explanation."""
+
+    await choose_order_schedule_mode(callback, state)
+
+
+@router.callback_query(OrderDraftState.action, F.data == "order:sendermode:choose")
+async def choose_order_sender_mode(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    data = await state.get_data()
+    current = str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
+    sender_count = len(data.get("sender_account_ids", []))
+    selected_target_ids = {
+        int(target_id)
+        for target_id in data.get("order_selected_target_ids", [])
+        if str(target_id).isdigit() and int(target_id) > 0
+    }
+    target_count = len(selected_target_ids)
+    if not target_count:
+        target_count = int(data.get("audience_target_count") or 0)
+    await _edit_callback(
+        callback,
+        "<b>👥 Как работают аккаунты</b>\n\n"
+        "🤖 <b>Умный выбор</b> — один пост в каждый чат; сервис выбирает подходящий "
+        "аккаунт из отмеченного пула.\n\n"
+        "🚀 <b>Независимо</b> — каждый отмеченный аккаунт публикует во всех чатах; "
+        "это увеличивает объём, но один заблокированный аккаунт не тормозит остальные.\n\n"
+        f"Сейчас: <b>{target_count or '—'} чатов</b> · <b>{sender_count} аккаунтов</b>.\n"
+        "Выберите нужный режим явно — настройки можно изменить до запуска.",
+        order_sender_mode_menu(current),
+    )
+
+
+@router.callback_query(
+    OrderDraftState.action,
+    F.data.regexp(r"^order:sendermode:set:(distributed|independent)$"),
+)
+async def set_order_sender_mode(
     callback: CallbackQuery,
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
-    data = await state.get_data()
-    current = str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
-    selected = (
-        BroadcastSenderMode.DISTRIBUTED
-        if current == BroadcastSenderMode.INDEPENDENT.value
-        else BroadcastSenderMode.INDEPENDENT
-    )
+    selected = (callback.data or "").rsplit(":", 1)[1]
     await state.update_data(
-        sender_mode=selected.value,
-        auto_sender_failover=(selected == BroadcastSenderMode.DISTRIBUTED),
+        sender_mode=selected,
+        auto_sender_failover=selected == BroadcastSenderMode.DISTRIBUTED.value,
     )
-    await _show_order_draft(callback, state, repository)
+    await callback.answer(
+        "Выбран умный выбор аккаунта"
+        if selected == BroadcastSenderMode.DISTRIBUTED.value
+        else "Выбраны независимые потоки аккаунтов"
+    )
+    await _show_order_draft(callback, state, repository, answer=False)
+
+
+@router.callback_query(F.data == "order:sendermode:toggle")
+async def redirect_legacy_order_sender_mode(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if not (await state.get_data()).get("order_draft_active"):
+        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        return
+    await choose_order_sender_mode(callback, state)
 
 
 @router.callback_query(OrderDraftState.action, F.data.startswith("order:profile:"))
@@ -1768,6 +2171,7 @@ async def choose_order_profile(
     await state.update_data(
         broadcast_profile=profile.key,
         smart_timer_mode=True,
+        repeat_forever=False,
         smart_duration_hours=profile.duration_hours,
         smart_no_timer_interval_minutes=profile.interval_minutes,
         activity_aware=True,
@@ -2004,10 +2408,14 @@ async def begin_order_visibility_max_wait(
             1,
             1,
             "Через сколько минут разрешить повтор, даже если нужное число новых сообщений "
-            "ещё не набралось? Выберите вариант или отправьте число от <b>1</b> до "
-            "<b>10080</b> минут. Это работает только если после публикации уже появились "
-            "сообщения: пока ваш пост последний, повтор всегда ждёт.",
-            hint="15 минут — активный режим по умолчанию.",
+            "ещё не набралось? Выберите вариант или отправьте число от <b>0</b> до "
+            "<b>10080</b> минут. <b>0</b> означает строго ждать выбранное число новых "
+            "сообщений, без публикации по таймеру. Это работает только если после публикации "
+            "уже появились сообщения: пока ваш пост последний, повтор всегда ждёт.",
+            hint=(
+                "15 минут — активный режим по умолчанию; 0 подходит для строгого "
+                "правила «после N сообщений»."
+            ),
         ),
         order_visibility_wait_presets(),
     )
@@ -2042,8 +2450,8 @@ async def save_order_visibility_max_wait(
         minutes = int((message.text or "").strip())
     except ValueError:
         minutes = 0
-    if not 1 <= minutes <= 10080:
-        await message.answer("Введите целое число минут от 1 до 10080.")
+    if not 0 <= minutes <= 10080:
+        await message.answer("Введите целое число минут от 0 до 10080.")
         return
     await state.update_data(
         visibility_max_wait_seconds=minutes * 60,
@@ -2063,8 +2471,8 @@ async def begin_order_duration(callback: CallbackQuery, state: FSMContext) -> No
             1,
             1,
             "Выберите срок ниже или отправьте целое число часов от <b>1</b> до "
-            "<b>168</b>. По окончании "
-            "срока новые публикации создаваться не будут.",
+            "<b>168</b>. «До остановки» оставляет один следующий цикл на чат и "
+            "работает, пока вы не завершите запуск вручную.",
         ),
         order_duration_presets(),
     )
@@ -2080,7 +2488,11 @@ async def save_order_duration_preset(
     repository: AdminRepository,
 ) -> None:
     value = int((callback.data or "").rsplit(":", 1)[1])
-    await state.update_data(smart_duration_hours=value, broadcast_profile="manual")
+    await state.update_data(
+        smart_duration_hours=max(1, value),
+        repeat_forever=value == 0,
+        broadcast_profile="manual",
+    )
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2099,7 +2511,11 @@ async def save_order_duration(
     if not 1 <= value <= 168:
         await message.answer("Введите целое число часов от 1 до 168.")
         return
-    await state.update_data(smart_duration_hours=value, broadcast_profile="manual")
+    await state.update_data(
+        smart_duration_hours=value,
+        repeat_forever=False,
+        broadcast_profile="manual",
+    )
     await state.set_state(OrderDraftState.action)
     await _show_order_draft_from_message(bot, state, repository)
 
@@ -2173,11 +2589,7 @@ async def begin_order_senders(
     await state.set_state(OrderDraftState.sender_accounts)
     await _edit_callback(
         callback,
-        "<b>👥 Кто будет отправлять</b>\n"
-        "<i>Выберите аккаунты для этой рассылки.</i>\n\n"
-        "Отмеченные аккаунты делят чаты между собой. Если один аккаунт недоступен "
-        "или забанен в конкретном чате, автозамена использует другой отмеченный "
-        "аккаунт. По умолчанию выбраны все готовые аккаунты.",
+        _order_sender_picker_text(data, selected_count=len(selected)),
         order_sender_picker(accounts, selected, page=0),
     )
 
@@ -2205,7 +2617,7 @@ async def toggle_order_sender(
     )
     await _edit_callback(
         callback,
-        "<b>👥 Кто будет отправлять</b>\n\nОтметьте отправителей и нажмите «Готово».",
+        _order_sender_picker_text(data, selected_count=len(selected)),
         order_sender_picker(accounts, selected, page=page),
     )
 
@@ -2230,8 +2642,7 @@ async def paginate_order_senders(
     await state.update_data(sender_page=page)
     await _edit_callback(
         callback,
-        "<b>👥 Кто будет отправлять</b>\n\n"
-        f"Выбрано: <b>{len(selected)}</b>. Отметьте отправителей и нажмите «Готово».",
+        _order_sender_picker_text(data, selected_count=len(selected)),
         order_sender_picker(accounts, selected, page=page, page_size=PAGE_SIZE),
     )
 
@@ -2255,13 +2666,147 @@ async def bulk_order_senders(
     await state.update_data(sender_account_ids=sorted(selected))
     await _edit_callback(
         callback,
-        "<b>👥 Кто будет отправлять</b>\n\nОтметьте отправителей и нажмите «Готово».",
+        _order_sender_picker_text(data, selected_count=len(selected)),
         order_sender_picker(
             accounts,
             selected,
             page=int(data.get("sender_page", 0)),
             page_size=PAGE_SIZE,
         ),
+    )
+
+
+def _order_sender_picker_text(data: dict[str, object], *, selected_count: int) -> str:
+    """Explain the selected sender pool in the same terms as the chosen mode.
+
+    The old copy always described distributed delivery, which made the independent
+    option look broken while the user was selecting its accounts.
+    """
+
+    independent = (
+        str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
+        == BroadcastSenderMode.INDEPENDENT.value
+    )
+    target_count = max(0, int(data.get("audience_target_count") or 0))
+    lines = [
+        "<b>👥 Кто будет отправлять</b>",
+        f"Выбрано: <b>{selected_count}</b>.",
+    ]
+    if independent:
+        volume = target_count * selected_count
+        lines.extend(
+            [
+                "<b>🚀 Независимый режим:</b> каждый отмеченный аккаунт — отдельный "
+                "поток в каждом чате. Недоступность одной пары не остановит остальные.",
+                (
+                    f"Первый проход: <b>{target_count} чатов × {selected_count} аккаунтов "
+                    f"= {volume} направлений</b>."
+                    if target_count
+                    else "Выберите чаты — тогда здесь появится точный объём первого прохода."
+                ),
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "<b>🤖 Умный выбор:</b> в каждом чате будет один поток. Сервис выберет "
+                "подходящий аккаунт из этого пула по доступу, лимиту и времени.",
+                "Если выбранный аккаунт недоступен в конкретном чате, включённая "
+                "автозамена попробует другой аккаунт из этого же пула.",
+            ]
+        )
+    lines.append("Отметьте отправителей и нажмите «Готово».")
+    return "\n\n".join(lines)
+
+
+def _active_capacity_warning(
+    campaign: Campaign,
+    capacity: CapacityEstimate,
+    *,
+    target_count: int,
+    independent_streams: int,
+) -> str | None:
+    """Turn capacity math into an actionable, finite-window launch warning."""
+
+    if (
+        capacity.full_round_seconds is None
+        or capacity.full_round_seconds <= campaign.smart_no_timer_interval_seconds
+    ):
+        return None
+    stream_factor = max(1, independent_streams)
+    daily_line = ""
+    coverage_line = ""
+    shortfall_line = ""
+    if capacity.messages_per_day is not None:
+        messages_per_day = capacity.messages_per_day * stream_factor
+        requested_per_day = capacity.requested_per_day * stream_factor
+        daily_line = (
+            f" Реальная мощность — около {messages_per_day} публикаций в сутки, "
+            f"а выбранная частота требует около {requested_per_day}."
+        )
+        coverage_line = (
+            f" Выполнимо примерно {capacity.coverage_ratio * 100:.1f}% плана."
+            if capacity.coverage_ratio is not None
+            else ""
+        )
+        shortfall_per_day = max(0, requested_per_day - messages_per_day)
+        if shortfall_per_day:
+            if campaign.repeat_forever:
+                shortfall_line = (
+                    f" При сохранении настроек от плана будет отставать примерно "
+                    f"<b>{shortfall_per_day} публикаций в сутки</b>; сервис не станет "
+                    "догонять их агрессивной отправкой."
+                )
+            else:
+                active_seconds = max(0, int(campaign.smart_duration_seconds))
+                expected_shortfall = ceil(shortfall_per_day * active_seconds / 86400)
+                if expected_shortfall:
+                    shortfall_line = (
+                        f" За активное окно примерно <b>{expected_shortfall} публикаций "
+                        "не успеют попасть в выбранный ритм</b> и не будут отправлены "
+                        "после окончания срока."
+                    )
+    return (
+        "⚠️ <b>Текущего пула может не хватить для выбранной частоты.</b> "
+        f"Полный круг по {target_count} чатам займёт примерно "
+        f"{ceil(capacity.full_round_seconds / 60)} мин.{daily_line}{coverage_line} "
+        f"{shortfall_line} "
+        "Увеличьте интервал, сократите аудиторию или используйте больше готовых аккаунтов."
+    )
+
+
+def _campaign_active_capacity_warning(
+    campaign: Campaign,
+    *,
+    sender_count: int,
+    target_count: int,
+    settings: Settings,
+) -> str | None:
+    """Use identical active-window feasibility feedback for every launch entry point."""
+
+    if not campaign.smart_timer_mode or target_count <= 0:
+        return None
+    sender_count = max(1, sender_count)
+    independent_streams = (
+        sender_count
+        if campaign.mode == CampaignMode.BROADCAST
+        and campaign.sender_mode == BroadcastSenderMode.INDEPENDENT
+        else 1
+    )
+    capacity = estimate_capacity(
+        account_count=(1 if independent_streams > 1 else sender_count),
+        target_count=target_count,
+        interval_seconds=campaign.smart_no_timer_interval_seconds,
+        pace_seconds=settings.account_pace_max_seconds,
+        daily_limit=settings.account_daily_limit,
+        micro_break_every=settings.account_micro_break_every,
+        micro_break_seconds=settings.account_micro_break_max_seconds,
+    )
+    return _active_capacity_warning(
+        campaign,
+        capacity,
+        target_count=target_count,
+        independent_streams=independent_streams,
     )
 
 
@@ -2302,9 +2847,10 @@ async def begin_order_audience(
     await _edit_callback(
         callback,
         "<b>🎯 Куда отправлять</b>\n"
-        "<i>Выберите один чат или готовый список чатов.</i>\n\n"
-        "Выберите список целиком или один вручную добавленный чат. Чаты из Telegram-"
-        "папок не показываются россыпью — они доступны только внутри своего списка." + list_hint,
+        "<i>Соберите аудиторию самым удобным способом.</i>\n\n"
+        "Выберите готовый список целиком или отметьте несколько отдельных чатов галочками. "
+        "Отмеченные чаты сохранятся как отдельная подборка только для этой рассылки. Чаты "
+        "из Telegram-папок доступны внутри своих списков." + list_hint,
         order_audience_source_menu(
             standalone_count=chats.total,
             list_count=lists.total,
@@ -2340,14 +2886,16 @@ async def begin_order_target_list_import(
     )
 
 
-@router.callback_query(
-    OrderDraftState.audience,
-    F.data.startswith("order:audience:chats:"),
-)
+@router.callback_query(F.data.startswith("order:audience:chats:"))
 async def page_order_chats(
     callback: CallbackQuery,
+    state: FSMContext,
     repository: AdminRepository,
 ) -> None:
+    data = await state.get_data()
+    if not data.get("order_draft_active"):
+        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        return
     page = int((callback.data or "").rsplit(":", 1)[1])
     targets = await repository.list_approved_targets(page, AUDIENCE_PAGE_SIZE)
     if targets.page >= targets.pages:
@@ -2355,21 +2903,136 @@ async def page_order_chats(
             targets.pages - 1,
             AUDIENCE_PAGE_SIZE,
         )
+    selected_ids = {
+        int(target_id)
+        for target_id in data.get("order_selected_target_ids", [])
+        if str(target_id).isdigit() and int(target_id) > 0
+    }
+    await state.update_data(order_audience_page=targets.page)
+    await state.set_state(OrderDraftState.audience_targets)
     await _edit_callback(
         callback,
-        "<b>📌 Отдельные чаты</b>\n\nВыберите один вручную добавленный чат.",
-        order_target_picker(targets),
+        "<b>☑️ Выберите чаты</b>\n\n"
+        f"Отмечено: <b>{len(selected_ids)}</b>. Нажимайте на чаты, затем «Готово».\n"
+        "Подборка не изменит уже существующие списки и будет сохранена вместе с этой рассылкой.",
+        order_target_picker(targets, selected_ids),
+    )
+
+
+async def _show_order_target_checklist(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    *,
+    answer: bool = True,
+) -> None:
+    data = await state.get_data()
+    page = max(0, int(data.get("order_audience_page", 0)))
+    targets = await repository.list_approved_targets(page, AUDIENCE_PAGE_SIZE)
+    if targets.page >= targets.pages:
+        targets = await repository.list_approved_targets(targets.pages - 1, AUDIENCE_PAGE_SIZE)
+    selected_ids = {
+        int(target_id)
+        for target_id in data.get("order_selected_target_ids", [])
+        if str(target_id).isdigit() and int(target_id) > 0
+    }
+    await state.update_data(order_audience_page=targets.page)
+    await _edit_callback(
+        callback,
+        "<b>☑️ Выберите чаты</b>\n\n"
+        f"Отмечено: <b>{len(selected_ids)}</b>. Нажимайте на чаты, затем «Готово».\n"
+        "Подборка не изменит уже существующие списки и будет сохранена вместе с этой рассылкой.",
+        order_target_picker(targets, selected_ids),
+        answer=answer,
     )
 
 
 @router.callback_query(
-    OrderDraftState.audience,
-    F.data.startswith("order:audience:search:"),
+    OrderDraftState.audience_targets,
+    F.data.startswith("order:audience:toggle:"),
 )
+async def toggle_order_audience_target(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    target_id = int((callback.data or "").rsplit(":", 1)[1])
+    try:
+        target = await repository.get_target(target_id)
+    except NotFoundError:
+        await callback.answer("Этот чат больше не существует", show_alert=True)
+        return
+    if (
+        not target.is_standalone
+        or not target.approved_by_operator
+        or target.quality_status == TARGET_QUALITY_BAD
+    ):
+        await callback.answer("Этот чат сейчас недоступен для рассылки", show_alert=True)
+        return
+    data = await state.get_data()
+    selected_ids = {
+        int(item)
+        for item in data.get("order_selected_target_ids", [])
+        if str(item).isdigit() and int(item) > 0
+    }
+    if target.id in selected_ids:
+        selected_ids.remove(target.id)
+    else:
+        selected_ids.add(target.id)
+    await state.update_data(order_selected_target_ids=sorted(selected_ids))
+    await _show_order_target_checklist(callback, state, repository)
+
+
+@router.callback_query(
+    OrderDraftState.audience_targets,
+    F.data.in_({"order:audience:all", "order:audience:clear"}),
+)
+async def bulk_order_audience_targets(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    if (callback.data or "").endswith(":all"):
+        selected_ids = [target.id for target in await repository.approved_targets()]
+    else:
+        selected_ids = []
+    await state.update_data(order_selected_target_ids=selected_ids)
+    await _show_order_target_checklist(callback, state, repository)
+
+
+@router.callback_query(OrderDraftState.audience_targets, F.data == "order:audience:done")
+async def finish_order_audience_targets(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    data = await state.get_data()
+    selected_ids = {
+        int(item)
+        for item in data.get("order_selected_target_ids", [])
+        if str(item).isdigit() and int(item) > 0
+    }
+    if not selected_ids:
+        await callback.answer("Отметьте хотя бы один чат", show_alert=True)
+        return
+    await state.update_data(
+        target_id=None,
+        target_list_id=None,
+        order_selected_target_ids=sorted(selected_ids),
+    )
+    await state.set_state(OrderDraftState.action)
+    await _show_order_draft(callback, state, repository)
+
+
+@router.callback_query(F.data.startswith("order:audience:search:"))
 async def begin_order_audience_search(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
+    data = await state.get_data()
+    if not data.get("order_draft_active"):
+        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        return
     kind = (callback.data or "").rsplit(":", 1)[-1]
     if kind not in {"chats", "lists"}:
         await callback.answer("Неизвестный тип аудитории", show_alert=True)
@@ -2401,7 +3064,7 @@ async def search_order_audience(
     kind = str(data.get("order_audience_search_kind") or "")
     if kind == "chats":
         items = await repository.search_targets(query, approved_only=True)
-        results = [(f"📌 {item.title}", f"order:audience:target:{item.id}") for item in items]
+        results = [(f"☑️ {item.title}", f"order:audience:toggle:{item.id}") for item in items]
     elif kind == "lists":
         items = await repository.search_target_lists(query, approved_only=False)
         results = [
@@ -2415,25 +3078,35 @@ async def search_order_audience(
         await state.set_state(OrderDraftState.action)
         await message.answer("Поиск устарел. Вернитесь в карточку рассылки.")
         return
-    await state.set_state(OrderDraftState.audience)
+    await state.set_state(
+        OrderDraftState.audience_targets if kind == "chats" else OrderDraftState.audience
+    )
     await _edit_origin(
         bot,
         state,
         "<b>🔎 Результаты поиска</b>\n"
         f"<code>{escape(query)}</code> · найдено <b>{len(results)}</b>\n\n"
-        + ("Выберите аудиторию." if results else "Совпадений нет — попробуйте короче."),
+        + (
+            "Нажмите чат, чтобы добавить или убрать его из подборки."
+            if kind == "chats" and results
+            else "Выберите аудиторию."
+            if results
+            else "Совпадений нет — попробуйте короче."
+        ),
         order_audience_search_menu(kind, results),
     )
 
 
-@router.callback_query(
-    OrderDraftState.audience,
-    F.data.startswith("order:audience:lists:"),
-)
+@router.callback_query(F.data.startswith("order:audience:lists:"))
 async def page_order_lists(
     callback: CallbackQuery,
+    state: FSMContext,
     repository: AdminRepository,
 ) -> None:
+    data = await state.get_data()
+    if not data.get("order_draft_active"):
+        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        return
     page = int((callback.data or "").rsplit(":", 1)[1])
     target_lists = await repository.list_target_lists(page, AUDIENCE_PAGE_SIZE)
     if target_lists.page >= target_lists.pages:
@@ -2441,6 +3114,7 @@ async def page_order_lists(
             target_lists.pages - 1,
             AUDIENCE_PAGE_SIZE,
         )
+    await state.set_state(OrderDraftState.audience)
     await _edit_callback(
         callback,
         "<b>📚 Списки чатов</b>\n\nВыберите список; справа указано число включённых "
@@ -2464,7 +3138,11 @@ async def choose_order_target(
     if not target.is_standalone or not target.approved_by_operator:
         await callback.answer("Этот отдельный чат сейчас недоступен", show_alert=True)
         return
-    await state.update_data(target_id=target.id, target_list_id=None)
+    await state.update_data(
+        target_id=target.id,
+        target_list_id=None,
+        order_selected_target_ids=[],
+    )
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2492,7 +3170,11 @@ async def choose_order_target_list(
             order_target_list_activation_menu(target_list.id),
         )
         return
-    await state.update_data(target_id=None, target_list_id=target_list.id)
+    await state.update_data(
+        target_id=None,
+        target_list_id=target_list.id,
+        order_selected_target_ids=[],
+    )
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2525,6 +3207,7 @@ async def activate_and_choose_order_target_list(
     await state.update_data(
         target_id=None,
         target_list_id=target_list.id,
+        order_selected_target_ids=[],
         order_resume_draft=None,
     )
     await state.set_state(OrderDraftState.action)
@@ -2543,14 +3226,24 @@ async def _create_campaign_from_order_draft(
     )
     target_id = int(data["target_id"]) if data.get("target_id") is not None else None
     target_list_id = int(data["target_list_id"]) if data.get("target_list_id") is not None else None
-    if (target_id is None) == (target_list_id is None):
+    selected_target_ids = list(
+        dict.fromkeys(
+            int(target_id)
+            for target_id in data.get("order_selected_target_ids", [])
+            if str(target_id).isdigit() and int(target_id) > 0
+        )
+    )
+    if not selected_target_ids and (target_id is None) == (target_list_id is None):
         raise ConflictError("выберите аудиторию")
     default_profile = broadcast_profile("active")
-    smart = bool(data.get("smart_timer_mode", False))
+    smart = bool(data.get("smart_timer_mode", mode == CampaignMode.BROADCAST))
     schedule_values = {
         "smart_timer_mode": smart,
+        "repeat_forever": smart and bool(data.get("repeat_forever", False)),
         "smart_duration_seconds": (
-            int(data.get("smart_duration_hours", default_profile.duration_hours)) * 3600
+            0
+            if bool(data.get("repeat_forever", False))
+            else int(data.get("smart_duration_hours", default_profile.duration_hours)) * 3600
             if smart
             else 0
         ),
@@ -2588,7 +3281,7 @@ async def _create_campaign_from_order_draft(
         ),
     }
     if mode == CampaignMode.BROADCAST:
-        sender_ids = [int(item) for item in data.get("sender_account_ids", [])]
+        sender_ids = list(dict.fromkeys(int(item) for item in data.get("sender_account_ids", [])))
         if not sender_ids:
             raise ConflictError("выберите хотя бы один аккаунт")
         primary_text = str(data.get("primary_text") or "").strip()
@@ -2600,6 +3293,8 @@ async def _create_campaign_from_order_draft(
         sender_mode = BroadcastSenderMode(
             str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
         )
+        selection_suffix = str(data.get("order_selection_key") or uuid4().hex[:6]).upper()
+        selection_name = f"Подборка · {str(data['order_name']).strip()[:120]} · {selection_suffix}"
         return await repository.create_campaign(
             name=str(data["order_name"]),
             mode=mode,
@@ -2631,6 +3326,13 @@ async def _create_campaign_from_order_draft(
             ),
             sender_mode=sender_mode,
             sender_account_ids=sender_ids,
+            selected_target_ids=selected_target_ids or None,
+            selected_target_list_name=selection_name if selected_target_ids else None,
+            reactions_enabled=bool(data.get("reactions_enabled", False)),
+            reaction_count=int(data.get("reaction_count") or 0),
+            reaction_emoji=str(data.get("reaction_emoji") or "👍"),
+            hidden_mentions_enabled=bool(data.get("hidden_mentions_enabled", False)),
+            mention_cooldown_days=int(data.get("mention_cooldown_days") or 30),
         )
     steps = [dict(item) for item in data.get("dialogue_steps", []) if isinstance(item, dict)]
     if len(steps) < 2:
@@ -2650,6 +3352,13 @@ async def _create_campaign_from_order_draft(
         auto_sender_failover=False,
         **schedule_values,
         dialogue_steps=steps,
+        selected_target_ids=selected_target_ids or None,
+        selected_target_list_name=(
+            f"Подборка · {str(data['order_name']).strip()[:120]} · "
+            f"{str(data.get('order_selection_key') or uuid4().hex[:6]).upper()}"
+            if selected_target_ids
+            else None
+        ),
     )
 
 
@@ -2677,6 +3386,60 @@ async def save_order_draft(
     )
 
 
+def _order_draft_preview_variant(data: dict[str, object]) -> BroadcastContentVariant:
+    """Build a sendable preview from an in-memory broadcast draft only."""
+
+    if data.get("order_mode") != "broadcast":
+        raise ContentError("предпросмотр доступен только для рассылки в чаты")
+    text = str(data.get("primary_text") or "").strip()
+    media_path = str(data.get("primary_media_path") or "").strip()
+    if not text and not media_path:
+        raise ContentError("сначала добавьте текст или вложение")
+    media: tuple[StoredMedia, ...] = ()
+    if media_path:
+        media_kind = str(data.get("primary_media_kind") or "").strip()
+        if not media_kind:
+            raise ContentError("у вложения не указан тип")
+        media = (
+            StoredMedia(
+                path=media_path,
+                kind=media_kind,
+                name=str(data.get("primary_media_name") or "файл"),
+                size=int(data.get("primary_media_size") or 0),
+            ),
+        )
+    return BroadcastContentVariant(
+        variant_id="order-preview",
+        name="Предпросмотр черновика",
+        text=text,
+        html_text=(str(data["primary_html"]) if data.get("primary_html") else None),
+        media=media,
+    )
+
+
+@router.callback_query(OrderDraftState.action, F.data == "order:preview")
+async def preview_order_draft(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    settings: Settings,
+) -> None:
+    try:
+        await _send_variant_preview(
+            bot,
+            callback.from_user.id,
+            _order_draft_preview_variant(await state.get_data()),
+            settings,
+        )
+    except (ContentError, TelegramBadRequest) as exc:
+        await callback.answer(
+            callback_error_message(exc, prefix="Предпросмотр не отправлен"),
+            show_alert=True,
+        )
+        return
+    await callback.answer("Предпросмотр отправлен вам в этот чат")
+
+
 @router.callback_query(OrderDraftState.action, F.data == "order:launch")
 async def ask_launch_order_draft(
     callback: CallbackQuery,
@@ -2702,82 +3465,91 @@ async def launch_order_draft(
     state: FSMContext,
     repository: AdminRepository,
     preflight_service: PreflightService,
-    run_queue: RunQueue,
+    settings: Settings,
 ) -> None:
-    data = await state.get_data()
-    try:
-        campaign = await _create_campaign_from_order_draft(data, repository)
-    except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+    operator_id = int(callback.from_user.id)
+    launch_lock = _order_launch_locks.setdefault(operator_id, asyncio.Lock())
+    if launch_lock.locked():
+        await _safe_callback_answer(
+            callback,
+            "Проверка этой рассылки уже идёт. Экран обновится по её завершении.",
+        )
         return
-    await callback.answer("Проверяю аккаунты и чаты…")
-    preflight_summary = None
-    try:
-        preflight_summary, runs = await _preflight_and_enqueue_order(
-            campaign.id,
-            preflight_service,
-            run_queue,
-            request_key=uuid4().hex,
-        )
-    except (ConflictError, NotFoundError) as exc:
+
+    async with launch_lock:
+        data = await state.get_data()
+        if not data.get("order_draft_active"):
+            await _safe_callback_answer(
+                callback,
+                "Черновик уже обработан. Откройте сохранённую рассылку в списке.",
+                show_alert=True,
+            )
+            return
+        try:
+            campaign = await _create_campaign_from_order_draft(data, repository)
+        except (ConflictError, NotFoundError) as exc:
+            await callback.answer(callback_error_message(exc), show_alert=True)
+            return
+
+        try:
+            preflight_summary = await _inspect_campaign_with_visible_progress(
+                callback,
+                preflight_service,
+                campaign.id,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the saved campaign and a recovery path
+            logger.warning(
+                "Order preflight failed for saved campaign %s",
+                campaign.id,
+                exc_info=True,
+            )
+            sender_ids = await repository.campaign_sender_ids(campaign.id)
+            await state.clear()
+            await _edit_callback(
+                callback,
+                "⚠️ <b>Проверка не завершилась, отправка не началась.</b>\n\n"
+                f"Причина: {escape(operator_error_message(exc))}\n\n"
+                "Рассылка сохранена. Ничего не отправлено и вступления не выполнялись. "
+                "Откройте её карточку, исправьте причину и запустите проверку снова."
+                + "\n\n"
+                + campaign_details_text(campaign, sender_ids),
+                campaign_details_menu(campaign, 0),
+                answer=False,
+            )
+            return
+
         sender_ids = await repository.campaign_sender_ids(campaign.id)
-        await state.clear()
-        readiness = (
-            "\n\n" + campaign_preflight_text(preflight_summary)
-            if preflight_summary is not None
-            else ""
+        launchable_count = preflight_summary.launchable_units
+        planned_tasks = launchable_count * (
+            1 if campaign.smart_timer_mode else campaign.repeat_count
         )
+        capacity_warning = _campaign_active_capacity_warning(
+            campaign,
+            sender_count=len(sender_ids),
+            target_count=preflight_summary.target_count,
+            settings=settings,
+        )
+        await state.clear()
         await _edit_callback(
             callback,
-            "⚠️ <b>Проверка завершена, отправка не началась.</b>\n\n"
-            f"Причина: <code>{escape(operator_error_message(exc))}</code>\n\n"
-            "Рассылка сохранена. Исправьте причину и повторите запуск из этой карточки."
-            + readiness
-            + "\n\n"
-            + campaign_details_text(campaign, sender_ids),
-            campaign_details_menu(campaign, 0),
+            campaign_launch_review_text(
+                campaign,
+                preflight_summary,
+                planned_tasks=planned_tasks,
+                capacity_warning=capacity_warning,
+            ),
+            campaign_run_confirmation(
+                campaign.id,
+                0,
+                ready_targets=(launchable_count if launchable_count else None),
+                schedule_after_cooldown=(
+                    launchable_count == 0 and preflight_summary.deferred_pairs > 0
+                ),
+            )
+            if launchable_count or preflight_summary.deferred_pairs
+            else campaign_details_menu(campaign, 0),
             answer=False,
         )
-        return
-    try:
-        launch, launch_runs = await repository.get_launch(max(run.id for run in runs))
-        targets = await repository.targets_by_ids({run.target_id for run in launch_runs})
-    except (ConflictError, NotFoundError) as exc:
-        sender_ids = await repository.campaign_sender_ids(campaign.id)
-        await state.clear()
-        await _edit_callback(
-            callback,
-            "🚀 <b>Рассылка запущена, но подробный отчёт пока не открылся.</b>\n\n"
-            f"В очередь поставлено направлений: <b>{len(runs)}</b>. "
-            "Повторно запускать рассылку не нужно.\n"
-            f"Причина отображения: <code>{escape(operator_error_message(exc))}</code>\n\n"
-            + campaign_details_text(campaign, sender_ids),
-            campaign_details_menu(campaign, 0),
-            answer=False,
-        )
-        return
-    await state.clear()
-    await _edit_callback(
-        callback,
-        "🚀 <b>Рассылка началась.</b> В этой карточке видны публикации, проблемы и настройки.\n\n"
-        + launch_details_text(launch, launch_runs, targets),
-        launch_details_menu(launch, 0),
-        answer=False,
-    )
-
-
-async def _preflight_and_enqueue_order(
-    campaign_id: int,
-    preflight_service: PreflightService,
-    run_queue: RunQueue,
-    *,
-    request_key: str,
-) -> tuple[CampaignPreflightSummary, list[CampaignRun]]:
-    """Never expose a newly created order to the queue before a fresh readiness check."""
-
-    summary = await preflight_service.inspect_campaign(campaign_id)
-    runs = await run_queue.enqueue_campaign(campaign_id, request_key)
-    return summary, runs
 
 
 @router.callback_query(F.data == "audiences:home")
@@ -2995,7 +3767,7 @@ async def open_menu(
     elif section == "templates":
         await _show_templates(callback, repository, page)
     elif section == "campaigns":
-        await _show_campaigns(callback, repository, page)
+        await _show_campaigns(callback, repository, settings, page)
     elif section == "runs":
         await _show_runs(callback, repository, page)
     elif section == "archive":
@@ -3063,6 +3835,61 @@ async def confirm_stop_all(
     )
 
 
+@router.callback_query(F.data == "campaign:stopall:ask")
+async def ask_stop_all_campaign_deliveries(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _edit_callback(
+        callback,
+        "<b>Остановить текущие публикации по чатам?</b>\n\n"
+        "Задания, которые ещё ждут, сразу отменятся. Для уже выполняющихся публикаций "
+        "и реакций будет выставлена отмена: worker не начнёт следующий внешний шаг. "
+        "Сценарии рассылок сохранятся и останутся включёнными — их можно будет запустить "
+        "заново вручную. ЛС-рассылки, приглашения, комментарии и реакции участников "
+        "эта кнопка не затрагивает.",
+        campaign_stop_all_confirmation(),
+        answer=False,
+    )
+
+
+@router.callback_query(F.data == "campaign:stopall:confirm")
+async def confirm_stop_all_campaign_deliveries(
+    callback: CallbackQuery,
+    repository: AdminRepository,
+    run_queue: RunQueue,
+    settings: Settings,
+) -> None:
+    result = await run_queue.cancel_all_campaign_deliveries()
+    await callback.answer("Остановка публикаций применена")
+    page = await repository.list_campaigns(0, PAGE_SIZE)
+    summary_lines = ["<b>🛑 Остановка публикаций по чатам применена</b>"]
+    if result.queued_runs:
+        summary_lines.append(f"В очереди отменено: <b>{result.queued_runs}</b>")
+    if result.running_runs:
+        summary_lines.append(
+            f"Выполняющимся публикациям передан стоп: <b>{result.running_runs}</b>"
+        )
+    if result.queued_reactions:
+        summary_lines.append(f"Реакций в очереди отменено: <b>{result.queued_reactions}</b>")
+    if result.running_reactions:
+        summary_lines.append(
+            f"Выполняющимся реакциям передан стоп: <b>{result.running_reactions}</b>"
+        )
+    if result.task_count == 0:
+        summary_lines.append("Текущих публикаций и реакций в чатах не найдено.")
+    summary_lines.append(
+        "<i>Сценарии сохранены; ЛС, приглашения, комментарии и реакции участников не "
+        "изменялись.</i>"
+    )
+    await _edit_callback(
+        callback,
+        campaigns_text(page, worker_campaign_scope=settings.worker_campaign_id_scope)
+        + "\n\n"
+        + "\n".join(summary_lines),
+        campaigns_menu(page),
+        answer=False,
+    )
+
+
 @router.callback_query(F.data == "maintenance:backup")
 async def create_backup(
     callback: CallbackQuery,
@@ -3070,8 +3897,12 @@ async def create_backup(
     repository: AdminRepository,
 ) -> None:
     try:
-        path = create_sqlite_backup(settings.database_url, Path(settings.backup_storage_path))
-        verification = verify_sqlite_backup(path)
+        path = await asyncio.to_thread(
+            create_sqlite_backup,
+            settings.database_url,
+            Path(settings.backup_storage_path),
+        )
+        verification = await asyncio.to_thread(verify_sqlite_backup, path)
         await repository.record_backup_created(
             path=str(path),
             size_bytes=verification.size_bytes,
@@ -3092,7 +3923,7 @@ async def create_backup(
 @router.callback_query(F.data == "maintenance:doctor")
 async def run_doctor(callback: CallbackQuery, settings: Settings) -> None:
     try:
-        report = inspect_sqlite(settings.database_url)
+        report = await asyncio.to_thread(inspect_sqlite, settings.database_url)
     except (RuntimeError, ValueError) as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
@@ -3140,14 +3971,25 @@ async def begin_proxy_add(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(ProxyAddState.url)
-async def proxy_add_url(message: Message, state: FSMContext, bot: Bot) -> None:
+async def proxy_add_url(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    settings: Settings,
+) -> None:
     value = (message.text or "").strip()
     try:
         parsed = parse_proxy(value)
     except ProxyInputError as exc:
         await message.answer(f"Некорректный адрес: {escape(operator_error_message(exc))}")
         return
-    await state.update_data(proxy_url=value, proxy_protocol=parsed.protocol.value)
+    # FSM state survives bot restarts and therefore must not retain a raw
+    # proxy password or MTProto secret between wizard steps.
+    encrypted_url = ProxySecretCipher.from_settings(settings).encrypt(value)
+    await state.update_data(
+        proxy_url_encrypted=encrypted_url,
+        proxy_protocol=parsed.protocol.value,
+    )
     await state.set_state(ProxyAddState.label)
     await _edit_origin(
         bot,
@@ -3170,6 +4012,7 @@ async def proxy_add_label(
     state: FSMContext,
     bot: Bot,
     proxy_service: ProxyService,
+    settings: Settings,
 ) -> None:
     value = (message.text or "").strip()
     if value != "-" and not 1 <= len(value) <= 100:
@@ -3181,8 +4024,16 @@ async def proxy_add_label(
     data = await state.get_data()
     if data.get("proxy_protocol") == "mtproto":
         try:
+            proxy_url = _proxy_draft_url(data, settings)
+        except ProxyInputError:
+            await state.clear()
+            await message.answer(
+                "Черновик прокси больше нельзя безопасно восстановить. Начните добавление заново."
+            )
+            return
+        try:
             view = await proxy_service.add_proxy(
-                str(data["proxy_url"]),
+                proxy_url,
                 label=data.get("proxy_label"),
             )
         except (ProxyInputError, ConflictError) as exc:
@@ -3248,6 +4099,7 @@ async def proxy_add_rotation_url(
     state: FSMContext,
     bot: Bot,
     proxy_service: ProxyService,
+    settings: Settings,
 ) -> None:
     value = (message.text or "").strip()
     try:
@@ -3257,8 +4109,16 @@ async def proxy_add_rotation_url(
         return
     data = await state.get_data()
     try:
+        proxy_url = _proxy_draft_url(data, settings)
+    except ProxyInputError:
+        await state.clear()
+        await message.answer(
+            "Черновик прокси больше нельзя безопасно восстановить. Начните добавление заново."
+        )
+        return
+    try:
         view = await proxy_service.add_proxy(
-            str(data["proxy_url"]),
+            proxy_url,
             label=data.get("proxy_label"),
             group_name=data.get("proxy_group"),
             rotation_url=rotation_url,
@@ -3273,6 +4133,18 @@ async def proxy_add_rotation_url(
         "✅ Прокси добавлен. Пароль сохранён в зашифрованном виде.\n\n" + proxy_details_text(view),
         proxy_details_menu(view, 0),
     )
+
+
+def _proxy_draft_url(data: dict[str, object], settings: Settings) -> str:
+    """Restore a proxy URL from an encrypted, restart-safe wizard draft."""
+
+    encrypted = data.get("proxy_url_encrypted")
+    if not isinstance(encrypted, str) or not encrypted:
+        raise ProxyInputError("черновик прокси не содержит зашифрованный адрес")
+    value = ProxySecretCipher.from_settings(settings).decrypt(encrypted)
+    if not value:
+        raise ProxyInputError("черновик прокси не содержит адрес")
+    return value
 
 
 @router.callback_query(F.data == "proxy:import")
@@ -5009,8 +5881,40 @@ async def check_all_account_sessions(
     account_service: AccountService,
 ) -> None:
     _, _, _, page = (callback.data or "").split(":")
-    await callback.answer("Проверяю все сессии…")
-    summary = await account_service.check_all_sessions()
+    await callback.answer("Начинаю проверку сессий…")
+    last_visible = -1
+    progress_lock = asyncio.Lock()
+
+    async def show_progress(completed: int, total: int) -> None:
+        nonlocal last_visible
+        update_every = max(1, ceil(total / 10)) if total else 1
+        if completed not in {0, total} and completed - last_visible < update_every:
+            return
+        async with progress_lock:
+            if completed != total and completed != 0 and completed - last_visible < update_every:
+                return
+            last_visible = completed
+            try:
+                await _edit_callback(
+                    callback,
+                    account_bulk_check_progress_text(completed=completed, total=total),
+                    None,
+                    answer=False,
+                )
+            except TelegramAPIError:
+                logger.warning("Unable to render bulk session-check progress", exc_info=True)
+
+    try:
+        summary = await account_service.check_all_sessions(on_progress=show_progress)
+    except Exception as exc:  # noqa: BLE001 - never leave the operator on a spinner
+        logger.exception("Bulk session check failed")
+        await _edit_callback(
+            callback,
+            "<b>❌ Проверка сессий не завершилась</b>\n\n" + escape(operator_error_message(exc)),
+            account_bulk_check_menu([], page=int(page)),
+            answer=False,
+        )
+        return
     await _edit_callback(
         callback,
         account_bulk_check_text(summary),
@@ -5018,6 +5922,91 @@ async def check_all_account_sessions(
             [(entry.account_id, entry.label) for entry in summary.session_revoked],
             page=int(page),
         ),
+        answer=False,
+    )
+
+
+@router.callback_query(F.data.startswith("account:spambot:all:"))
+async def check_all_accounts_spambot(
+    callback: CallbackQuery,
+    spambot_checks: SpamBotCheckService | None = None,
+) -> None:
+    _, _, _, page = (callback.data or "").split(":")
+    if spambot_checks is None:
+        await callback.answer("Проверка @SpamBot сейчас недоступна", show_alert=True)
+        return
+    await callback.answer("Начинаю проверку @SpamBot…")
+    last_visible = -1
+    progress_lock = asyncio.Lock()
+
+    async def show_progress(completed: int, total: int) -> None:
+        nonlocal last_visible
+        update_every = max(1, ceil(total / 10)) if total else 1
+        if completed not in {0, total} and completed - last_visible < update_every:
+            return
+        async with progress_lock:
+            if completed != total and completed != 0 and completed - last_visible < update_every:
+                return
+            last_visible = completed
+            try:
+                await _edit_callback(
+                    callback,
+                    account_bulk_spambot_progress_text(completed=completed, total=total),
+                    None,
+                    answer=False,
+                )
+            except TelegramAPIError:
+                logger.warning("Unable to render bulk @SpamBot progress", exc_info=True)
+
+    try:
+        summary = await spambot_checks.check_all_accounts(on_progress=show_progress)
+    except Exception as exc:  # noqa: BLE001 - preserve a clear operator result
+        logger.exception("Bulk @SpamBot check failed")
+        await _edit_callback(
+            callback,
+            "<b>❌ Проверка @SpamBot не завершилась</b>\n\n" + escape(operator_error_message(exc)),
+            account_bulk_spambot_menu(int(page)),
+            answer=False,
+        )
+        return
+    await _edit_callback(
+        callback,
+        account_bulk_spambot_text(summary),
+        account_bulk_spambot_menu(int(page)),
+        answer=False,
+    )
+
+
+@router.callback_query(F.data.startswith("account:check:purge:ask:"))
+async def ask_purge_confirmed_invalid_sessions(callback: CallbackQuery) -> None:
+    _, _, _, _, page = (callback.data or "").split(":")
+    await _edit_callback(
+        callback,
+        "<b>🧹 Удалить все подтверждённо невалидные сессии?</b>\n\n"
+        "После подтверждения сервис заново проверит все сохранённые Telegram-сессии "
+        "без отправки сообщений. Удалены будут только те записи, для которых Telegram "
+        "сейчас прямо подтвердит потерю доступа.\n\n"
+        "Ошибки сети, прокси, flood, неизвестный статус и аккаунты с активными задачами "
+        "останутся без изменений.",
+        account_bulk_cleanup_confirmation(int(page)),
+    )
+
+
+@router.callback_query(F.data.startswith("account:check:purge:confirm:"))
+async def confirm_purge_confirmed_invalid_sessions(
+    callback: CallbackQuery,
+    account_service: AccountService,
+    gateway: object | None = None,
+) -> None:
+    _, _, _, _, page = (callback.data or "").split(":")
+    await callback.answer("Повторно проверяю и очищаю невалидные сессии…")
+    summary = await account_service.remove_confirmed_invalid_sessions()
+    for result in summary.removed:
+        await _close_account_client(result.account_id, gateway)
+    await _edit_callback(
+        callback,
+        account_bulk_cleanup_text(summary),
+        account_bulk_cleanup_result_menu(int(page)),
         answer=False,
     )
 
@@ -5037,8 +6026,14 @@ async def check_account(
         if isinstance(callback.message, Message):
             await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
         return
-    if result.error and result.authorized:
-        verdict = "⚠️ Сессия была активна, но текущая проверка связи не выполнена"
+    if result.failure_code == "session_material_invalid":
+        verdict = "⚠️ Локальные данные сессии не удалось прочитать — Telegram не проверялся"
+    elif result.error:
+        verdict = (
+            "⚠️ Сессия была активна, но текущая проверка связи не выполнена"
+            if result.authorized
+            else "⚠️ Проверка сессии не завершена"
+        )
     else:
         verdict = "✅ Сессия активна" if result.authorized else "❌ Сессия недоступна"
     detail = ""
@@ -5056,9 +6051,19 @@ async def check_account(
                 SpamBotStatus.TEMPORARY_RESTRICTION: "⏳ @SpamBot: временное ограничение",
                 SpamBotStatus.ACTIVE_RESTRICTION: "⛔ @SpamBot: активное ограничение",
                 SpamBotStatus.PERMANENT_RESTRICTION: "⛔ @SpamBot: постоянное ограничение",
+                SpamBotStatus.RESTRICTION_UNCLEAR: (
+                    "⚠️ @SpamBot подтвердил ограничение, но его точный вид не распознан"
+                ),
                 SpamBotStatus.UNKNOWN: "⚠️ Ответ @SpamBot не удалось однозначно распознать",
             }[restriction.status]
             detail += f"\n<b>{restriction_text}</b>"
+        else:
+            checked_account = await account_service.get_account(int(account_id))
+            if checked_account.spambot_status == "error":
+                detail += (
+                    "\n⚠️ <b>@SpamBot не ответил:</b> статус ограничения сохранён "
+                    "без изменений. Попробуйте проверку позже."
+                )
     await _show_account_details(
         callback,
         account_service,
@@ -6796,14 +7801,19 @@ async def account_import_payload(
         proxy_service, account.id
     )
     await state.clear()
-    if check.authorized:
+    if check.authorized and not check.error:
         banner = f"✅ <b>Аккаунт загружен и сессия подтверждена.</b>\n{proxy_note}\n"
     else:
         note = f"\n<code>{escape(check.error)}</code>" if check.error else ""
+        diagnosis = (
+            "Локальные данные сессии не удалось прочитать. Импортируйте файл повторно."
+            if check.failure_code == "session_material_invalid"
+            else "После настройки прокси повторите проверку из карточки аккаунта."
+        )
         banner = (
             "🟡 <b>Аккаунт загружен, но сессию подтвердить не удалось.</b>\n"
             f"{proxy_note}"
-            "После настройки прокси повторите проверку из карточки аккаунта."
+            f"{diagnosis}"
             f"{note}\n\n"
         )
     await _edit_origin_data(
@@ -7130,8 +8140,9 @@ async def begin_target_create(callback: CallbackQuery, state: FSMContext) -> Non
         wizard_text(
             "🎯 Новый чат",
             1,
-            2,
-            "Введите @username, ссылку или числовой chat ID чата.",
+            1,
+            "Введите @username, ссылку или числовой chat ID чата. Название будет взято из "
+            "Telegram при первой проверке доступа.",
         ),
         cancel_menu(),
         answer=False,
@@ -7464,49 +8475,25 @@ async def target_chat_ref(
             bot,
             state,
             "ℹ️ <b>Этот чат уже добавлен.</b> Повторно создавать его не нужно. "
-            "Название и настройки не менялись.\n\n" + target_details_text(existing, timings),
+            "Его название будет обновлено по данным Telegram при следующей проверке доступа.\n\n"
+            + target_details_text(existing, timings),
             target_details_menu(existing, 0),
         )
         await state.clear()
         return
-    await state.update_data(chat_ref=parsed.canonical)
-    await state.set_state(TargetCreateState.title)
-    await _edit_origin(
-        bot,
-        state,
-        wizard_text(
-            "🎯 Новый чат",
-            2,
-            2,
-            "Введите понятное название. Чат останется закрытым, пока вы отдельно не откроете его.",
-        ),
-        cancel_menu(),
-    )
-
-
-@router.message(TargetCreateState.title)
-async def target_title(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-    repository: AdminRepository,
-) -> None:
-    value = (message.text or "").strip()
-    if not value or len(value) > 150:
-        await message.answer("Название должно содержать от 1 до 150 символов.")
-        return
-    data = await state.get_data()
     try:
-        target = await repository.create_target(chat_ref=str(data["chat_ref"]), title=value)
+        await repository.create_target(chat_ref=parsed.canonical)
     except ConflictError as exc:
         await message.answer(escape(operator_error_message(exc)))
         return
+    data = await state.get_data()
     await state.clear()
     page = await repository.list_targets(0, PAGE_SIZE)
     await _edit_origin_data(
         bot,
         data,
-        f"✅ Чат <b>{escape(target.title)}</b> добавлен и пока закрыт.\n\n{targets_text(page)}",
+        "✅ Чат добавлен и пока закрыт. Его название будет автоматически взято из Telegram "
+        "при первой проверке доступа.\n\n" + targets_text(page),
         targets_menu(page),
     )
 
@@ -8496,7 +9483,9 @@ async def begin_campaign_create(
     repository: AdminRepository,
     settings: Settings,
 ) -> None:
-    await _begin_campaign_create(callback, state, repository, settings)
+    # Legacy cards can still carry this callback.  Route them to the unified
+    # draft so they get checkbox audiences and publication actions as well.
+    await open_new_order(callback, state)
 
 
 @router.callback_query(F.data.startswith("campaign:add:"))
@@ -8510,7 +9499,7 @@ async def begin_typed_campaign_create(
     if mode not in {"broadcast", "dialogue"}:
         await callback.answer("Неизвестный режим", show_alert=True)
         return
-    await _begin_campaign_create(callback, state, repository, settings, mode=mode)
+    await begin_order_draft(callback, state, repository, settings)
 
 
 async def _begin_campaign_create(
@@ -9199,12 +10188,13 @@ async def campaign_primary_text(
         )
     else:
         try:
-            value, _html_text, media = await _extract_broadcast_content(message, bot, settings)
+            value, html_text, media = await _extract_broadcast_content(message, bot, settings)
         except ContentError as exc:
             await message.answer(escape(operator_error_message(exc)))
             return
         await state.update_data(
             primary_text=value,
+            primary_html=html_text,
             primary_media_path=media.path if media else None,
             primary_media_kind=media.kind if media else None,
             primary_media_name=media.name if media else None,
@@ -9243,12 +10233,13 @@ async def campaign_reply_text(
     settings: Settings,
 ) -> None:
     try:
-        value, _html_text, media = await _extract_broadcast_content(message, bot, settings)
+        value, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
         await message.answer(escape(operator_error_message(exc)))
         return
     await state.update_data(
         reply_text=value,
+        reply_html=html_text,
         reply_media_path=media.path if media else None,
         reply_media_kind=media.kind if media else None,
         reply_media_name=media.name if media else None,
@@ -9288,6 +10279,7 @@ async def campaign_delay(
         {
             "account_id": int(data["primary_account_id"]),
             "text": str(data["primary_text"]),
+            "html_text": data.get("primary_html"),
             "delay_seconds": 0,
             "reply_to_previous": False,
             "media_path": data.get("primary_media_path"),
@@ -9298,6 +10290,7 @@ async def campaign_delay(
         {
             "account_id": int(data["reply_account_id"]),
             "text": str(data["reply_text"]),
+            "html_text": data.get("reply_html"),
             "delay_seconds": value,
             "reply_to_previous": True,
             "media_path": data.get("reply_media_path"),
@@ -9497,7 +10490,7 @@ async def dialogue_chain_text(
     settings: Settings,
 ) -> None:
     try:
-        value, _html_text, media = await _extract_broadcast_content(message, bot, settings)
+        value, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
         await message.answer(escape(operator_error_message(exc)))
         return
@@ -9508,6 +10501,7 @@ async def dialogue_chain_text(
             {
                 "account_id": int(data["chain_account_id"]),
                 "text": value,
+                "html_text": html_text,
                 "delay_seconds": 0,
                 "reply_to_previous": False,
                 "media_path": media.path if media else None,
@@ -9531,6 +10525,7 @@ async def dialogue_chain_text(
         return
     await state.update_data(
         chain_text=value,
+        chain_html=html_text,
         chain_media_path=media.path if media else None,
         chain_media_kind=media.kind if media else None,
         chain_media_name=media.name if media else None,
@@ -9572,6 +10567,7 @@ async def dialogue_chain_delay(
         {
             "account_id": int(data["chain_account_id"]),
             "text": str(data["chain_text"]),
+            "html_text": data.get("chain_html"),
             "delay_seconds": delay_seconds,
             "reply_to_previous": True,
             "media_path": data.get("chain_media_path"),
@@ -9667,6 +10663,7 @@ async def campaign_repeat_mode(
             repeat_count=1,
             repeat_interval_minutes=0,
             smart_timer_mode=False,
+            repeat_forever=False,
             smart_duration_hours=0,
             smart_no_timer_interval_minutes=0,
             auto_sender_failover=False,
@@ -9694,6 +10691,7 @@ async def campaign_repeat_mode(
         repeat_count=1,
         repeat_interval_minutes=0,
         smart_timer_mode=True,
+        repeat_forever=False,
         smart_no_timer_interval_minutes=default_profile.interval_minutes,
         min_messages_between_posts=default_profile.min_messages_between_posts,
         activity_check_interval_seconds=default_profile.activity_check_interval_seconds,
@@ -9709,7 +10707,8 @@ async def campaign_repeat_mode(
             7,
             "Сколько часов рассылка должна оставаться активной? В течение этого срока "
             "софт будет снова писать в каждый чат по его собственному расписанию.\n\n"
-            "Выберите срок или введите целое число часов от <b>1</b> до <b>168</b>.",
+            "Выберите срок, «До остановки» или введите целое число часов "
+            "от <b>1</b> до <b>168</b>.",
             hint=(
                 "Остановка срока не обрывает уже отправляемое сообщение, но новые повторы "
                 "после конца срока не создаются."
@@ -9728,7 +10727,15 @@ async def campaign_smart_duration_preset(
     state: FSMContext,
 ) -> None:
     hours = int((callback.data or "").rsplit(":", 1)[1])
-    await state.update_data(smart_duration_hours=hours)
+    period = (
+        "Работать: <b>до ручной остановки.</b>\n\n"
+        if hours == 0
+        else f"Срок активности: <b>{hours} ч.</b>\n\n"
+    )
+    await state.update_data(
+        smart_duration_hours=max(1, hours),
+        repeat_forever=hours == 0,
+    )
     await state.set_state(CampaignCreateState.smart_no_timer_interval_minutes)
     await _edit_callback(
         callback,
@@ -9736,8 +10743,7 @@ async def campaign_smart_duration_preset(
             "♻️ Умная непрерывная рассылка",
             7,
             7,
-            f"Срок активности: <b>{hours} ч.</b>\n\n"
-            "Как часто писать в чат, если у него <b>нет</b> ни Telegram slow mode, "
+            period + "Как часто писать в чат, если у него <b>нет</b> ни Telegram slow mode, "
             "ни ручного таймера? Выберите вариант или введите от <b>1</b> до "
             "<b>10080</b> минут. Активное значение — <b>5 минут</b>.\n\n"
             "Если таймер есть, этот интервал не используется: отправка становится готова "
@@ -9765,7 +10771,7 @@ async def campaign_smart_duration(
     if not 1 <= hours <= 168:
         await message.answer("Срок активности должен быть от 1 часа до 7 суток.")
         return
-    await state.update_data(smart_duration_hours=hours)
+    await state.update_data(smart_duration_hours=hours, repeat_forever=False)
     await state.set_state(CampaignCreateState.smart_no_timer_interval_minutes)
     await _edit_origin(
         bot,
@@ -9872,6 +10878,7 @@ async def confirm_campaign(
     callback: CallbackQuery,
     state: FSMContext,
     repository: AdminRepository,
+    settings: Settings,
 ) -> None:
     data = await state.get_data()
     mode = CampaignMode.BROADCAST if data.get("mode") == "broadcast" else CampaignMode.DIALOGUE
@@ -9924,7 +10931,14 @@ async def confirm_campaign(
             repeat_count=1,
             repeat_interval_seconds=0,
             smart_timer_mode=smart_timer_mode,
-            smart_duration_seconds=(smart_duration_hours * 3600 if smart_timer_mode else 0),
+            repeat_forever=smart_timer_mode and bool(data.get("repeat_forever", False)),
+            smart_duration_seconds=(
+                0
+                if bool(data.get("repeat_forever", False))
+                else smart_duration_hours * 3600
+                if smart_timer_mode
+                else 0
+            ),
             smart_no_timer_interval_seconds=(
                 smart_no_timer_interval_minutes * 60 if smart_timer_mode else 0
             ),
@@ -9951,9 +10965,21 @@ async def confirm_campaign(
                     default_profile.visibility_max_wait_seconds,
                 )
             ),
-            auto_sender_failover=smart_timer_mode,
+            auto_sender_failover=(
+                bool(data.get("auto_sender_failover", True))
+                and mode == CampaignMode.BROADCAST
+                and BroadcastSenderMode(
+                    str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
+                )
+                == BroadcastSenderMode.DISTRIBUTED
+            ),
+            # Legacy creation remains available, so preserve its explicit
+            # choice just like the order flow.  Distributed is only the safe
+            # fallback when the old draft predates sender-mode controls.
             sender_mode=(
-                BroadcastSenderMode.INDEPENDENT
+                BroadcastSenderMode(
+                    str(data.get("sender_mode") or BroadcastSenderMode.DISTRIBUTED.value)
+                )
                 if mode == CampaignMode.BROADCAST
                 else BroadcastSenderMode.DISTRIBUTED
             ),
@@ -9973,7 +10999,7 @@ async def confirm_campaign(
     await _edit_callback(
         callback,
         f"✅ «{escape(campaign.name)}» сохранено. Теперь можно запустить из списка.\n\n"
-        f"{campaigns_text(page)}",
+        f"{campaigns_text(page, worker_campaign_scope=settings.worker_campaign_id_scope)}",
         campaigns_menu(page),
         answer=False,
     )
@@ -10123,7 +11149,12 @@ async def begin_campaign_target_edit(
         return
     await callback.answer()
     await _remember_origin(callback, state)
-    await state.update_data(edit_campaign_id=campaign.id, edit_campaign_page=int(page))
+    await state.update_data(
+        edit_campaign_id=campaign.id,
+        edit_campaign_page=int(page),
+        edit_campaign_selected_target_ids=[],
+        edit_campaign_selection_initialized=False,
+    )
     await state.set_state(CampaignEditState.target)
     await _edit_callback(
         callback,
@@ -10141,6 +11172,215 @@ async def begin_campaign_target_edit(
             campaign_page=int(page),
         ),
         answer=False,
+    )
+
+
+async def _show_campaign_checked_target_picker(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    *,
+    campaign_id: int,
+    campaign_page: int,
+    target_page: int,
+    answer: bool = True,
+) -> None:
+    try:
+        campaign = await repository.get_campaign(campaign_id)
+    except NotFoundError as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    page = await repository.list_approved_targets(target_page, AUDIENCE_PAGE_SIZE)
+    if page.page >= page.pages and page.pages:
+        page = await repository.list_approved_targets(page.pages - 1, AUDIENCE_PAGE_SIZE)
+    if not page.items:
+        await callback.answer("Нет включённых отдельных чатов", show_alert=True)
+        return
+    data = await state.get_data()
+    selected_ids = {
+        int(target_id)
+        for target_id in data.get("edit_campaign_selected_target_ids", [])
+        if str(target_id).isdigit()
+    }
+    await state.update_data(
+        edit_campaign_id=campaign.id,
+        edit_campaign_page=campaign_page,
+        edit_campaign_selected_target_ids=sorted(selected_ids),
+        edit_campaign_target_page=page.page,
+    )
+    await state.set_state(CampaignEditState.target_selection)
+    await _edit_callback(
+        callback,
+        wizard_text(
+            f"☑️ Подборка чатов · {campaign.name}",
+            1,
+            1,
+            "Отметьте нужные чаты и нажмите «Сохранить подборку». Будет создана новая "
+            "независимая подборка: исходный список и уже поставленные отправки не изменятся.",
+            hint="Отмечены только доступные отдельные чаты. У выключенных или проблемных "
+            "чатов отметка не сохраняется.",
+        ),
+        campaign_checked_target_picker(
+            page,
+            selected_ids=selected_ids,
+            campaign_id=campaign.id,
+            campaign_page=campaign_page,
+        ),
+        answer=answer,
+    )
+
+
+@router.callback_query(F.data.startswith("campaign:edit:checked:"))
+async def page_campaign_checked_targets(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    _, _, _, campaign_id, campaign_page, target_page = (callback.data or "").split(":")
+    data = await state.get_data()
+    if int(data.get("edit_campaign_id") or campaign_id) != int(campaign_id):
+        await callback.answer("Откройте редактирование чатов заново", show_alert=True)
+        return
+    if not data.get("edit_campaign_selection_initialized"):
+        try:
+            selected_ids = await repository.campaign_selected_standalone_target_ids(
+                int(campaign_id)
+            )
+        except NotFoundError as exc:
+            await callback.answer(callback_error_message(exc), show_alert=True)
+            return
+        await state.update_data(
+            edit_campaign_selected_target_ids=selected_ids,
+            edit_campaign_selection_initialized=True,
+        )
+    await _show_campaign_checked_target_picker(
+        callback,
+        state,
+        repository,
+        campaign_id=int(campaign_id),
+        campaign_page=int(campaign_page),
+        target_page=int(target_page),
+    )
+
+
+@router.callback_query(
+    CampaignEditState.target_selection,
+    F.data.startswith("campaign:edit:checktoggle:"),
+)
+async def toggle_campaign_checked_target(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    target_id = int((callback.data or "").rsplit(":", 1)[1])
+    data = await state.get_data()
+    selected_ids = {
+        int(value)
+        for value in data.get("edit_campaign_selected_target_ids", [])
+        if str(value).isdigit()
+    }
+    if target_id in selected_ids:
+        selected_ids.remove(target_id)
+    else:
+        selected_ids.add(target_id)
+    await state.update_data(edit_campaign_selected_target_ids=sorted(selected_ids))
+    await _show_campaign_checked_target_picker(
+        callback,
+        state,
+        repository,
+        campaign_id=int(data["edit_campaign_id"]),
+        campaign_page=int(data["edit_campaign_page"]),
+        target_page=int(data.get("edit_campaign_target_page") or 0),
+        answer=False,
+    )
+
+
+@router.callback_query(
+    CampaignEditState.target_selection,
+    F.data.in_({"campaign:edit:checkall", "campaign:edit:checkclear"}),
+)
+async def bulk_campaign_checked_targets(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    data = await state.get_data()
+    if callback.data == "campaign:edit:checkall":
+        selected_ids = [target.id for target in await repository.approved_targets()]
+    else:
+        selected_ids = []
+    await state.update_data(edit_campaign_selected_target_ids=selected_ids)
+    await _show_campaign_checked_target_picker(
+        callback,
+        state,
+        repository,
+        campaign_id=int(data["edit_campaign_id"]),
+        campaign_page=int(data["edit_campaign_page"]),
+        target_page=int(data.get("edit_campaign_target_page") or 0),
+        answer=False,
+    )
+
+
+@router.callback_query(CampaignEditState.target_selection, F.data == "campaign:edit:checkdone")
+async def save_campaign_checked_targets(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    data = await state.get_data()
+    selected_ids = [
+        int(value)
+        for value in data.get("edit_campaign_selected_target_ids", [])
+        if str(value).isdigit()
+    ]
+    if not selected_ids:
+        await callback.answer("Выберите хотя бы один чат", show_alert=True)
+        return
+    campaign_id = int(data["edit_campaign_id"])
+    page = int(data["edit_campaign_page"])
+    try:
+        current = await repository.get_campaign(campaign_id)
+        campaign = await repository.update_campaign_selected_targets(
+            campaign_id,
+            target_ids=selected_ids,
+            target_list_name=f"Подборка · {current.name[:110]} · {uuid4().hex[:8]}",
+        )
+        sender_ids = await repository.campaign_sender_ids(campaign.id)
+    except (ConflictError, NotFoundError) as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Подборка чатов сохранена")
+    await _edit_callback(
+        callback,
+        "✅ <b>Подборка чатов обновлена для следующих рассылок.</b>\n\n"
+        "Исходный список не менялся: сценарий получил новую независимую подборку.\n\n"
+        + campaign_details_text(campaign, sender_ids),
+        campaign_details_menu(campaign, page),
+        answer=False,
+    )
+
+
+@router.callback_query(CampaignEditState.target_selection, F.data == "campaign:edit:checksearch")
+async def begin_campaign_checked_target_search(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    data = await state.get_data()
+    await state.update_data(edit_target_search_kind="checked")
+    await state.set_state(CampaignEditState.search)
+    await _edit_callback(
+        callback,
+        "<b>🔎 Найти чат в подборке</b>\n\n"
+        "Отправьте часть названия, username/ссылку или точный ID. Результат можно "
+        "отметить галочкой.",
+        search_prompt_menu(
+            "campaign",
+            back_callback=(
+                f"campaign:edit:checked:{int(data['edit_campaign_id'])}:"
+                f"{int(data['edit_campaign_page'])}:0"
+            ),
+        ),
     )
 
 
@@ -10244,6 +11484,12 @@ async def search_campaign_edit_target(
         results = [
             (f"📌 {item.title} · {item.chat_ref}", f"cedit:target:{item.id}") for item in items
         ]
+    elif kind == "checked":
+        items = await repository.search_targets(query, approved_only=True)
+        results = [
+            (f"☑️ {item.title} · {item.chat_ref}", f"campaign:edit:checktoggle:{item.id}")
+            for item in items
+        ]
     elif kind == "lists":
         items = await repository.search_target_lists(query, approved_only=True)
         results = [
@@ -10254,18 +11500,35 @@ async def search_campaign_edit_target(
         await state.clear()
         await message.answer("Поиск устарел. Откройте редактирование аудитории заново.")
         return
-    await state.set_state(CampaignEditState.target)
+    next_state = (
+        CampaignEditState.target_selection if kind == "checked" else CampaignEditState.target
+    )
+    await state.set_state(next_state)
     await _edit_origin(
         bot,
         state,
         "<b>🔎 Результаты поиска аудитории</b>\n"
         f"<code>{escape(query)}</code> · найдено <b>{len(results)}</b>\n\n"
-        + ("Выберите новую аудиторию." if results else "Совпадений нет."),
+        + (
+            "Отметьте чат галочкой."
+            if kind == "checked" and results
+            else "Выберите новую аудиторию."
+            if results
+            else "Совпадений нет."
+        ),
         search_results_menu(
             results,
             section="campaign",
-            new_search_callback=(f"campaign:edit:search:{kind}:{campaign_id}:{campaign_page}"),
-            back_callback=(f"campaign:edit:browse:{kind}:{campaign_id}:{campaign_page}:0"),
+            new_search_callback=(
+                "campaign:edit:checksearch"
+                if kind == "checked"
+                else f"campaign:edit:search:{kind}:{campaign_id}:{campaign_page}"
+            ),
+            back_callback=(
+                f"campaign:edit:checked:{campaign_id}:{campaign_page}:0"
+                if kind == "checked"
+                else f"campaign:edit:browse:{kind}:{campaign_id}:{campaign_page}:0"
+            ),
         ),
     )
 
@@ -10340,8 +11603,13 @@ async def begin_campaign_schedule_edit(
     await state.set_state(CampaignScheduleEditState.mode)
     if campaign.smart_timer_mode:
         current = (
-            "умная непрерывная · срок "
-            f"{campaign.smart_duration_seconds // 3600} ч. · без таймера каждые "
+            "умная непрерывная · "
+            + (
+                "до ручной остановки"
+                if campaign.repeat_forever
+                else f"срок {campaign.smart_duration_seconds // 3600} ч."
+            )
+            + " · без таймера каждые "
             f"{campaign.smart_no_timer_interval_seconds // 60} мин."
         )
     elif campaign.repeat_count == 1:
@@ -10414,8 +11682,8 @@ async def choose_campaign_schedule_mode(
                 "♻️ Умная непрерывная рассылка",
                 2,
                 3,
-                "Укажите новый срок активности: выберите вариант или введите целое "
-                "число часов от <b>1</b> до <b>168</b>.\n\n"
+                "Укажите новый срок активности: выберите вариант, «До остановки» или введите "
+                "целое число часов от <b>1</b> до <b>168</b>.\n\n"
                 "В течение этого срока каждый чат работает независимо: чат с таймером "
                 "готов к отправке сразу после его окончания.",
             ),
@@ -10447,7 +11715,15 @@ async def edit_campaign_smart_duration_preset(
     state: FSMContext,
 ) -> None:
     hours = int((callback.data or "").rsplit(":", 1)[1])
-    await state.update_data(schedule_smart_duration_hours=hours)
+    period = (
+        "Работать: <b>до ручной остановки.</b>\n\n"
+        if hours == 0
+        else f"Срок активности: <b>{hours} ч.</b>\n\n"
+    )
+    await state.update_data(
+        schedule_smart_duration_hours=max(1, hours),
+        schedule_repeat_forever=hours == 0,
+    )
     await state.set_state(CampaignScheduleEditState.smart_no_timer_interval_minutes)
     await _edit_callback(
         callback,
@@ -10455,8 +11731,7 @@ async def edit_campaign_smart_duration_preset(
             "♻️ Умная непрерывная рассылка",
             3,
             3,
-            f"Срок активности: <b>{hours} ч.</b>\n\n"
-            "Задайте интервал только для чатов <b>без</b> Telegram slow mode и "
+            period + "Задайте интервал только для чатов <b>без</b> Telegram slow mode и "
             "без ручного таймера: от <b>1</b> до <b>10080</b> минут. "
             "Активный режим по умолчанию — <b>5 минут</b>.\n\n"
             "Чат с таймером будет готов к отправке сразу по окончании своего таймера.",
@@ -10483,7 +11758,7 @@ async def edit_campaign_smart_duration(
     if not 1 <= hours <= 168:
         await message.answer("Срок активности должен быть от 1 часа до 7 суток.")
         return
-    await state.update_data(schedule_smart_duration_hours=hours)
+    await state.update_data(schedule_smart_duration_hours=hours, schedule_repeat_forever=False)
     await state.set_state(CampaignScheduleEditState.smart_no_timer_interval_minutes)
     await _edit_origin(
         bot,
@@ -10520,8 +11795,13 @@ async def save_campaign_smart_schedule_preset(
     try:
         campaign = await repository.update_campaign_smart_schedule(
             int(data["schedule_campaign_id"]),
-            smart_duration_seconds=int(data["schedule_smart_duration_hours"]) * 3600,
+            smart_duration_seconds=(
+                0
+                if bool(data.get("schedule_repeat_forever", False))
+                else int(data["schedule_smart_duration_hours"]) * 3600
+            ),
             smart_no_timer_interval_seconds=minutes * 60,
+            repeat_forever=bool(data.get("schedule_repeat_forever", False)),
             auto_sender_failover=data.get("schedule_campaign_mode") == "broadcast",
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
@@ -10559,8 +11839,13 @@ async def save_campaign_smart_schedule(
     try:
         campaign = await repository.update_campaign_smart_schedule(
             int(data["schedule_campaign_id"]),
-            smart_duration_seconds=int(data["schedule_smart_duration_hours"]) * 3600,
+            smart_duration_seconds=(
+                0
+                if bool(data.get("schedule_repeat_forever", False))
+                else int(data["schedule_smart_duration_hours"]) * 3600
+            ),
             smart_no_timer_interval_seconds=minutes * 60,
+            repeat_forever=bool(data.get("schedule_repeat_forever", False)),
             auto_sender_failover=data.get("schedule_campaign_mode") == "broadcast",
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
@@ -10726,16 +12011,79 @@ async def cancel_campaign_schedule_edit(
     )
 
 
-@router.callback_query(F.data.startswith("campaign:toggle:"))
-async def toggle_campaign(callback: CallbackQuery, repository: AdminRepository) -> None:
-    _, _, campaign_id, page = (callback.data or "").split(":")
+@router.callback_query(F.data.startswith("campaign:pause:ask:"))
+async def ask_pause_campaign(callback: CallbackQuery, repository: AdminRepository) -> None:
+    _, _, _, campaign_id, page = (callback.data or "").split(":")
     try:
-        campaign = await repository.toggle_campaign(int(campaign_id))
+        campaign = await repository.get_campaign(int(campaign_id))
+    except NotFoundError as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    if not campaign.enabled:
+        await callback.answer("Сценарий уже приостановлен")
+        await _edit_callback(
+            callback,
+            campaign_details_text(campaign, await repository.campaign_sender_ids(campaign.id)),
+            campaign_details_menu(campaign, int(page)),
+            answer=False,
+        )
+        return
+    await _edit_callback(
+        callback,
+        f"<b>⏸ Приостановить «{escape(campaign.name)}»?</b>\n\n"
+        "Новые запуски будут недоступны. Задания уже в очереди перестанут браться в "
+        "работу, а ожидающие реакции отменятся; уже взятое задание может завершиться "
+        "ошибкой конфигурации.\n\n"
+        "Чтобы аккуратно остановить текущую партию, откройте её отчёт и используйте "
+        "«Остановить отправку» там.",
+        campaign_pause_confirmation(campaign.id, int(page)),
+    )
+
+
+@router.callback_query(F.data.startswith("campaign:pause:confirm:"))
+async def confirm_pause_campaign(callback: CallbackQuery, repository: AdminRepository) -> None:
+    _, _, _, campaign_id, page = (callback.data or "").split(":")
+    try:
+        campaign = await repository.get_campaign(int(campaign_id))
+        if campaign.enabled:
+            campaign = await repository.toggle_campaign(campaign.id)
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except NotFoundError as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Сценарий включён" if campaign.enabled else "Сценарий на паузе")
+    await callback.answer("Сценарий приостановлен")
+    await _edit_callback(
+        callback,
+        campaign_details_text(campaign, sender_ids),
+        campaign_details_menu(campaign, int(page)),
+        answer=False,
+    )
+
+
+@router.callback_query(F.data.startswith("campaign:toggle:"))
+async def toggle_campaign(callback: CallbackQuery, repository: AdminRepository) -> None:
+    _, _, campaign_id, page = (callback.data or "").split(":")
+    try:
+        current = await repository.get_campaign(int(campaign_id))
+    except NotFoundError as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    if current.enabled:
+        await _edit_callback(
+            callback,
+            f"<b>⏸ Приостановить «{escape(current.name)}»?</b>\n\n"
+            "Эта кнопка на старом сообщении не приостанавливает сценарий сразу. "
+            "Подтвердите действие ниже.",
+            campaign_pause_confirmation(current.id, int(page)),
+        )
+        return
+    try:
+        campaign = await repository.toggle_campaign(current.id)
+        sender_ids = await repository.campaign_sender_ids(campaign.id)
+    except NotFoundError as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    await callback.answer("Новые запуски снова разрешены")
     await _edit_callback(
         callback,
         campaign_details_text(campaign, sender_ids),
@@ -11468,17 +12816,14 @@ async def campaign_preflight(
     except NotFoundError as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Проверка аккаунтов и чатов началась")
-    await _edit_callback(
-        callback,
-        "<b>🩺 Проверяю готовность</b>\n\n"
-        "Сессии, членство, право писать и таймеры проверяются без вступлений и отправок.",
-        campaign_details_menu(campaign, page_value),
-        answer=False,
-    )
     try:
-        summary = await preflight_service.inspect_campaign(campaign_id_value)
-    except (ConflictError, NotFoundError) as exc:
+        summary = await _inspect_campaign_with_visible_progress(
+            callback,
+            preflight_service,
+            campaign_id_value,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the campaign card actionable after any failure
+        logger.warning("Campaign-only preflight failed for campaign %s", campaign.id, exc_info=True)
         await _edit_callback(
             callback,
             f"<b>❌ Проверка не выполнена</b>\n\n{escape(operator_error_message(exc))}",
@@ -11489,37 +12834,82 @@ async def campaign_preflight(
     await _edit_callback(
         callback,
         campaign_preflight_text(summary),
-        campaign_details_menu(campaign, page_value),
+        campaign_run_confirmation(
+            campaign.id,
+            page_value,
+            ready_targets=(summary.launchable_units if summary.launchable_units else None),
+            schedule_after_cooldown=(summary.launchable_units == 0 and summary.deferred_pairs > 0),
+        )
+        if summary.launchable_units or summary.deferred_pairs
+        else campaign_details_menu(campaign, page_value),
         answer=False,
     )
 
 
-@router.callback_query(F.data.startswith("campaign:sendermode:toggle:"))
-async def toggle_campaign_sender_mode(
+@router.callback_query(F.data.startswith("campaign:sendermode:choose:"))
+async def choose_campaign_sender_mode(
     callback: CallbackQuery,
     repository: AdminRepository,
 ) -> None:
     _, _, _, campaign_id, page = (callback.data or "").split(":")
     try:
-        current = await repository.get_campaign(int(campaign_id))
-        selected = (
-            BroadcastSenderMode.DISTRIBUTED
-            if current.sender_mode == BroadcastSenderMode.INDEPENDENT
-            else BroadcastSenderMode.INDEPENDENT
-        )
-        campaign = await repository.update_campaign_sender_mode(int(campaign_id), selected)
+        campaign = await repository.get_campaign(int(campaign_id))
+        if campaign.mode != CampaignMode.BROADCAST:
+            await callback.answer("Режим аккаунтов доступен только для рассылки", show_alert=True)
+            return
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
-    label = "независимые потоки" if selected == BroadcastSenderMode.INDEPENDENT else "распределение"
-    await callback.answer(f"Режим аккаунтов: {label}")
+    await _edit_callback(
+        callback,
+        "<b>👥 Как будут работать аккаунты</b>\n\n"
+        "🤖 <b>Умный выбор</b> — один пост в каждый чат; сервис выберет подходящий "
+        "аккаунт из пула.\n\n"
+        "🚀 <b>Независимо</b> — каждый из выбранных аккаунтов публикует во всех чатах. "
+        "Объём первого прохода увеличится пропорционально числу аккаунтов.\n\n"
+        f"Выбрано аккаунтов: <b>{len(sender_ids)}</b>. Изменение применяется только к "
+        "будущим запускам; уже созданная очередь не изменится.",
+        campaign_sender_mode_menu(campaign.id, int(page), campaign.sender_mode.value),
+    )
+
+
+@router.callback_query(
+    F.data.regexp(r"^campaign:sendermode:set:(distributed|independent):\d+:\d+$"),
+)
+async def set_campaign_sender_mode(
+    callback: CallbackQuery,
+    repository: AdminRepository,
+) -> None:
+    _, _, _, selected_mode, campaign_id, page = (callback.data or "").split(":")
+    try:
+        campaign = await repository.update_campaign_sender_mode(
+            int(campaign_id),
+            BroadcastSenderMode(selected_mode),
+        )
+        sender_ids = await repository.campaign_sender_ids(campaign.id)
+    except (ValueError, ConflictError, NotFoundError) as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    await callback.answer(
+        "Режим будущих запусков: умный выбор"
+        if campaign.sender_mode == BroadcastSenderMode.DISTRIBUTED
+        else "Режим будущих запусков: независимые потоки"
+    )
     await _edit_callback(
         callback,
         campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, int(page)),
         answer=False,
     )
+
+
+@router.callback_query(F.data.startswith("campaign:sendermode:toggle:"))
+async def redirect_legacy_campaign_sender_mode(
+    callback: CallbackQuery,
+    repository: AdminRepository,
+) -> None:
+    await choose_campaign_sender_mode(callback, repository)
 
 
 @router.callback_query(F.data.startswith("campaign:mentions:toggle:"))
@@ -11617,7 +13007,7 @@ async def begin_custom_campaign_mention_cooldown(
     await _edit_callback(
         callback,
         "<b>Срок ротации отметок</b>\n\nОтправьте целое число дней от <b>1</b> до <b>365</b>.",
-        cancel_menu(),
+        cancel_menu(f"campaign:details:{campaign_id}:{page}"),
     )
 
 
@@ -11662,6 +13052,7 @@ async def apply_campaign_profile(
             int(campaign_id),
             smart_duration_seconds=profile.duration_hours * 3600,
             smart_no_timer_interval_seconds=profile.interval_minutes * 60,
+            repeat_forever=False,
             auto_sender_failover=True,
             activity_aware=True,
             min_messages_between_posts=profile.min_messages_between_posts,
@@ -11719,7 +13110,8 @@ async def begin_campaign_advanced_edit(
         ),
         "duration": (
             "🗓 Срок работы",
-            "Отправьте число часов от 1 до 168. По умолчанию активный режим работает 24 часа.",
+            "Отправьте число часов от 0 до 168. 0 — работать до ручной остановки; "
+            "24 — срок активного режима по умолчанию.",
         ),
         "depth": (
             "👁 Глубина видимости",
@@ -11730,8 +13122,9 @@ async def begin_campaign_advanced_edit(
             "Отправьте число секунд от 30 до 3600. По умолчанию — 60 секунд.",
         ),
         "maxwait": (
-            "⌛ Максимальное ожидание",
-            "Отправьте число минут от 1 до 10080. Активный дедлайн по умолчанию — 15 минут.",
+            "⌛ Тайм-аут до повтора",
+            "Отправьте число минут от 0 до 10080. 0 — строго ждать выбранное число новых "
+            "сообщений без публикации по таймеру; 15 — активный профиль по умолчанию.",
         ),
     }
     spec = specs.get(field)
@@ -11773,10 +13166,10 @@ async def save_campaign_advanced_value(
         value = 0
     ranges = {
         "interval": (1, 10080, "минут"),
-        "duration": (1, 168, "часов"),
+        "duration": (0, 168, "часов"),
         "depth": (1, 100000, "сообщений"),
         "check": (30, 3600, "секунд"),
-        "maxwait": (1, 10080, "минут"),
+        "maxwait": (0, 10080, "минут"),
     }
     minimum, maximum, unit = ranges.get(field, (1, 0, ""))
     if not minimum <= value <= maximum:
@@ -11788,7 +13181,8 @@ async def save_campaign_advanced_value(
         duration = current.smart_duration_seconds
         interval = current.smart_no_timer_interval_seconds
         if field == "duration":
-            duration = value * 3600
+            duration = 0 if value == 0 else value * 3600
+            changes["repeat_forever"] = value == 0
         elif field == "interval":
             interval = value * 60
         elif field == "depth":
@@ -11880,12 +13274,13 @@ async def campaign_reactions_settings(callback: CallbackQuery, repository: Admin
     try:
         campaign = await repository.get_campaign(int(campaign_id))
         step_count = _campaign_reaction_step_count(campaign)
+        sender_count = len(await repository.campaign_sender_ids(campaign.id))
     except (NotFoundError, ValueError) as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        campaign_reactions_text(campaign, step_count),
+        campaign_reactions_text(campaign, step_count, sender_count=sender_count),
         campaign_reactions_menu(campaign, int(page), step_count),
     )
 
@@ -11916,13 +13311,14 @@ async def update_campaign_reactions(callback: CallbackQuery, repository: AdminRe
             await callback.answer("Неизвестная настройка реакций", show_alert=True)
             return
         step_count = _campaign_reaction_step_count(campaign)
+        sender_count = len(await repository.campaign_sender_ids(campaign.id))
     except (KeyError, ValueError, ConflictError, NotFoundError) as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
     await callback.answer("Настройка реакций сохранена")
     await _edit_callback(
         callback,
-        campaign_reactions_text(campaign, step_count),
+        campaign_reactions_text(campaign, step_count, sender_count=sender_count),
         campaign_reactions_menu(campaign, int(page), step_count),
         answer=False,
     )
@@ -11946,7 +13342,11 @@ async def ask_delete_campaign(callback: CallbackQuery, repository: AdminReposito
 
 
 @router.callback_query(F.data.startswith("campaign:delete:confirm:"))
-async def confirm_delete_campaign(callback: CallbackQuery, repository: AdminRepository) -> None:
+async def confirm_delete_campaign(
+    callback: CallbackQuery,
+    repository: AdminRepository,
+    settings: Settings,
+) -> None:
     _, _, _, campaign_id, page = (callback.data or "").split(":")
     try:
         await repository.delete_campaign(int(campaign_id))
@@ -11954,7 +13354,7 @@ async def confirm_delete_campaign(callback: CallbackQuery, repository: AdminRepo
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
     await callback.answer("Сценарий удалён")
-    await _show_campaigns(callback, repository, int(page))
+    await _show_campaigns(callback, repository, settings, int(page))
 
 
 @router.callback_query(F.data.startswith("campaign:run:ask:"))
@@ -11962,6 +13362,7 @@ async def ask_enqueue_campaign(
     callback: CallbackQuery,
     repository: AdminRepository,
     settings: Settings,
+    preflight_service: PreflightService,
 ) -> None:
     _, _, _, campaign_id, page = (callback.data or "").split(":")
     try:
@@ -11985,6 +13386,15 @@ async def ask_enqueue_campaign(
     if not campaign.enabled:
         await callback.answer("Эта рассылка остановлена. Сначала включите её.", show_alert=True)
         return
+    worker_scope = settings.worker_campaign_id_scope
+    if worker_scope is not None and campaign.id not in worker_scope:
+        active_ids = ", ".join(f"#{item}" for item in sorted(worker_scope))
+        await callback.answer(
+            "Фоновый worker сейчас ограничен рассылками "
+            f"{active_ids}. Эта рассылка не начнётся, пока ограничение не снимут.",
+            show_alert=True,
+        )
+        return
     account_factor = (
         len(sender_ids)
         if campaign.mode == CampaignMode.BROADCAST
@@ -12004,60 +13414,65 @@ async def ask_enqueue_campaign(
         return
     capacity_warning: str | None = None
     if campaign.smart_timer_mode and target_count:
-        sender_count = max(1, len(sender_ids))
-        capacity = estimate_capacity(
-            account_count=(
-                1 if campaign.sender_mode == BroadcastSenderMode.INDEPENDENT else sender_count
-            ),
-            target_count=target_count,
-            interval_seconds=campaign.smart_no_timer_interval_seconds,
-            pace_seconds=settings.account_pace_max_seconds,
-            daily_limit=settings.account_daily_limit,
-            micro_break_every=settings.account_micro_break_every,
-            micro_break_seconds=settings.account_micro_break_max_seconds,
-        )
-        if (
-            capacity.full_round_seconds is not None
-            and capacity.full_round_seconds > campaign.smart_no_timer_interval_seconds
-        ):
-            daily_line = (
-                f" Реальная мощность — около {capacity.messages_per_day} публикаций в сутки, "
-                f"а выбранная частота требует около {capacity.requested_per_day}."
-                if capacity.messages_per_day is not None
-                else ""
-            )
-            coverage_line = (
-                f" Выполнимо примерно {capacity.coverage_ratio * 100:.1f}% плана."
-                if capacity.coverage_ratio is not None
-                else ""
-            )
-            capacity_warning = (
-                "⚠️ <b>Текущего пула может не хватить для выбранной частоты.</b> "
-                f"Полный круг по {target_count} чатам займёт примерно "
-                f"{ceil(capacity.full_round_seconds / 60)} мин.{daily_line}{coverage_line} "
-                "Увеличьте интервал, сократите аудиторию или используйте больше готовых "
-                "аккаунтов."
-            )
-    await _edit_callback(
-        callback,
-        campaign_run_confirmation_text(
+        capacity_warning = _campaign_active_capacity_warning(
             campaign,
             sender_count=len(sender_ids),
             target_count=target_count,
+            settings=settings,
+        )
+    try:
+        summary = await _inspect_campaign_with_visible_progress(
+            callback,
+            preflight_service,
+            campaign.id,
+        )
+    except Exception as exc:  # noqa: BLE001 - the saved campaign must remain recoverable
+        logger.warning("Campaign preflight failed for campaign %s", campaign.id, exc_info=True)
+        await _edit_callback(
+            callback,
+            f"<b>❌ Проверка не выполнена</b>\n\n{escape(operator_error_message(exc))}",
+            campaign_details_menu(campaign, int(page)),
+            answer=False,
+        )
+        return
+    ready_targets = summary.launchable_units
+    review_task_count = (
+        ready_targets if campaign.smart_timer_mode else ready_targets * campaign.repeat_count
+    )
+    await _edit_callback(
+        callback,
+        campaign_launch_review_text(
+            campaign,
+            summary,
+            planned_tasks=review_task_count,
             capacity_warning=capacity_warning,
         ),
-        campaign_run_confirmation(campaign.id, int(page)),
+        campaign_run_confirmation(
+            campaign.id,
+            int(page),
+            ready_targets=ready_targets if ready_targets else None,
+            schedule_after_cooldown=(ready_targets == 0 and summary.deferred_pairs > 0),
+        )
+        if ready_targets or summary.deferred_pairs
+        else campaign_details_menu(campaign, int(page)),
+        answer=False,
     )
 
 
 @router.callback_query(F.data.startswith("campaign:run:confirm:"))
+@router.callback_query(F.data.startswith("campaign:run:deferred:"))
 async def enqueue_campaign(
     callback: CallbackQuery,
     repository: AdminRepository,
     preflight_service: PreflightService,
     run_queue: RunQueue,
+    settings: Settings,
 ) -> None:
-    _, _, _, campaign_id, page = (callback.data or "").split(":")
+    _, _, launch_action, campaign_id, page = (callback.data or "").split(":")
+    if launch_action not in {"confirm", "deferred"}:
+        await callback.answer("Неизвестный вариант запуска", show_alert=True)
+        return
+    allow_deferred_start = launch_action == "deferred"
     campaign_id_value = int(campaign_id)
     page_value = int(page)
     try:
@@ -12065,19 +13480,41 @@ async def enqueue_campaign(
     except NotFoundError as exc:
         await callback.answer(callback_error_message(exc), show_alert=True)
         return
+    worker_scope = settings.worker_campaign_id_scope
+    if worker_scope is not None and campaign.id not in worker_scope:
+        active_ids = ", ".join(f"#{item}" for item in sorted(worker_scope))
+        await callback.answer(
+            "Фоновый worker сейчас ограничен рассылками "
+            f"{active_ids}. Эта рассылка не начнётся, пока ограничение не снимут.",
+            show_alert=True,
+        )
+        return
     launch_key = uuid4().hex
-    await callback.answer("Проверяю доступ к чатам и ставлю рассылку в очередь…")
+    await callback.answer("Проверяю свежесть результата и ставлю рассылку в очередь…")
     summary: CampaignPreflightSummary | None = None
     try:
-        # The saved-campaign path used to rely on an earlier manual check and
-        # surfaced the queue guard as a technical alert.  Check immediately
-        # before enqueuing instead: this is both fresher and keeps the launch
-        # flow self-contained for the operator.
-        summary = await preflight_service.inspect_campaign(campaign_id_value)
-        runs = await run_queue.enqueue_campaign(campaign_id_value, launch_key)
-    except (ConflictError, NotFoundError):
+        # Review already performed the full read-only RPC preflight. Reuse its
+        # persisted result here; the queue still enforces its strict freshness
+        # window, so a delayed confirmation cannot launch stale routes.
+        summary = await preflight_service.cached_campaign_summary(campaign_id_value)
+        runs = await run_queue.enqueue_campaign(
+            campaign_id_value,
+            launch_key,
+            allow_deferred_start=allow_deferred_start,
+        )
+    except (ConflictError, NotFoundError) as exc:
         if summary is not None:
-            text = campaign_launch_not_ready_text(summary)
+            reason = operator_error_message(exc)
+            text = campaign_launch_not_ready_text(
+                summary,
+                # A capacity-window conflict is discovered only by the final
+                # whole-matrix planner. Keep its exact explanation; other
+                # conflicts are still explained correctly by the preflight
+                # summary (for example an expired result or a Telegram pause).
+                planning_reason=(
+                    reason if reason.startswith("активная рассылка не может стартовать") else None
+                ),
+            )
         else:
             text = (
                 screen_title(
@@ -12086,7 +13523,7 @@ async def enqueue_campaign(
                 )
                 + "\n\n"
                 + section("Что делать")
-                + "\nНажмите «Проверить перед отправкой», восстановите доступ к чатам или "
+                + "\nНажмите «Проверить доступ без запуска», восстановите доступ к чатам или "
                 "аккаунтам и повторите запуск."
             )
         await _edit_callback(
@@ -12278,6 +13715,156 @@ async def save_active_launch_interval(
     await state.clear()
 
 
+@router.callback_query(F.data.startswith("launch:edit:depth:"))
+async def begin_active_launch_depth_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    _, _, _, anchor_run_id, page = (callback.data or "").split(":")
+    try:
+        launch, _ = await repository.get_launch(int(anchor_run_id))
+    except NotFoundError as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    if not launch.active or not launch.smart_timer_mode:
+        await callback.answer("Активная рассылка уже завершена", show_alert=True)
+        return
+    await _remember_origin(callback, state)
+    await state.update_data(
+        edit_launch_anchor_id=launch.anchor_run_id,
+        edit_launch_page=int(page),
+    )
+    await state.set_state(LaunchEditState.min_messages_between_posts)
+    await _edit_callback(
+        callback,
+        wizard_text(
+            "👁 Порог новых сообщений",
+            1,
+            1,
+            "После скольких новых сообщений в конкретном чате публиковать следующий "
+            "пост? Введите целое число от <b>1</b> до <b>100000</b>.",
+            hint=(
+                "Введите 10 или 12. Изменение затронет только ещё не опубликованные "
+                "циклы этого запуска."
+            ),
+        ),
+        launch_edit_cancel(launch.anchor_run_id, int(page)),
+    )
+
+
+@router.message(LaunchEditState.min_messages_between_posts)
+async def save_active_launch_depth(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    repository: AdminRepository,
+    run_queue: RunQueue,
+) -> None:
+    try:
+        messages = int((message.text or "").strip())
+    except ValueError:
+        messages = 0
+    if not 1 <= messages <= 100_000:
+        await message.answer("Введите целое число сообщений от 1 до 100000.")
+        return
+    data = await state.get_data()
+    anchor_run_id = int(data["edit_launch_anchor_id"])
+    page = int(data["edit_launch_page"])
+    try:
+        count = await run_queue.update_active_launch(
+            anchor_run_id,
+            min_messages_between_posts=messages,
+        )
+        launch, runs = await repository.get_launch(anchor_run_id)
+        targets = await repository.targets_by_ids({run.target_id for run in runs})
+    except (ConflictError, NotFoundError) as exc:
+        await message.answer(escape(operator_error_message(exc)))
+        return
+    await _edit_origin_data(
+        bot,
+        data,
+        f"✅ <b>Порог изменён: после {messages} новых сообщений.</b> "
+        f"Обновлено будущих отправок: {count}.\n\n" + launch_details_text(launch, runs, targets),
+        launch_details_menu(launch, page),
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("launch:edit:maxwait:"))
+async def begin_active_launch_max_wait_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+) -> None:
+    _, _, _, anchor_run_id, page = (callback.data or "").split(":")
+    try:
+        launch, _ = await repository.get_launch(int(anchor_run_id))
+    except NotFoundError as exc:
+        await callback.answer(callback_error_message(exc), show_alert=True)
+        return
+    if not launch.active or not launch.smart_timer_mode:
+        await callback.answer("Активная рассылка уже завершена", show_alert=True)
+        return
+    await _remember_origin(callback, state)
+    await state.update_data(
+        edit_launch_anchor_id=launch.anchor_run_id,
+        edit_launch_page=int(page),
+    )
+    await state.set_state(LaunchEditState.visibility_max_wait_minutes)
+    await _edit_callback(
+        callback,
+        wizard_text(
+            "⌛ Тайм-аут до повтора",
+            1,
+            1,
+            "Введите число минут от <b>0</b> до <b>10080</b>. <b>0</b> — строго ждать "
+            "порог новых сообщений и не публиковать по таймеру.",
+            hint="15 минут — обычный активный профиль. Это изменит только будущие циклы запуска.",
+        ),
+        launch_edit_cancel(launch.anchor_run_id, int(page)),
+    )
+
+
+@router.message(LaunchEditState.visibility_max_wait_minutes)
+async def save_active_launch_max_wait(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    repository: AdminRepository,
+    run_queue: RunQueue,
+) -> None:
+    try:
+        minutes = int((message.text or "").strip())
+    except ValueError:
+        minutes = -1
+    if not 0 <= minutes <= 10080:
+        await message.answer("Введите целое число минут от 0 до 10080.")
+        return
+    data = await state.get_data()
+    anchor_run_id = int(data["edit_launch_anchor_id"])
+    page = int(data["edit_launch_page"])
+    try:
+        count = await run_queue.update_active_launch(
+            anchor_run_id,
+            visibility_max_wait_seconds=minutes * 60,
+        )
+        launch, runs = await repository.get_launch(anchor_run_id)
+        targets = await repository.targets_by_ids({run.target_id for run in runs})
+    except (ConflictError, NotFoundError) as exc:
+        await message.answer(escape(operator_error_message(exc)))
+        return
+    mode = "только после порога" if minutes == 0 else f"тайм-аут {minutes} мин."
+    await _edit_origin_data(
+        bot,
+        data,
+        f"✅ <b>Условие повтора обновлено: {mode}.</b> "
+        f"Обновлено будущих отправок: {count}.\n\n" + launch_details_text(launch, runs, targets),
+        launch_details_menu(launch, page),
+    )
+    await state.clear()
+
+
 @router.callback_query(F.data.startswith("launch:edit:duration:"))
 async def begin_active_launch_duration_edit(
     callback: CallbackQuery,
@@ -12302,11 +13889,12 @@ async def begin_active_launch_duration_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "🗓 Время работы активной рассылки",
+            "🗓 Работать ещё",
             1,
             1,
             "Сколько часов рассылке работать <b>с текущего момента</b>? "
-            "Введите целое число от <b>1</b> до <b>168</b>.",
+            "Введите целое число от <b>0</b> до <b>168</b>. <b>0</b> — работать до "
+            "ручной остановки.",
             hint="Например, 24 продлит или сократит работу рассылки до следующих суток.",
         ),
         launch_edit_cancel(launch.anchor_run_id, int(page)),
@@ -12326,8 +13914,8 @@ async def save_active_launch_duration(
         hours = int(raw)
     except ValueError:
         hours = 0
-    if not 1 <= hours <= 168:
-        await message.answer("Введите целое число часов от 1 до 168.")
+    if not 0 <= hours <= 168:
+        await message.answer("Введите целое число часов от 0 до 168.")
         return
     data = await state.get_data()
     anchor_run_id = int(data["edit_launch_anchor_id"])
@@ -12345,7 +13933,14 @@ async def save_active_launch_duration(
     await _edit_origin_data(
         bot,
         data,
-        f"✅ <b>Рассылка будет активна ещё {hours} ч.; обновлено отправок: {count}.</b>\n\n"
+        (
+            "✅ <b>Рассылка будет работать до ручной остановки; "
+            f"обновлено отправок: {count}.</b>\n\n"
+            if hours == 0
+            else (
+                f"✅ <b>Рассылка будет активна ещё {hours} ч.; обновлено отправок: {count}.</b>\n\n"
+            )
+        )
         + launch_details_text(launch, runs, targets),
         launch_details_menu(launch, page),
     )
@@ -12619,12 +14214,13 @@ async def channel_comment_chain_text(
     settings: Settings,
 ) -> None:
     try:
-        text, _html_text, media = await _extract_broadcast_content(message, bot, settings)
+        text, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
         await message.answer(escape(operator_error_message(exc)))
         return
     await state.update_data(
         chain_text=text,
+        chain_html=html_text,
         chain_media_path=media.path if media else None,
         chain_media_kind=media.kind if media else None,
         chain_media_name=media.name if media else None,
@@ -12659,6 +14255,7 @@ async def channel_comment_chain_delay(
         {
             "account_id": int(data["chain_account_id"]),
             "text": str(data["chain_text"]),
+            "html_text": data.get("chain_html"),
             "delay_seconds": delay,
             "reply_to_previous": True,
             "media_path": (str(data["chain_media_path"]) if data.get("chain_media_path") else None),
@@ -12752,6 +14349,7 @@ async def create_channel_comment_rule(
             primary_account_id=int(data["primary_account_id"]),
             primary_text=str(data["primary_text"]),
             initial_delay_seconds=int(data.get("initial_delay_seconds", 0)),
+            primary_html=(str(data["primary_html"]) if data.get("primary_html") else None),
             primary_media_path=(
                 str(data["primary_media_path"]) if data.get("primary_media_path") else None
             ),
@@ -12770,6 +14368,11 @@ async def create_channel_comment_rule(
             message_edit_initial_text=(
                 str(data["message_edit_initial_text"])
                 if mode == ChannelCommentMode.MESSAGE_EDIT
+                else None
+            ),
+            message_edit_initial_html=(
+                str(data["message_edit_initial_html"])
+                if mode == ChannelCommentMode.MESSAGE_EDIT and data.get("message_edit_initial_html")
                 else None
             ),
             message_edit_delay_seconds=(
@@ -14674,9 +16277,12 @@ async def _extract_broadcast_content(
     if len(value) > text_limit:
         raise ContentError(f"текст должен содержать не больше {text_limit} символов")
     html_text = message.html_text if message.text is not None else message.html_caption
-    validate_spintax(value)
-    if html_text is not None:
-        validate_spintax(html_text)
+    validate_telegram_text(
+        value,
+        html_text,
+        has_media=downloadable is not None,
+        allow_empty=downloadable is not None,
+    )
 
     if downloadable is None:
         return value, html_text, None
@@ -15122,12 +16728,20 @@ async def _show_templates(
 
 
 async def _show_campaigns(
-    callback: CallbackQuery, repository: AdminRepository, page_number: int
+    callback: CallbackQuery,
+    repository: AdminRepository,
+    settings: Settings,
+    page_number: int,
 ) -> None:
     page = await repository.list_campaigns(page_number, PAGE_SIZE)
     if page.page >= page.pages:
         page = await repository.list_campaigns(page.pages - 1, PAGE_SIZE)
-    await _edit_callback(callback, campaigns_text(page), campaigns_menu(page), answer=False)
+    await _edit_callback(
+        callback,
+        campaigns_text(page, worker_campaign_scope=settings.worker_campaign_id_scope),
+        campaigns_menu(page),
+        answer=False,
+    )
 
 
 async def _show_runs(

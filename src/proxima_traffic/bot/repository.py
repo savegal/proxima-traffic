@@ -149,6 +149,24 @@ class AccountListFilter(StrEnum):
     NO_SESSION = "no_session"
 
 
+# These are state changes made by Telegram safety checks or the sender, not a
+# voluntary operator pause.  A generic "Enable" button must not bypass them.
+_ACCOUNT_PROTECTED_PAUSE_REASONS = frozenset(
+    {
+        "account_dead",
+        "account_unauthorized",
+        "account_restricted",
+        "flood_escalation",
+        "flood_wait",
+        "peer_flood",
+        "spambot_temp_ban",
+        "spambot_restriction_no_expiry",
+        "spambot_restriction_unclear",
+        "spambot_permanent_ban",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class AccountGroupView:
     id: int
@@ -234,6 +252,7 @@ class LaunchView:
     first_scheduled_for: datetime
     last_scheduled_for: datetime
     smart_timer_mode: bool = False
+    repeat_forever: bool = False
     active_until: datetime | None = None
     no_timer_interval_seconds: int = 0
     auto_sender_failover: bool = False
@@ -256,6 +275,12 @@ class LaunchView:
     reaction_skipped: int = 0
     reaction_cancelled: int = 0
     reaction_last_error: str | None = None
+    reaction_last_error_code: str | None = None
+    reaction_skipped_reasons: tuple[tuple[str, int], ...] = ()
+    reaction_delivered_emojis: tuple[tuple[str, int], ...] = ()
+    reactions_enabled: bool = False
+    reaction_requested_count: int = 0
+    reaction_emoji: str = "👍"
 
     @property
     def active(self) -> int:
@@ -393,7 +418,10 @@ class AdminRepository:
                 smart_active_chats=int(
                     await session.scalar(
                         select(func.count(func.distinct(CampaignRun.target_id))).where(
-                            CampaignRun.repeat_until.is_not(None),
+                            or_(
+                                CampaignRun.repeat_until.is_not(None),
+                                CampaignRun.repeat_forever_snapshot.is_(True),
+                            ),
                             CampaignRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
                         )
                     )
@@ -970,6 +998,21 @@ class AdminRepository:
             ):
                 raise ConflictError(
                     "у аккаунта нет Telegram-сессии; сначала импортируйте её повторно"
+                )
+            protected_reason = account.cooldown_reason in _ACCOUNT_PROTECTED_PAUSE_REASONS
+            cooldown_until = ensure_utc(account.cooldown_until)
+            cooldown_active = cooldown_until is not None and cooldown_until > utc_now()
+            if account.status is AccountStatus.DISABLED and (
+                not account.authorized or protected_reason
+            ):
+                raise ConflictError(
+                    "доступ Telegram не подтверждён или ограничен; проверьте сессию "
+                    "либо импортируйте её повторно"
+                )
+            if account.status is AccountStatus.PAUSED and (protected_reason or cooldown_active):
+                raise ConflictError(
+                    "это защитная пауза Telegram. Запустите «Проверить сессию + "
+                    "@SpamBot»: после свободного статуса аккаунт включится автоматически"
                 )
             account.status = (
                 AccountStatus.PAUSED
@@ -1790,14 +1833,23 @@ class AdminRepository:
             await session.refresh(target_list)
             return target_list, added, len(unique_refs) - added
 
-    async def create_target(self, *, chat_ref: str, title: str) -> Target:
+    async def create_target(self, *, chat_ref: str, title: str | None = None) -> Target:
+        """Create a standalone chat without requiring an operator alias.
+
+        ``title`` remains accepted for API/import compatibility. The bot flow
+        omits it and starts with the reference until preflight resolves the
+        actual Telegram entity and stores its title.
+        """
+        fallback_title = chat_ref.strip()[:150] or "Telegram chat"
+        requested_title = title.strip()[:150] if title is not None else None
         async with self._session_factory() as session:
             existing = await session.scalar(select(Target).where(Target.chat_ref == chat_ref))
             if existing is not None:
                 if existing.is_standalone:
                     raise ConflictError("этот чат уже добавлен")
                 existing.is_standalone = True
-                existing.title = title
+                if requested_title:
+                    existing.title = requested_title
                 add_audit_event(
                     session,
                     event_type="target.promoted_to_standalone",
@@ -1809,7 +1861,11 @@ class AdminRepository:
                 await session.commit()
                 await session.refresh(existing)
                 return existing
-            target = Target(chat_ref=chat_ref, title=title, is_standalone=True)
+            target = Target(
+                chat_ref=chat_ref,
+                title=requested_title or fallback_title,
+                is_standalone=True,
+            )
             session.add(target)
             await self._flush_or_conflict(session, "этот чат уже добавлен")
             add_audit_event(
@@ -2308,6 +2364,7 @@ class AdminRepository:
         repeat_count: int = 1,
         repeat_interval_seconds: int = 0,
         smart_timer_mode: bool = False,
+        repeat_forever: bool = False,
         smart_duration_seconds: int = 0,
         smart_no_timer_interval_seconds: int = 900,
         auto_sender_failover: bool = False,
@@ -2318,7 +2375,33 @@ class AdminRepository:
         visibility_max_wait_seconds: int = 3600,
         sender_account_ids: list[int] | None = None,
         dialogue_steps: list[dict[str, object]] | None = None,
+        selected_target_ids: list[int] | None = None,
+        selected_target_list_name: str | None = None,
+        reactions_enabled: bool = False,
+        reaction_count: int = 0,
+        reaction_emoji: str = "👍",
+        hidden_mentions_enabled: bool = False,
+        mention_cooldown_days: int = 30,
     ) -> Campaign:
+        selected_ids = list(
+            dict.fromkeys(int(target_id) for target_id in selected_target_ids or [])
+        )
+        if selected_ids and (target_id is not None or target_list_id is not None):
+            raise ConflictError("выберите либо готовую аудиторию, либо отмеченные чаты")
+        if selected_ids and not (selected_target_list_name or "").strip():
+            raise ConflictError("не удалось назвать подборку выбранных чатов")
+        if selected_ids and len(str(selected_target_list_name).strip()) > 150:
+            raise ConflictError("название подборки не должно быть длиннее 150 символов")
+        if not selected_ids and (target_id is None) == (target_list_id is None):
+            raise ConflictError("choose exactly one target or target list")
+        if not 0 <= reaction_count <= 10:
+            raise ConflictError("количество реакций должно быть от 0 до 10")
+        if reaction_emoji not in {"👍", "🔥", "❤️", "⚡"}:
+            raise ConflictError("выберите реакцию из списка")
+        if reactions_enabled and reaction_count < 1:
+            reaction_count = 1
+        if not 1 <= mention_cooldown_days <= 365:
+            raise ConflictError("срок ротации отметок должен быть от 1 до 365 дней")
         normalized_dialogue_steps = None
         if mode == CampaignMode.DIALOGUE and dialogue_steps:
             try:
@@ -2366,6 +2449,7 @@ class AdminRepository:
                     1,
                     0,
                     smart_timer_mode=True,
+                    repeat_forever=repeat_forever,
                     spread_seconds=0,
                     smart_duration_seconds=smart_duration_seconds,
                     smart_no_timer_interval_seconds=smart_no_timer_interval_seconds,
@@ -2375,11 +2459,11 @@ class AdminRepository:
                         raise ConflictError("глубина диалога должна быть от 1 до 100000 сообщений")
                     if not 30 <= activity_check_interval_seconds <= 3600:
                         raise ConflictError("проверка активности должна быть от 30 до 3600 секунд")
-                    if not 60 <= visibility_max_wait_seconds <= 7 * 24 * 3600:
+                    if not 0 <= visibility_max_wait_seconds <= 7 * 24 * 3600:
                         raise ConflictError(
-                            "максимальное ожидание должно быть от 1 минуты до 7 суток"
+                            "максимальное ожидание должно быть от 0 минут до 7 суток"
                         )
-            elif smart_duration_seconds != 0 or activity_aware:
+            elif smart_duration_seconds != 0 or repeat_forever or activity_aware:
                 raise ConflictError("адаптивная частота требует умный режим диалога")
         elif mode == CampaignMode.BROADCAST:
             if sender_mode == BroadcastSenderMode.INDEPENDENT:
@@ -2405,6 +2489,7 @@ class AdminRepository:
                 repeat_count,
                 repeat_interval_seconds,
                 smart_timer_mode=smart_timer_mode,
+                repeat_forever=repeat_forever,
                 spread_seconds=spread_seconds,
                 smart_duration_seconds=smart_duration_seconds,
                 smart_no_timer_interval_seconds=smart_no_timer_interval_seconds,
@@ -2416,8 +2501,8 @@ class AdminRepository:
                     raise ConflictError("глубина поста должна быть от 1 до 100000 сообщений")
                 if not 30 <= activity_check_interval_seconds <= 3600:
                     raise ConflictError("проверка активности должна быть от 30 до 3600 секунд")
-                if not 60 <= visibility_max_wait_seconds <= 7 * 24 * 3600:
-                    raise ConflictError("максимальное ожидание должно быть от 1 минуты до 7 суток")
+                if not 0 <= visibility_max_wait_seconds <= 7 * 24 * 3600:
+                    raise ConflictError("максимальное ожидание должно быть от 0 минут до 7 суток")
         primary_is_captionless_dialogue_media = bool(
             normalized_dialogue_steps and normalized_dialogue_steps[0].media_path is not None
         )
@@ -2427,9 +2512,42 @@ class AdminRepository:
             and not primary_is_captionless_dialogue_media
         ):
             raise ConflictError("primary message must not be empty")
-        if (target_id is None) == (target_list_id is None):
-            raise ConflictError("choose exactly one target or target list")
         async with self._session_factory() as session:
+            if selected_ids:
+                targets = list(
+                    await session.scalars(
+                        select(Target)
+                        .where(
+                            Target.id.in_(selected_ids),
+                            Target.is_standalone.is_(True),
+                            Target.approved_by_operator.is_(True),
+                            Target.quality_status != TARGET_QUALITY_BAD,
+                        )
+                        .order_by(Target.id)
+                    )
+                )
+                found_ids = {int(target.id) for target in targets}
+                unavailable = [
+                    target_id for target_id in selected_ids if target_id not in found_ids
+                ]
+                if unavailable:
+                    preview = ", ".join(f"#{target_id}" for target_id in unavailable[:5])
+                    suffix = f" и ещё {len(unavailable) - 5}" if len(unavailable) > 5 else ""
+                    raise ConflictError(
+                        f"часть выбранных чатов больше недоступна для рассылки: {preview}{suffix}"
+                    )
+                selected_list = TargetList(name=str(selected_target_list_name).strip())
+                session.add(selected_list)
+                await self._flush_or_conflict(session, "не удалось сохранить подборку чатов")
+                session.add_all(
+                    TargetListItem(
+                        target_list_id=selected_list.id,
+                        target_id=target.id,
+                        enabled=True,
+                    )
+                    for target in targets
+                )
+                target_list_id = selected_list.id
             campaign = Campaign(
                 name=name,
                 mode=mode,
@@ -2449,6 +2567,7 @@ class AdminRepository:
                 repeat_count=repeat_count,
                 repeat_interval_seconds=repeat_interval_seconds,
                 smart_timer_mode=smart_timer_mode,
+                repeat_forever=repeat_forever,
                 smart_duration_seconds=smart_duration_seconds,
                 smart_no_timer_interval_seconds=smart_no_timer_interval_seconds,
                 auto_sender_failover=auto_sender_failover,
@@ -2457,6 +2576,13 @@ class AdminRepository:
                 min_messages_between_posts=min_messages_between_posts,
                 activity_check_interval_seconds=activity_check_interval_seconds,
                 visibility_max_wait_seconds=visibility_max_wait_seconds,
+                reactions_enabled=reactions_enabled,
+                reaction_count=reaction_count,
+                reaction_emoji=reaction_emoji,
+                hidden_mentions_enabled=(
+                    hidden_mentions_enabled if mode == CampaignMode.BROADCAST else False
+                ),
+                mention_cooldown_days=mention_cooldown_days,
                 dialogue_steps_json=(
                     serialize_dialogue_steps(normalized_dialogue_steps)
                     if normalized_dialogue_steps is not None
@@ -2480,10 +2606,12 @@ class AdminRepository:
                     "name": name,
                     "target_id": target_id,
                     "target_list_id": target_list_id,
+                    "selected_target_ids": selected_ids,
                     "sender_account_ids": sender_ids if mode == CampaignMode.BROADCAST else [],
                     "repeat_count": repeat_count,
                     "repeat_interval_seconds": repeat_interval_seconds,
                     "smart_timer_mode": smart_timer_mode,
+                    "repeat_forever": repeat_forever,
                     "smart_duration_seconds": smart_duration_seconds,
                     "smart_no_timer_interval_seconds": smart_no_timer_interval_seconds,
                     "auto_sender_failover": auto_sender_failover,
@@ -2498,6 +2626,11 @@ class AdminRepository:
                         if normalized_dialogue_steps is not None
                         else (2 if mode == CampaignMode.DIALOGUE else 0)
                     ),
+                    "reactions_enabled": reactions_enabled,
+                    "reaction_count": reaction_count,
+                    "reaction_emoji": reaction_emoji,
+                    "hidden_mentions_enabled": hidden_mentions_enabled,
+                    "mention_cooldown_days": mention_cooldown_days,
                 },
                 actor="control-bot",
             )
@@ -2527,11 +2660,13 @@ class AdminRepository:
                 "repeat_count": campaign.repeat_count,
                 "repeat_interval_seconds": campaign.repeat_interval_seconds,
                 "smart_timer_mode": campaign.smart_timer_mode,
+                "repeat_forever": campaign.repeat_forever,
                 "smart_duration_seconds": campaign.smart_duration_seconds,
             }
             campaign.repeat_count = repeat_count
             campaign.repeat_interval_seconds = repeat_interval_seconds
             campaign.smart_timer_mode = False
+            campaign.repeat_forever = False
             campaign.smart_duration_seconds = 0
             campaign.auto_sender_failover = False
             campaign.activity_aware = False
@@ -2546,6 +2681,7 @@ class AdminRepository:
                     "repeat_count": repeat_count,
                     "repeat_interval_seconds": repeat_interval_seconds,
                     "smart_timer_mode": False,
+                    "repeat_forever": False,
                     "auto_sender_failover": False,
                 },
                 actor="control-bot",
@@ -2560,20 +2696,13 @@ class AdminRepository:
         *,
         smart_duration_seconds: int,
         smart_no_timer_interval_seconds: int,
+        repeat_forever: bool | None = None,
         auto_sender_failover: bool | None = None,
         activity_aware: bool | None = None,
         min_messages_between_posts: int | None = None,
         activity_check_interval_seconds: int | None = None,
         visibility_max_wait_seconds: int | None = None,
     ) -> Campaign:
-        self._validate_broadcast_schedule(
-            1,
-            0,
-            smart_timer_mode=True,
-            spread_seconds=0,
-            smart_duration_seconds=smart_duration_seconds,
-            smart_no_timer_interval_seconds=smart_no_timer_interval_seconds,
-        )
         async with self._session_factory() as session:
             campaign = await session.get(Campaign, campaign_id)
             if campaign is None:
@@ -2584,6 +2713,18 @@ class AdminRepository:
                 campaign.auto_sender_failover
                 if auto_sender_failover is None
                 else auto_sender_failover
+            )
+            effective_repeat_forever = (
+                campaign.repeat_forever if repeat_forever is None else repeat_forever
+            )
+            self._validate_broadcast_schedule(
+                1,
+                0,
+                smart_timer_mode=True,
+                repeat_forever=effective_repeat_forever,
+                spread_seconds=0,
+                smart_duration_seconds=smart_duration_seconds,
+                smart_no_timer_interval_seconds=smart_no_timer_interval_seconds,
             )
             if (
                 campaign.mode == CampaignMode.DIALOGUE
@@ -2612,10 +2753,11 @@ class AdminRepository:
                 raise ConflictError("для адаптивной видимости укажите глубину поста")
             if not 30 <= effective_check_interval <= 3600:
                 raise ConflictError("проверка активности должна быть от 30 до 3600 секунд")
-            if not 60 <= effective_max_wait <= 7 * 24 * 3600:
-                raise ConflictError("максимальное ожидание должно быть от 1 минуты до 7 суток")
+            if not 0 <= effective_max_wait <= 7 * 24 * 3600:
+                raise ConflictError("максимальное ожидание должно быть от 0 минут до 7 суток")
             previous = {
                 "smart_timer_mode": campaign.smart_timer_mode,
+                "repeat_forever": campaign.repeat_forever,
                 "smart_duration_seconds": campaign.smart_duration_seconds,
                 "smart_no_timer_interval_seconds": (campaign.smart_no_timer_interval_seconds),
                 "auto_sender_failover": campaign.auto_sender_failover,
@@ -2626,6 +2768,7 @@ class AdminRepository:
             campaign.repeat_count = 1
             campaign.repeat_interval_seconds = 0
             campaign.smart_timer_mode = True
+            campaign.repeat_forever = effective_repeat_forever
             campaign.smart_duration_seconds = smart_duration_seconds
             campaign.smart_no_timer_interval_seconds = smart_no_timer_interval_seconds
             campaign.auto_sender_failover = effective_failover
@@ -2641,6 +2784,7 @@ class AdminRepository:
                 details={
                     "previous": previous,
                     "smart_duration_seconds": smart_duration_seconds,
+                    "repeat_forever": effective_repeat_forever,
                     "smart_no_timer_interval_seconds": smart_no_timer_interval_seconds,
                     "auto_sender_failover": effective_failover,
                     "activity_aware": effective_activity,
@@ -3423,6 +3567,7 @@ class AdminRepository:
         repeat_interval_seconds: int,
         *,
         smart_timer_mode: bool = False,
+        repeat_forever: bool = False,
         spread_seconds: int = 0,
         smart_duration_seconds: int = 0,
         smart_no_timer_interval_seconds: int = 900,
@@ -3434,12 +3579,15 @@ class AdminRepository:
                 raise ConflictError("для рассылки по таймерам число проходов должно быть равно 1")
             if repeat_interval_seconds != 0 or spread_seconds != 0:
                 raise ConflictError("умная рассылка использует отдельные настройки времени")
-            if not 60 <= smart_duration_seconds <= 7 * 24 * 3600:
+            if repeat_forever:
+                if smart_duration_seconds != 0:
+                    raise ConflictError("бессрочная рассылка не должна иметь срок")
+            elif not 60 <= smart_duration_seconds <= 7 * 24 * 3600:
                 raise ConflictError("срок активности должен быть от 1 минуты до 7 суток")
             if not 60 <= smart_no_timer_interval_seconds <= 7 * 24 * 3600:
                 raise ConflictError("интервал без таймера должен быть от 1 минуты до 7 суток")
             return
-        if smart_duration_seconds != 0:
+        if smart_duration_seconds != 0 or repeat_forever:
             raise ConflictError("срок умной рассылки требует режим по таймерам")
         if repeat_count == 1:
             if repeat_interval_seconds != 0:
@@ -3531,6 +3679,110 @@ class AdminRepository:
             await session.commit()
             await session.refresh(campaign)
             return campaign
+
+    async def update_campaign_selected_targets(
+        self,
+        campaign_id: int,
+        *,
+        target_ids: list[int],
+        target_list_name: str,
+    ) -> Campaign:
+        """Replace a scenario audience with a new checked-chat selection atomically."""
+
+        selected_ids = list(dict.fromkeys(int(target_id) for target_id in target_ids))
+        if not selected_ids:
+            raise ConflictError("выберите хотя бы один чат")
+        normalized_name = target_list_name.strip()
+        if not 1 <= len(normalized_name) <= 150:
+            raise ConflictError("название подборки должно содержать от 1 до 150 символов")
+        async with self._session_factory() as session:
+            campaign = await session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise NotFoundError("рассылка/диалог не найдены")
+            targets = list(
+                await session.scalars(
+                    select(Target)
+                    .where(
+                        Target.id.in_(selected_ids),
+                        Target.is_standalone.is_(True),
+                        Target.approved_by_operator.is_(True),
+                        Target.quality_status != TARGET_QUALITY_BAD,
+                    )
+                    .order_by(Target.id)
+                )
+            )
+            found_ids = {int(target.id) for target in targets}
+            unavailable = [target_id for target_id in selected_ids if target_id not in found_ids]
+            if unavailable:
+                preview = ", ".join(f"#{target_id}" for target_id in unavailable[:5])
+                suffix = f" и ещё {len(unavailable) - 5}" if len(unavailable) > 5 else ""
+                raise ConflictError(
+                    f"часть выбранных чатов больше недоступна для рассылки: {preview}{suffix}"
+                )
+            target_list = TargetList(name=normalized_name)
+            session.add(target_list)
+            await self._flush_or_conflict(session, "не удалось сохранить подборку чатов")
+            session.add_all(
+                TargetListItem(
+                    target_list_id=target_list.id,
+                    target_id=target.id,
+                    enabled=True,
+                )
+                for target in targets
+            )
+            previous = {
+                "target_id": campaign.target_id,
+                "target_list_id": campaign.target_list_id,
+            }
+            campaign.target_id = None
+            campaign.target_list_id = target_list.id
+            add_audit_event(
+                session,
+                event_type="campaign.checked_targets_changed",
+                entity_type="campaign",
+                entity_id=campaign.id,
+                details={
+                    "previous": previous,
+                    "target_list_id": target_list.id,
+                    "target_ids": selected_ids,
+                },
+                actor="control-bot",
+            )
+            await session.commit()
+            await session.refresh(campaign)
+            return campaign
+
+    async def campaign_selected_standalone_target_ids(self, campaign_id: int) -> list[int]:
+        """Return the currently active standalone chats for the checkbox editor."""
+
+        async with self._session_factory() as session:
+            campaign = await session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise NotFoundError("рассылка/диалог не найдены")
+            conditions = [
+                Target.is_standalone.is_(True),
+                Target.approved_by_operator.is_(True),
+                Target.quality_status != TARGET_QUALITY_BAD,
+            ]
+            if campaign.target_id is not None:
+                conditions.append(Target.id == campaign.target_id)
+                return [
+                    int(target_id)
+                    for target_id in await session.scalars(select(Target.id).where(*conditions))
+                ]
+            return [
+                int(target_id)
+                for target_id in await session.scalars(
+                    select(TargetListItem.target_id)
+                    .join(Target, Target.id == TargetListItem.target_id)
+                    .where(
+                        TargetListItem.target_list_id == campaign.target_list_id,
+                        TargetListItem.enabled.is_(True),
+                        *conditions,
+                    )
+                    .order_by(TargetListItem.id)
+                )
+            ]
 
     async def campaign_sender_ids(self, campaign_id: int) -> list[int]:
         async with self._session_factory() as session:
@@ -3627,8 +3879,20 @@ class AdminRepository:
                 Campaign.name.label("campaign_name"),
                 Campaign.mode.label("mode"),
                 Campaign.sender_mode.label("sender_mode"),
-                func.max(case((CampaignRun.repeat_until.is_not(None), 1), else_=0)).label(
-                    "smart_timer_mode"
+                func.max(
+                    case(
+                        (
+                            or_(
+                                CampaignRun.repeat_until.is_not(None),
+                                CampaignRun.repeat_forever_snapshot.is_(True),
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("smart_timer_mode"),
+                func.max(case((CampaignRun.repeat_forever_snapshot.is_(True), 1), else_=0)).label(
+                    "repeat_forever"
                 ),
                 Campaign.smart_duration_seconds.label("smart_duration_seconds"),
                 func.coalesce(
@@ -3888,15 +4152,55 @@ class AdminRepository:
                 .group_by(ReactionTask.status)
             )
             reaction_counts = {status: int(count) for status, count in reaction_result}
-            reaction_last_error = await session.scalar(
-                select(ReactionTask.error)
+            delivered_emoji_result = await session.execute(
+                select(ReactionTask.emoji, func.count(ReactionTask.id))
                 .where(
                     ReactionTask.run_id.in_(run_ids),
-                    ReactionTask.status == ReactionTaskStatus.FAILED,
-                    ReactionTask.error.is_not(None),
+                    ReactionTask.status == ReactionTaskStatus.SUCCEEDED,
                 )
-                .order_by(ReactionTask.finished_at.desc(), ReactionTask.id.desc())
-                .limit(1)
+                .group_by(ReactionTask.emoji)
+                .order_by(func.count(ReactionTask.id).desc(), ReactionTask.emoji)
+            )
+            reaction_delivered_emojis = tuple(
+                (str(emoji), int(count)) for emoji, count in delivered_emoji_result if emoji
+            )
+            reaction_last_error_row = (
+                await session.execute(
+                    select(ReactionTask.error, ReactionTask.error_code)
+                    .where(
+                        ReactionTask.run_id.in_(run_ids),
+                        ReactionTask.status.in_(
+                            [ReactionTaskStatus.FAILED, ReactionTaskStatus.SKIPPED]
+                        ),
+                        ReactionTask.error.is_not(None),
+                    )
+                    .order_by(ReactionTask.finished_at.desc(), ReactionTask.id.desc())
+                    .limit(1)
+                )
+            ).first()
+            reaction_last_error = (
+                str(reaction_last_error_row[0])
+                if reaction_last_error_row is not None and reaction_last_error_row[0]
+                else None
+            )
+            reaction_last_error_code = (
+                str(reaction_last_error_row[1])
+                if reaction_last_error_row is not None and reaction_last_error_row[1]
+                else None
+            )
+            skipped_reason_result = await session.execute(
+                select(ReactionTask.error_code, func.count(ReactionTask.id))
+                .where(
+                    ReactionTask.run_id.in_(run_ids),
+                    ReactionTask.status == ReactionTaskStatus.SKIPPED,
+                    ReactionTask.error_code.is_not(None),
+                )
+                .group_by(ReactionTask.error_code)
+                .order_by(func.count(ReactionTask.id).desc(), ReactionTask.error_code)
+                .limit(3)
+            )
+            reaction_skipped_reasons = tuple(
+                (str(code), int(count)) for code, count in skipped_reason_result if code
             )
             audit_events = list(
                 await session.scalars(
@@ -4005,6 +4309,9 @@ class AdminRepository:
                     timings=timings,
                     reaction_counts=reaction_counts,
                     reaction_last_error=reaction_last_error,
+                    reaction_last_error_code=reaction_last_error_code,
+                    reaction_skipped_reasons=reaction_skipped_reasons,
+                    reaction_delivered_emojis=reaction_delivered_emojis,
                 ),
                 runs,
             )
@@ -4163,6 +4470,7 @@ class AdminRepository:
             first_scheduled_for=row.first_scheduled_for,  # type: ignore[attr-defined]
             last_scheduled_for=row.last_scheduled_for,  # type: ignore[attr-defined]
             smart_timer_mode=bool(row.smart_timer_mode),  # type: ignore[attr-defined]
+            repeat_forever=bool(row.repeat_forever),  # type: ignore[attr-defined]
             active_until=active_until,
             no_timer_interval_seconds=int(  # type: ignore[attr-defined]
                 row.no_timer_interval_seconds or 0
@@ -4189,6 +4497,9 @@ class AdminRepository:
         timings: tuple[TargetTimingView, ...] = (),
         reaction_counts: dict[ReactionTaskStatus, int] | None = None,
         reaction_last_error: str | None = None,
+        reaction_last_error_code: str | None = None,
+        reaction_skipped_reasons: tuple[tuple[str, int], ...] = (),
+        reaction_delivered_emojis: tuple[tuple[str, int], ...] = (),
     ) -> LaunchView:
         reaction_counts = reaction_counts or {}
         counts = {status: 0 for status in RunStatus}
@@ -4213,7 +4524,10 @@ class AdminRepository:
         account_ids.update(item.failed_account_id for item in failovers)
         account_ids.update(item.replacement_account_id for item in failovers)
         account_ids.update(account_id for account_id, _ in account_labels)
-        smart_timer_mode = any(run.repeat_until is not None for run in runs)
+        smart_timer_mode = any(
+            run.repeat_forever_snapshot or run.repeat_until is not None for run in runs
+        )
+        repeat_forever = any(run.repeat_forever_snapshot for run in runs)
         no_timer_interval_seconds = next(
             (
                 run.no_timer_interval_seconds_snapshot
@@ -4252,6 +4566,7 @@ class AdminRepository:
                 ensure_utc(run.scheduled_for) or run.scheduled_for for run in runs
             ),
             smart_timer_mode=smart_timer_mode,
+            repeat_forever=repeat_forever,
             active_until=active_until,
             no_timer_interval_seconds=no_timer_interval_seconds,
             auto_sender_failover=auto_sender_failover,
@@ -4278,6 +4593,12 @@ class AdminRepository:
             reaction_skipped=reaction_counts.get(ReactionTaskStatus.SKIPPED, 0),
             reaction_cancelled=reaction_counts.get(ReactionTaskStatus.CANCELLED, 0),
             reaction_last_error=reaction_last_error,
+            reaction_last_error_code=reaction_last_error_code,
+            reaction_skipped_reasons=reaction_skipped_reasons,
+            reaction_delivered_emojis=reaction_delivered_emojis,
+            reactions_enabled=bool(campaign.reactions_enabled),
+            reaction_requested_count=int(campaign.reaction_count or 0),
+            reaction_emoji=campaign.reaction_emoji,
         )
 
     @staticmethod

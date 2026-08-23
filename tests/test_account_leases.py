@@ -11,7 +11,7 @@ from proxima_traffic.account_leases import (
 from proxima_traffic.config import Settings
 from proxima_traffic.db import Database
 from proxima_traffic.gateways import DryRunGateway
-from proxima_traffic.models import Account, AccountOperationLease
+from proxima_traffic.models import Account, AccountOperationLease, ensure_utc
 from proxima_traffic.services import AccountSendDeferred, CampaignRunner
 
 
@@ -146,6 +146,54 @@ async def test_account_send_reservation_is_atomic_across_runner_instances(tmp_pa
             assert stored.next_send_at is not None
             assert stored.send_reservation_token is None
             assert stored.send_reservation_until is None
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_account_send_reservation_heartbeat_is_durably_committed(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'account-send-heartbeat.db'}",
+        worker_enabled=False,
+        worker_heartbeat_seconds=0.01,
+        account_micro_break_every=0,
+    )
+    database = Database(settings.database_url)
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="heartbeat-account", ownership_confirmed=True)
+            session.add(account)
+            await session.commit()
+            await session.refresh(account)
+        assert account.id is not None
+        runner = CampaignRunner(database.session_factory, DryRunGateway(), settings=settings)
+        token, original_until = await runner._claim_account_send_slot(account.id)
+        assert token is not None and original_until is None
+
+        async with database.session_factory() as session:
+            stored = await session.get(Account, account.id)
+            assert stored is not None and stored.send_reservation_until is not None
+            initial_until = ensure_utc(stored.send_reservation_until)
+        assert initial_until is not None
+
+        stop = asyncio.Event()
+        lost = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            runner._heartbeat_account_send_slot(account.id, token, stop, lost, None)
+        )
+        await asyncio.sleep(1.1)
+        stop.set()
+        await heartbeat
+
+        assert not lost.is_set()
+        async with database.session_factory() as session:
+            stored = await session.get(Account, account.id)
+            assert stored is not None
+            renewed_until = ensure_utc(stored.send_reservation_until)
+        assert renewed_until is not None
+        assert renewed_until > initial_until
+        await runner._release_account_send_slot(account.id, token)
     finally:
         await database.dispose()
 

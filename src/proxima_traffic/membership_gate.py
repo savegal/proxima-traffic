@@ -49,6 +49,26 @@ _SUBSCRIPTION_MARKERS = (
     "follow the channel",
     "follow channel",
     "join the group",
+    "be a member",
+    "member of the channel",
+    "member of channel",
+    "required channel",
+    "required channels",
+    "join our channel",
+    "join our channels",
+    "subscribe to the following",
+    "subscription required",
+    "subscription is required",
+    "must be subscribed",
+    "must join",
+    "access after subscription",
+    "доступ после подпис",
+    "доступ лише після підпис",
+    "доступ только после подпис",
+    "нужно состоять",
+    "необходимо состоять",
+    "потрібно бути учасником",
+    "необхідно бути учасником",
 )
 _CAPTCHA_OR_MANUAL_MARKERS = (
     "капч",
@@ -67,19 +87,53 @@ _VERIFY_BUTTON_MARKERS = (
     "подтверд",
     "підтверд",
     "готово",
+    "я подпис",
+    "я підпис",
+    "я вступ",
+    "я приєдна",
+    "уже подпис",
+    "вже підпис",
+    "получить доступ",
+    "отримати доступ",
+    "открыть доступ",
+    "відкрити доступ",
+    "разблокир",
+    "розблокув",
+    "продолжить",
+    "продовжити",
+    "активир",
     "verify",
     "check",
     "done",
+    "i subscribed",
+    "already subscribed",
+    "i joined",
+    "get access",
+    "unlock",
+    "continue",
 )
 _INVITE_SLUG = re.compile(r"[A-Za-z0-9_-]{5,128}")
+_PUBLIC_USERNAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{4,31}")
+_TEXT_TELEGRAM_URL = re.compile(
+    r"(?i)(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[^\s<>()[\]{}\"']+"
+    r"|tg://resolve\?[^\s<>()[\]{}\"']+"
+)
+_TEXT_TELEGRAM_USERNAME = re.compile(r"(?<![\w@])@([A-Za-z][A-Za-z0-9_]{4,31})\b")
+_URL_TRAILING_PUNCTUATION = ".,;:!?…»”')]}"
 
 
-def parse_membership_gate(text: str, buttons: tuple[InlineButton, ...]) -> MembershipGate | None:
+def parse_membership_gate(
+    text: str,
+    buttons: tuple[InlineButton, ...],
+    *,
+    text_links: tuple[str, ...] = (),
+) -> MembershipGate | None:
     """Return a supported channel-subscription gate, otherwise ``None``.
 
-    Only ``t.me``/``telegram.me`` links are accepted.  A notice that asks for
-    a captcha or another manual check is deliberately rejected: the caller
-    treats it as ordinary moderation rather than attempting to bypass it.
+    Telegram channel links may be placed in an inline keyboard, visible text,
+    or a text-link entity.  A notice that asks for a captcha or another manual
+    check is deliberately rejected: the caller treats it as ordinary
+    moderation rather than attempting to bypass it.
     """
 
     notice = " ".join(text.split())[:500]
@@ -105,6 +159,21 @@ def parse_membership_gate(text: str, buttons: tuple[InlineButton, ...]) -> Membe
         ):
             callbacks.append(button.callback_data)
 
+    for url in (*_telegram_urls_in_text(notice), *text_links):
+        channel_ref = telegram_channel_ref(url)
+        if channel_ref is not None and channel_ref not in channel_refs:
+            channel_refs.append(channel_ref)
+
+    # Moderator bots commonly write a public channel handle directly in the
+    # gate text instead of adding a URL button.  This remains narrow: the
+    # surrounding message has already been required to ask for a subscription,
+    # and the gateway will still verify that the resolved peer is a Channel
+    # before any join request is made.
+    for match in _TEXT_TELEGRAM_USERNAME.finditer(notice):
+        channel_ref = f"@{match.group(1).casefold()}"
+        if channel_ref not in channel_refs:
+            channel_refs.append(channel_ref)
+
     if not channel_refs:
         return None
     return MembershipGate(
@@ -123,7 +192,10 @@ def telegram_channel_ref(url: str) -> str | None:
     to posts, folders, shares, mini apps and non-Telegram sites are rejected.
     """
 
-    parsed = urlparse(url.strip())
+    normalized_url = url.strip().rstrip(_URL_TRAILING_PUNCTUATION)
+    if normalized_url.casefold().startswith(("t.me/", "www.t.me/", "telegram.me/")):
+        normalized_url = f"https://{normalized_url}"
+    parsed = urlparse(normalized_url)
     host = parsed.netloc.casefold().removeprefix("www.")
     path = unquote(parsed.path).strip("/")
     if parsed.scheme.casefold() in {"http", "https"} and host in {"t.me", "telegram.me"}:
@@ -136,6 +208,24 @@ def telegram_channel_ref(url: str) -> str | None:
             and _INVITE_SLUG.fullmatch(parts[1])
         ):
             return f"https://t.me/joinchat/{parts[1]}"
+        # Moderation bots sometimes include a link to a concrete post rather
+        # than to the channel header.  A public post still identifies one
+        # channel precisely, so reduce it to that channel's @username.  The
+        # private /c/ form has no public username and remains intentionally
+        # unsupported.
+        public_username: str | None = None
+        if len(parts) in {1, 2} and parts and _PUBLIC_USERNAME.fullmatch(parts[0]):
+            if len(parts) == 1 or parts[1].isdigit():
+                public_username = parts[0]
+        elif (
+            len(parts) in {2, 3}
+            and parts[0].casefold() == "s"
+            and _PUBLIC_USERNAME.fullmatch(parts[1])
+            and (len(parts) == 2 or parts[2].isdigit())
+        ):
+            public_username = parts[1]
+        if public_username is not None:
+            return f"@{public_username.casefold()}"
         if (
             not path
             or "/" in path
@@ -149,9 +239,19 @@ def telegram_channel_ref(url: str) -> str | None:
             }
         ):
             return None
-        return f"@{path}"
+        return f"@{path.casefold()}" if _PUBLIC_USERNAME.fullmatch(path) else None
     if parsed.scheme.casefold() == "tg" and parsed.netloc.casefold() == "resolve":
         domain = (parse_qs(parsed.query).get("domain") or [""])[0].strip().lstrip("@")
-        if domain and "/" not in domain:
-            return f"@{domain}"
+        if _PUBLIC_USERNAME.fullmatch(domain):
+            return f"@{domain.casefold()}"
+    if parsed.scheme.casefold() == "tg" and parsed.netloc.casefold() == "join":
+        invite = (parse_qs(parsed.query).get("invite") or [""])[0].strip()
+        if _INVITE_SLUG.fullmatch(invite):
+            return f"https://t.me/+{invite}"
     return None
+
+
+def _telegram_urls_in_text(text: str) -> tuple[str, ...]:
+    """Extract only syntactically explicit Telegram URLs from a gate notice."""
+
+    return tuple(match.group(0) for match in _TEXT_TELEGRAM_URL.finditer(text))

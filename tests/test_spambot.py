@@ -15,7 +15,12 @@ from proxima_traffic.models import (
     ensure_utc,
     utc_now,
 )
-from proxima_traffic.spambot import SpamBotResult, SpamBotStatus, parse_spambot_response
+from proxima_traffic.spambot import (
+    SpamBotRestrictionScope,
+    SpamBotResult,
+    SpamBotStatus,
+    parse_spambot_response,
+)
 from proxima_traffic.spambot_checks import SpamBotCheckService
 
 REFERENCE_TIME = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
@@ -49,6 +54,21 @@ def test_parser_recognizes_free_responses_in_common_locales(message: str) -> Non
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        "Good news, your account has no restrictions. You're free as a bird!",
+        "Good news, all restrictions have been removed from your account!",
+        "Your account is not limited. No limitations are currently applied.",
+    ],
+)
+def test_parser_recognizes_current_english_free_variants(message: str) -> None:
+    result = parse_spambot_response(message, now=REFERENCE_TIME)
+
+    assert result.status is SpamBotStatus.FREE
+    assert result.is_restricted is False
+
+
+@pytest.mark.parametrize(
     ("message", "expected"),
     [
         (
@@ -74,6 +94,29 @@ def test_parser_recognizes_free_responses_in_common_locales(message: str) -> Non
     ],
 )
 def test_parser_extracts_temporary_restriction_expiry(
+    message: str,
+    expected: datetime,
+) -> None:
+    result = parse_spambot_response(message, now=REFERENCE_TIME)
+
+    assert result.status is SpamBotStatus.TEMPORARY_RESTRICTION
+    assert result.restricted_until == expected
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "Your account will remain limited until 2026-08-15 14:30 UTC.",
+            datetime(2026, 8, 15, 14, 30, tzinfo=UTC),
+        ),
+        (
+            "All restrictions will be lifted on August 15, 2026 at 14:30 UTC.",
+            datetime(2026, 8, 15, 14, 30, tzinfo=UTC),
+        ),
+    ],
+)
+def test_parser_extracts_current_english_temporary_variants(
     message: str,
     expected: datetime,
 ) -> None:
@@ -145,6 +188,8 @@ def test_parser_recognizes_captured_active_restriction_without_expiry() -> None:
     assert result.restricted_until is None
     assert result.parser_signal == "active_restriction_without_expiry"
     assert result.button_rows[-1] == ("This is a mistake",)
+    assert result.restriction_scope is SpamBotRestrictionScope.DIRECT_OUTREACH_AND_INVITES
+    assert result.allows_reply_to_inbound is True
 
 
 def test_parser_recognizes_captured_dutch_active_restriction() -> None:
@@ -164,6 +209,53 @@ def test_parser_recognizes_captured_dutch_active_restriction() -> None:
 
     assert result.status is SpamBotStatus.ACTIVE_RESTRICTION
     assert result.parser_signal == "active_restriction_without_expiry"
+
+
+def test_parser_keeps_explicit_but_new_restriction_copy_in_protective_state() -> None:
+    result = parse_spambot_response(
+        "Your account is restricted. We cannot provide an exact date at this time.",
+        now=REFERENCE_TIME,
+    )
+
+    assert result.status is SpamBotStatus.RESTRICTION_UNCLEAR
+    assert result.is_restricted is True
+    assert result.restriction_scope is SpamBotRestrictionScope.UNSPECIFIED
+
+
+def test_parser_does_not_treat_future_lifting_copy_as_a_free_account() -> None:
+    result = parse_spambot_response(
+        "Your account is currently limited. If this was a mistake, all limitations will "
+        "be lifted from your account soon. While the account is limited, you cannot send "
+        "messages to people who do not have your number in their contacts.",
+        now=REFERENCE_TIME,
+    )
+
+    assert result.status is SpamBotStatus.ACTIVE_RESTRICTION
+    assert result.is_restricted is True
+
+
+def test_parser_keeps_onboarding_question_unknown_not_restricted() -> None:
+    result = parse_spambot_response(
+        "Hello! I can help you find out if your account was limited.",
+        now=REFERENCE_TIME,
+    )
+
+    assert result.status is SpamBotStatus.UNKNOWN
+    assert result.is_restricted is False
+    assert result.parser_signal == "status_inquiry_without_verdict"
+
+
+def test_parser_does_not_misread_a_reply_capability_as_chat_delivery_permission() -> None:
+    result = parse_spambot_response(
+        "While your account is limited, you cannot send messages to people who don't have "
+        "your number in their contacts. Remember that you can still reply to anyone who "
+        "messages you first.",
+        now=REFERENCE_TIME,
+    )
+
+    assert result.status is SpamBotStatus.ACTIVE_RESTRICTION
+    assert result.restriction_scope is SpamBotRestrictionScope.DIRECT_OUTREACH
+    assert result.allows_reply_to_inbound is True
 
 
 class SpamBotGateway:

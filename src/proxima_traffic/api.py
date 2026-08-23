@@ -537,11 +537,13 @@ async def create_target(payload: TargetCreate, session: SessionDep) -> Target:
             detail="chat folder links must be expanded by an authorized user connector",
         )
     existing = await session.scalar(select(Target).where(Target.chat_ref == parsed.canonical))
+    requested_title = (payload.title or "").strip()[:150]
     if existing is not None:
         if existing.is_standalone:
             raise HTTPException(status_code=409, detail="target already exists")
         existing.is_standalone = True
-        existing.title = payload.title
+        if requested_title:
+            existing.title = requested_title
         add_audit_event(
             session,
             event_type="target.promoted_to_standalone",
@@ -554,7 +556,7 @@ async def create_target(payload: TargetCreate, session: SessionDep) -> Target:
         return existing
     target = Target(
         chat_ref=parsed.canonical,
-        title=payload.title,
+        title=requested_title or parsed.canonical,
         is_standalone=True,
     )
     session.add(target)
@@ -821,6 +823,7 @@ async def create_campaign(payload: CampaignCreate, session: SessionDep) -> Campa
             "repeat_count": campaign.repeat_count,
             "repeat_interval_seconds": campaign.repeat_interval_seconds,
             "smart_timer_mode": campaign.smart_timer_mode,
+            "repeat_forever": campaign.repeat_forever,
             "smart_duration_seconds": campaign.smart_duration_seconds,
             "smart_no_timer_interval_seconds": campaign.smart_no_timer_interval_seconds,
             "auto_sender_failover": campaign.auto_sender_failover,
@@ -887,6 +890,15 @@ async def preflight_campaign(campaign_id: int, request: Request) -> CampaignPref
         target_count=summary.target_count,
         checked_pairs=summary.checked_pairs,
         ready_pairs=summary.ready_pairs,
+        routable_pairs=summary.routable_pairs,
+        joinable_pairs=summary.joinable_pairs,
+        planned_join_attempts=summary.planned_join_attempts,
+        ready_now_pairs=summary.ready_now_pairs or 0,
+        ready_now_targets=summary.ready_now_targets or 0,
+        deferred_pairs=summary.deferred_pairs,
+        earliest_resume_at=summary.earliest_resume_at,
+        independent_mode=summary.independent_mode,
+        requires_all_accounts=summary.requires_all_accounts,
         member_targets=summary.member_targets,
         joinable_targets=summary.joinable_targets,
         blocked_targets=summary.blocked_targets,
@@ -992,7 +1004,11 @@ async def enqueue_campaign(
 ) -> list[CampaignRun]:
     queue: RunQueue = request.app.state.run_queue
     try:
-        return await queue.enqueue_campaign(campaign_id, payload.request_key)
+        return await queue.enqueue_campaign(
+            campaign_id,
+            payload.request_key,
+            allow_deferred_start=payload.allow_deferred_start,
+        )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ConflictError as exc:
@@ -1307,6 +1323,7 @@ def _validate_campaign_update(campaign: Campaign, changes: dict[str, object]) ->
             )
         )
         smart_timer_mode = bool(changes.get("smart_timer_mode", campaign.smart_timer_mode))
+        repeat_forever = bool(changes.get("repeat_forever", campaign.repeat_forever))
         smart_duration_seconds = int(
             changes.get("smart_duration_seconds", campaign.smart_duration_seconds)
         )
@@ -1320,7 +1337,9 @@ def _validate_campaign_update(campaign: Campaign, changes: dict[str, object]) ->
                 detail="для диалога доступен один проход или умный режим",
             )
         if smart_timer_mode:
-            if not 60 <= smart_duration_seconds <= 7 * 24 * 3600:
+            if repeat_forever and smart_duration_seconds != 0:
+                raise HTTPException(status_code=422, detail="repeat_forever requires zero duration")
+            if not repeat_forever and not 60 <= smart_duration_seconds <= 7 * 24 * 3600:
                 raise HTTPException(
                     status_code=422,
                     detail="smart duration must be between 1 minute and 7 days",
@@ -1342,7 +1361,7 @@ def _validate_campaign_update(campaign: Campaign, changes: dict[str, object]) ->
                     status_code=422,
                     detail="activity-aware mode requires min_messages_between_posts",
                 )
-        elif smart_duration_seconds != 0:
+        elif smart_duration_seconds != 0 or repeat_forever:
             raise HTTPException(
                 status_code=422,
                 detail="smart duration requires smart_timer_mode",
@@ -1390,6 +1409,7 @@ def _validate_campaign_update(campaign: Campaign, changes: dict[str, object]) ->
             )
         )
         smart_timer_mode = bool(changes.get("smart_timer_mode", campaign.smart_timer_mode))
+        repeat_forever = bool(changes.get("repeat_forever", campaign.repeat_forever))
         spread_seconds = int(changes.get("spread_seconds", campaign.spread_seconds))
         smart_duration_seconds = int(
             changes.get("smart_duration_seconds", campaign.smart_duration_seconds)
@@ -1405,7 +1425,9 @@ def _validate_campaign_update(campaign: Campaign, changes: dict[str, object]) ->
                     status_code=422,
                     detail="timer-driven broadcasts use dedicated smart timing fields",
                 )
-            if not 60 <= smart_duration_seconds <= 7 * 24 * 3600:
+            if repeat_forever and smart_duration_seconds != 0:
+                raise HTTPException(status_code=422, detail="repeat_forever requires zero duration")
+            if not repeat_forever and not 60 <= smart_duration_seconds <= 7 * 24 * 3600:
                 raise HTTPException(
                     status_code=422,
                     detail="smart duration must be between 1 minute and 7 days",
@@ -1427,7 +1449,7 @@ def _validate_campaign_update(campaign: Campaign, changes: dict[str, object]) ->
                 status_code=422,
                 detail="one-pass broadcast must have a zero repeat interval",
             )
-        elif smart_duration_seconds != 0:
+        elif smart_duration_seconds != 0 or repeat_forever:
             raise HTTPException(
                 status_code=422,
                 detail="smart duration requires smart_timer_mode",

@@ -19,7 +19,7 @@ from proxima_traffic.content import (
     ContentError,
     render_spintax,
     resolve_media_path,
-    validate_spintax,
+    validate_telegram_text,
 )
 from proxima_traffic.dialogues import DialogueStep, parse_dialogue_steps, serialize_dialogue_steps
 from proxima_traffic.failure_policy import (
@@ -152,12 +152,14 @@ class ChannelCommentService:
         primary_account_id: int,
         primary_text: str,
         initial_delay_seconds: int,
+        primary_html: str | None = None,
         primary_media_path: str | None = None,
         primary_media_kind: str | None = None,
         primary_media_name: str | None = None,
         primary_media_size: int | None = None,
         dialogue_steps: list[DialogueStep] | None = None,
         message_edit_initial_text: str | None = None,
+        message_edit_initial_html: str | None = None,
         message_edit_delay_seconds: int | None = None,
         actor: str = "control-bot",
     ) -> ChannelCommentRule:
@@ -168,6 +170,7 @@ class ChannelCommentService:
             mode=mode,
             primary_account_id=primary_account_id,
             primary_text=primary_text,
+            primary_html=primary_html,
             initial_delay_seconds=initial_delay_seconds,
             primary_media_path=primary_media_path,
             primary_media_kind=primary_media_kind,
@@ -175,6 +178,7 @@ class ChannelCommentService:
             primary_media_size=primary_media_size,
             dialogue_steps=dialogue_steps,
             message_edit_initial_text=message_edit_initial_text,
+            message_edit_initial_html=message_edit_initial_html,
             message_edit_delay_seconds=message_edit_delay_seconds,
             actor=actor,
         )
@@ -189,12 +193,14 @@ class ChannelCommentService:
         primary_account_id: int,
         primary_text: str,
         initial_delay_seconds: int,
+        primary_html: str | None = None,
         primary_media_path: str | None = None,
         primary_media_kind: str | None = None,
         primary_media_name: str | None = None,
         primary_media_size: int | None = None,
         dialogue_steps: list[DialogueStep] | None = None,
         message_edit_initial_text: str | None = None,
+        message_edit_initial_html: str | None = None,
         message_edit_delay_seconds: int | None = None,
         actor: str = "control-bot",
     ) -> list[ChannelCommentRule]:
@@ -233,6 +239,7 @@ class ChannelCommentService:
         media_without_caption = has_primary_media
         normalized_text = self._normalize_text(
             primary_text,
+            primary_html,
             allow_empty=media_without_caption,
             has_media=has_primary_media,
         )
@@ -241,7 +248,7 @@ class ChannelCommentService:
                 raise ConflictError("режим редактирования комментария поддерживает только текст")
             if primary_media_kind not in ALLOWED_MEDIA_KINDS:
                 raise ConflictError("неизвестный тип медиафайла")
-            if primary_media_kind == "video_note" and normalized_text:
+            if primary_media_kind == "video_note" and (normalized_text or primary_html):
                 raise ConflictError("к видеокружку нельзя добавить подпись")
             try:
                 resolve_media_path(self._settings, str(primary_media_path))
@@ -255,6 +262,7 @@ class ChannelCommentService:
         normalized_delay = self._normalize_delay(initial_delay_seconds)
         serialized_steps: str | None = None
         normalized_edit_initial_text: str | None = None
+        normalized_edit_initial_html: str | None = None
         normalized_edit_delay: int | None = None
         if mode == ChannelCommentMode.DIALOGUE:
             if not dialogue_steps:
@@ -279,6 +287,7 @@ class ChannelCommentService:
             if (
                 steps[0].account_id != primary_account_id
                 or steps[0].text != normalized_text
+                or steps[0].html_text != primary_html
                 or steps[0].media_path != primary_media_path
                 or steps[0].media_kind != primary_media_kind
                 or steps[0].media_name != primary_media_name
@@ -293,11 +302,19 @@ class ChannelCommentService:
                 raise ConflictError("для режима редактирования нужен исходный комментарий")
             if message_edit_delay_seconds is None:
                 raise ConflictError("для режима редактирования нужна задержка")
-            normalized_edit_initial_text = self._normalize_text(message_edit_initial_text)
+            normalized_edit_initial_text = self._normalize_text(
+                message_edit_initial_text,
+                message_edit_initial_html,
+            )
+            normalized_edit_initial_html = message_edit_initial_html
             normalized_edit_delay = self._normalize_message_edit_delay(message_edit_delay_seconds)
         elif dialogue_steps:
             raise ConflictError("одиночный режим не содержит цепочку")
-        elif message_edit_initial_text is not None or message_edit_delay_seconds is not None:
+        elif (
+            message_edit_initial_text is not None
+            or message_edit_initial_html is not None
+            or message_edit_delay_seconds is not None
+        ):
             raise ConflictError("параметры редактирования доступны только в этом режиме")
 
         async with self._session_factory() as session:
@@ -328,10 +345,18 @@ class ChannelCommentService:
 
         # One Telegram preflight per channel is intentional: discussion groups
         # and sender permissions may differ even when the flow is identical.
-        preflights = [
-            await self._preflight_accounts(list(accounts.values()), channel_ref)
-            for channel_ref in normalized_refs
-        ]
+        # Keep the exact channel in the error so a batch can be corrected
+        # without the operator having to discover which one failed by trial.
+        preflights: list[ChannelCommentPreflight | None] = []
+        for channel_ref in normalized_refs:
+            try:
+                preflights.append(
+                    await self._preflight_accounts(list(accounts.values()), channel_ref)
+                )
+            except ConflictError as exc:
+                raise ConflictError(
+                    f"канал {channel_ref} не прошёл проверку: {exc}"
+                ) from exc
         async with self._session_factory() as session:
             rules = [
                 ChannelCommentRule(
@@ -340,6 +365,7 @@ class ChannelCommentService:
                     mode=mode,
                     primary_account_id=primary_account_id,
                     primary_text=normalized_text,
+                    primary_html=primary_html,
                     primary_media_path=primary_media_path,
                     primary_media_kind=primary_media_kind,
                     primary_media_name=(primary_media_name[:255] if primary_media_name else None),
@@ -348,6 +374,7 @@ class ChannelCommentService:
                     ),
                     dialogue_steps_json=serialized_steps,
                     message_edit_initial_text=normalized_edit_initial_text,
+                    message_edit_initial_html=normalized_edit_initial_html,
                     message_edit_delay_seconds=normalized_edit_delay,
                     mention_cooldown_days=(self._settings.channel_comments_mention_cooldown_days),
                     initial_delay_seconds=normalized_delay,
@@ -1339,6 +1366,11 @@ class ChannelCommentService:
                 )
             try:
                 text = render_spintax(step.text, seed=content_key)
+                html_text = (
+                    render_spintax(step.html_text, seed=content_key)
+                    if step.html_text is not None
+                    else None
+                )
             except ContentError as exc:
                 raise ConflictError(str(exc)) from exc
             if is_message_edit:
@@ -1350,6 +1382,7 @@ class ChannelCommentService:
                     channel_post_id=run.source_post_id,
                     message_id=run.last_comment_message_id,
                     text=text,
+                    html_text=html_text,
                     idempotency_key=idempotency_key,
                 )
             else:
@@ -1373,7 +1406,7 @@ class ChannelCommentService:
                     )
                 html_text = append_hidden_mentions(
                     text=text,
-                    html_text=None,
+                    html_text=html_text,
                     user_ids=mention_ids,
                 )
                 sent = await self._gateway.send_channel_comment(
@@ -1951,6 +1984,10 @@ class ChannelCommentService:
                     external_message_id=getattr(exc, "external_message_id", None),
                 )
         if code in {
+            # This lock is acquired before a Telegram RPC. It is normal when a
+            # scan, reaction or another worker owns the account briefly, so it
+            # must not spend a comment-delivery attempt.
+            "account_operation_busy",
             "flood_wait",
             "slow_mode",
             "proxy_unavailable",
@@ -2991,6 +3028,7 @@ class ChannelCommentService:
     @staticmethod
     def _retry_reason_text(reason: str) -> str:
         return {
+            "account_operation_busy": "аккаунт занят другой операцией; комментарий ждёт",
             "account_pacing": "отправка ждёт доступного интервала аккаунта",
             "flood_wait": "Telegram потребовал увеличить паузу перед повтором",
             "slow_mode": "в группе обсуждения действует медленный режим",
@@ -3058,10 +3096,40 @@ class ChannelCommentService:
     @staticmethod
     def _normalize_channel_ref(value: str) -> str:
         normalized = value.strip().rstrip("/")
-        if normalized.startswith("https://t.me/") or normalized.startswith("http://t.me/"):
-            normalized = "@" + normalized.split("t.me/", 1)[1].split("/", 1)[0]
-        if normalized.startswith("t.me/"):
-            normalized = "@" + normalized.split("/", 1)[1]
+        lowered = normalized.casefold()
+        public_prefixes = (
+            "https://t.me/",
+            "http://t.me/",
+            "https://www.t.me/",
+            "http://www.t.me/",
+            "https://telegram.me/",
+            "http://telegram.me/",
+            "https://www.telegram.me/",
+            "http://www.telegram.me/",
+            "t.me/",
+            "www.t.me/",
+            "telegram.me/",
+            "www.telegram.me/",
+        )
+        prefix = next((item for item in public_prefixes if lowered.startswith(item)), None)
+        if prefix is not None:
+            path = normalized[len(prefix) :].split("?", 1)[0].split("#", 1)[0]
+            parts = [part for part in path.split("/") if part]
+            if parts and parts[0].casefold() == "s":
+                # Telegram's preview links use /s/<username>/<post-id>.
+                parts = parts[1:]
+            if parts and parts[0].casefold() not in {
+                "+",
+                "c",
+                "joinchat",
+                "addlist",
+            } and not parts[0].startswith("+"):
+                normalized = "@" + parts[0]
+            else:
+                raise ConflictError(
+                    "для автокомментариев нужен публичный канал с @username; "
+                    "приватные invite-ссылки не подходят"
+                )
         if not normalized.startswith("@") or not 5 <= len(normalized) <= 33:
             raise ConflictError("укажите публичную ссылку канала в формате @channel")
         if not normalized[1:].replace("_", "").isalnum():
@@ -3071,18 +3139,19 @@ class ChannelCommentService:
     @staticmethod
     def _normalize_text(
         value: str,
+        html_text: str | None = None,
         *,
         allow_empty: bool = False,
         has_media: bool = False,
     ) -> str:
         normalized = value.strip()
-        if allow_empty and not normalized:
-            return normalized
-        maximum = 1024 if has_media else 4096
-        if not 1 <= len(normalized) <= maximum:
-            raise ConflictError(f"текст комментария: от 1 до {maximum} символов")
         try:
-            validate_spintax(normalized)
+            validate_telegram_text(
+                normalized,
+                html_text,
+                has_media=has_media,
+                allow_empty=allow_empty,
+            )
         except ContentError as exc:
             raise ConflictError(str(exc)) from exc
         return normalized
@@ -3114,6 +3183,7 @@ class ChannelCommentService:
                 DialogueStep(
                     account_id=rule.primary_account_id,
                     text=rule.primary_text,
+                    html_text=rule.primary_html,
                     media_path=rule.primary_media_path,
                     media_kind=rule.primary_media_kind,
                     media_name=rule.primary_media_name,
@@ -3130,10 +3200,12 @@ class ChannelCommentService:
                 DialogueStep(
                     account_id=rule.primary_account_id,
                     text=rule.message_edit_initial_text,
+                    html_text=rule.message_edit_initial_html,
                 ),
                 DialogueStep(
                     account_id=rule.primary_account_id,
                     text=rule.primary_text,
+                    html_text=rule.primary_html,
                     delay_seconds=edit_delay,
                 ),
             ]

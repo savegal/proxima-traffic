@@ -1,11 +1,11 @@
 """Pure parsing primitives for Telegram's official @SpamBot responses.
 
 The response language follows the Telegram client's locale, so this module
-never assumes a single language or a date format.  An unrecognised response is
-intentionally reported as ``UNKNOWN``.  This state is inconclusive: callers
-must record it for diagnostics, but must not turn it into a Telegram ban.
-Actual send errors remain the final authority when the bot reply cannot be
-classified.
+never assumes a single language or a date format. A genuinely unrecognised
+response is reported as ``UNKNOWN``. A response which explicitly mentions an
+account restriction but cannot be classified precisely is instead kept in a
+protective restricted state. Actual send errors remain the final authority for
+per-chat delivery diagnostics.
 """
 
 from __future__ import annotations
@@ -22,7 +22,22 @@ class SpamBotStatus(StrEnum):
     TEMPORARY_RESTRICTION = "temporary_restriction"
     ACTIVE_RESTRICTION = "active_restriction"
     PERMANENT_RESTRICTION = "permanent_restriction"
+    RESTRICTION_UNCLEAR = "restriction_unclear"
     UNKNOWN = "unknown"
+
+
+class SpamBotRestrictionScope(StrEnum):
+    """What @SpamBot explicitly says is restricted.
+
+    ``DIRECT_OUTREACH`` does not mean that publishing in every existing chat is
+    allowed.  Telegram's text only confirms the capabilities listed here, so
+    callers must keep restricted accounts out of automated campaigns.
+    """
+
+    NONE = "none"
+    DIRECT_OUTREACH = "direct_outreach"
+    DIRECT_OUTREACH_AND_INVITES = "direct_outreach_and_invites"
+    UNSPECIFIED = "unspecified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +48,8 @@ class SpamBotResult:
     parser_signal: str = "unknown"
     button_rows: tuple[tuple[str, ...], ...] = ()
     format_entities: tuple[tuple[str, int, int], ...] = ()
+    restriction_scope: SpamBotRestrictionScope = SpamBotRestrictionScope.NONE
+    allows_reply_to_inbound: bool | None = None
 
     @property
     def is_restricted(self) -> bool:
@@ -40,6 +57,7 @@ class SpamBotResult:
             SpamBotStatus.TEMPORARY_RESTRICTION,
             SpamBotStatus.ACTIVE_RESTRICTION,
             SpamBotStatus.PERMANENT_RESTRICTION,
+            SpamBotStatus.RESTRICTION_UNCLEAR,
         }
 
 
@@ -64,8 +82,19 @@ def _markers(*values: str) -> tuple[str, ...]:
 # Telegram can change surrounding copy without changing the safety meaning.
 _FREE_MARKERS = _markers(
     "free from any restrictions",
+    "free from all restrictions",
+    "free of any restrictions",
     "no limits are currently applied",
+    "no limitations are currently applied",
     "no restrictions are currently applied",
+    "no restrictions apply to your account",
+    "no restrictions have been applied to your account",
+    "your account has no restrictions",
+    "your account is not limited",
+    "all restrictions have been removed from your account",
+    "all limitations have been lifted from your account",
+    "you're free as a bird",
+    "you are free as a bird",
     "свободен от каких-либо ограничений",
     "никаких ограничений",
     "не має жодних обмежень",
@@ -98,9 +127,21 @@ _TEMPORARY_MARKERS = _markers(
     "limited until",
     "restricted until",
     "restriction until",
-    "until",
-    "до",
+    "will remain limited until",
+    "will remain restricted until",
+    "limitations will be lifted on",
+    "restrictions will be lifted on",
+    "limitations will be removed on",
+    "restrictions will be removed on",
+    "limited through",
+    "restricted through",
+    "ограничен до",
+    "ограничена до",
+    "ограничено до",
+    "ограничения действуют до",
     "обмежено до",
+    "обмежений до",
+    "обмежена до",
     "обмеження до",
     "hasta",
     "limitada hasta",
@@ -134,7 +175,6 @@ _RESTRICTION_MARKERS = _markers(
     "limited",
     "restricted",
     "restriction",
-    "spam",
     "ограничен",
     "ограничена",
     "ограничени",
@@ -163,9 +203,27 @@ _RESTRICTION_MARKERS = _markers(
     "제한",
 )
 
+# @SpamBot can send an onboarding/question prompt before it returns a status.
+# It contains words such as "limited" but is not evidence that the account is
+# restricted. Keep it diagnostically unknown instead of pausing an account.
+_STATUS_INQUIRY_MARKERS = _markers(
+    "i can help you find out if your account was limited",
+    "has your account been limited recently",
+    "может помочь узнать, ограничен ли ваш аккаунт",
+    "ваш аккаунт недавно был ограничен",
+    "puedo ayudarte a saber si tu cuenta fue limitada",
+    "posso ajudar a descobrir se sua conta foi limitada",
+)
+
 _PERMANENT_MARKERS = _markers(
-    "permanently",
     "permanent restriction",
+    "permanent limitations",
+    "permanently limited",
+    "permanently restricted",
+    "will remain limited indefinitely",
+    "will remain restricted indefinitely",
+    "not possible to remove the limitations",
+    "cannot remove the limitations",
     "cannot be undone",
     "can not be undone",
     "serious violations",
@@ -194,7 +252,6 @@ _PERMANENT_MARKERS = _markers(
     "trwale",
     "kalıcı",
     "kalici",
-    "permanen",
     "بشكل دائم",
     "دائم",
     "永久",
@@ -209,7 +266,45 @@ _ACTIVE_RESTRICTION_MARKERS = _markers(
     "while your account is limited",
     "your account is currently limited",
     "your account is currently restricted",
+    "you will not be able to send messages to people who do not have your number",
+    "you will not be able to send messages to people who don't have your number",
+    "you will not be able to send messages to people who have not contacted you first",
+    "you cannot send messages to people who do not have your number",
+    "you cannot send messages to people who don't have your number",
+    "you can still reply to anyone who messages you first",
+    "when people contact you first, you can always reply",
     "terwijl je account beperkt is",
+    "пока ваш аккаунт ограничен",
+    "пока аккаунт ограничен",
+    "вы не сможете отправлять сообщения людям, у которых нет вашего номера",
+    "вы по-прежнему можете отвечать тем, кто написал вам первым",
+    "поки ваш обліковий запис обмежено",
+    "ви не зможете надсилати повідомлення людям, у яких немає вашого номера",
+    "ви можете відповідати тим, хто написав вам першим",
+    "mientras tu cuenta esté limitada",
+    "no podrás enviar mensajes a personas que no tengan tu número",
+    "enquanto sua conta estiver limitada",
+    "não poderá enviar mensagens para pessoas que não têm seu número",
+    "solange dein konto eingeschränkt ist",
+    "du kannst keine nachrichten an personen senden, die deine nummer nicht haben",
+    "tant que votre compte est limité",
+    "vous ne pourrez pas envoyer de messages aux personnes qui n'ont pas votre numéro",
+    "finché il tuo account è limitato",
+    "non potrai inviare messaggi alle persone che non hanno il tuo numero",
+    "gdy twoje konto jest ograniczone",
+    "nie będziesz mógł wysyłać wiadomości do osób, które nie mają twojego numeru",
+    "hesabınız kısıtlandığı sürece",
+    "numaranıza sahip olmayan kişilere mesaj gönderemezsiniz",
+    "selama akun anda dibatasi",
+    "tidak dapat mengirim pesan kepada orang yang tidak memiliki nomor anda",
+    "أثناء تقييد حسابك",
+    "لا يمكنك إرسال رسائل إلى الأشخاص الذين لا يملكون رقمك",
+    "帐户受限期间",
+    "无法向没有您电话号码的人发送消息",
+    "アカウントが制限されている間",
+    "電話番号を連絡先に登録していない人にメッセージを送信できません",
+    "계정이 제한되는 동안",
+    "전화번호를 연락처에 저장하지 않은 사람에게 메시지를 보낼 수 없습니다",
 )
 
 _ACTIVE_RESTRICTION_BUTTON_MARKERS = _markers(
@@ -217,6 +312,90 @@ _ACTIVE_RESTRICTION_BUTTON_MARKERS = _markers(
     "this is a mistake",
     "mijn fout, geef me weer vrij",
     "dit is een fout",
+    "this decision is wrong",
+    "i believe this is a mistake",
+    "это ошибка",
+    "я считаю, что это ошибка",
+    "це помилка",
+    "esto es un error",
+    "isto é um erro",
+    "das ist ein fehler",
+    "c'est une erreur",
+    "questo è un errore",
+    "to jest błąd",
+    "bu bir hata",
+    "ini adalah kesalahan",
+    "هذا خطأ",
+    "这是一个错误",
+    "これは間違いです",
+    "이것은 실수입니다",
+)
+
+
+_DIRECT_OUTREACH_MARKERS = _markers(
+    "send messages to people who do not have your number",
+    "send messages to people who don't have your number",
+    "send messages to people who have not contacted you first",
+    "message people who are not in your contacts",
+    "writing to strangers who haven't contacted you first",
+    "отправлять сообщения людям, у которых нет вашего номера",
+    "писать незнакомым людям, которые не написали вам первыми",
+    "надсилати повідомлення людям, у яких немає вашого номера",
+    "enviar mensajes a personas que no tengan tu número",
+    "enviar mensagens para pessoas que não têm seu número",
+    "nachrichten an personen senden, die deine nummer nicht haben",
+    "envoyer des messages aux personnes qui n'ont pas votre numéro",
+    "inviare messaggi alle persone che non hanno il tuo numero",
+    "wysyłać wiadomości do osób, które nie mają twojego numeru",
+    "numaranıza sahip olmayan kişilere mesaj gönderemezsiniz",
+    "mengirim pesan kepada orang yang tidak memiliki nomor anda",
+    "إرسال رسائل إلى الأشخاص الذين لا يملكون رقمك",
+    "向没有您电话号码的人发送消息",
+    "電話番号を連絡先に登録していない人にメッセージを送信",
+    "전화번호를 연락처에 저장하지 않은 사람에게 메시지를",
+)
+
+_INVITE_RESTRICTION_MARKERS = _markers(
+    "add them to groups and channels",
+    "add people to groups and channels",
+    "adding people to groups and channels",
+    "добавлять их в группы и каналы",
+    "добавлять людей в группы и каналы",
+    "додавати їх до груп і каналів",
+    "agregarlas a grupos y canales",
+    "adicionar pessoas a grupos e canais",
+    "zu gruppen und kanälen hinzufügen",
+    "ajouter des personnes aux groupes et aux chaînes",
+    "aggiungerle a gruppi e canali",
+    "dodawać ich do grup i kanałów",
+    "gruplara ve kanallara ekleyemezsiniz",
+    "menambahkannya ke grup dan kanal",
+    "إضافتهم إلى المجموعات والقنوات",
+    "将他们添加到群组和频道",
+    "グループやチャンネルに追加",
+    "그룹과 채널에 추가",
+)
+
+_INBOUND_REPLY_ALLOWED_MARKERS = _markers(
+    "when people contact you first, you can always reply",
+    "you can always reply to them",
+    "you can still reply to anyone who messages you first",
+    "remember that you can still reply to anyone who messages you first",
+    "можете отвечать тем, кто написал вам первым",
+    "можете по-прежнему отвечать тем, кто написал вам первым",
+    "можете відповідати тим, хто написав вам першим",
+    "puedes responder a quienes te escriban primero",
+    "pode responder a quem falar com você primeiro",
+    "kannst immer antworten, wenn dich jemand zuerst kontaktiert",
+    "pouvez toujours répondre aux personnes qui vous contactent d'abord",
+    "puoi sempre rispondere a chi ti contatta per primo",
+    "możesz odpowiadać osobom, które najpierw do ciebie napiszą",
+    "size ilk mesajı atan kişilere yanıt verebilirsiniz",
+    "dapat membalas orang yang menghubungi anda terlebih dahulu",
+    "يمكنك الرد على من يراسلك أولاً",
+    "您仍然可以回复先联系您的人",
+    "先に連絡してきた人には返信できます",
+    "먼저 연락한 사람에게는 답장할 수 있습니다",
 )
 
 _MONTH_NUMBERS = {
@@ -456,6 +635,7 @@ def parse_spambot_response(
         )
 
     reference = _utc_now(now)
+    restriction_scope, allows_reply_to_inbound = _restriction_capabilities(text)
     restricted_until = _find_restriction_expiry(text, reference)
     if restricted_until is not None:
         return SpamBotResult(
@@ -465,6 +645,8 @@ def parse_spambot_response(
             parser_signal="restriction_marker_with_date",
             button_rows=button_rows,
             format_entities=format_entities,
+            restriction_scope=restriction_scope,
+            allows_reply_to_inbound=allows_reply_to_inbound,
         )
     if _contains_any(text, _PERMANENT_MARKERS):
         return SpamBotResult(
@@ -473,6 +655,8 @@ def parse_spambot_response(
             parser_signal="permanent_marker",
             button_rows=button_rows,
             format_entities=format_entities,
+            restriction_scope=restriction_scope,
+            allows_reply_to_inbound=allows_reply_to_inbound,
         )
     if _contains_any(text, _FREE_MARKERS):
         return SpamBotResult(
@@ -494,14 +678,26 @@ def parse_spambot_response(
             parser_signal="active_restriction_without_expiry",
             button_rows=button_rows,
             format_entities=format_entities,
+            restriction_scope=restriction_scope,
+            allows_reply_to_inbound=allows_reply_to_inbound,
         )
-    if _contains_any(text, _RESTRICTION_MARKERS):
+    if _contains_any(text, _STATUS_INQUIRY_MARKERS):
         return SpamBotResult(
             SpamBotStatus.UNKNOWN,
             raw,
-            parser_signal="restriction_without_date",
+            parser_signal="status_inquiry_without_verdict",
             button_rows=button_rows,
             format_entities=format_entities,
+        )
+    if _contains_any(text, _RESTRICTION_MARKERS):
+        return SpamBotResult(
+            SpamBotStatus.RESTRICTION_UNCLEAR,
+            raw,
+            parser_signal="restriction_confirmed_scope_unclear",
+            button_rows=button_rows,
+            format_entities=format_entities,
+            restriction_scope=SpamBotRestrictionScope.UNSPECIFIED,
+            allows_reply_to_inbound=allows_reply_to_inbound,
         )
     return SpamBotResult(
         SpamBotStatus.UNKNOWN,
@@ -523,6 +719,25 @@ def _safe_raw_text(value: str | None) -> str:
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
+
+
+def _restriction_capabilities(text: str) -> tuple[SpamBotRestrictionScope, bool | None]:
+    """Extract only capabilities explicitly stated by @SpamBot.
+
+    A restricted account might still reply to an inbound private message or
+    have access to an existing chat.  Neither fact is a permission to use it
+    for automated delivery, so this function never declares chat publishing
+    available.  It reports the narrow, textual guarantees only.
+    """
+
+    direct_outreach_blocked = _contains_any(text, _DIRECT_OUTREACH_MARKERS)
+    invites_blocked = _contains_any(text, _INVITE_RESTRICTION_MARKERS)
+    allows_reply_to_inbound = True if _contains_any(text, _INBOUND_REPLY_ALLOWED_MARKERS) else None
+    if direct_outreach_blocked and invites_blocked:
+        return SpamBotRestrictionScope.DIRECT_OUTREACH_AND_INVITES, allows_reply_to_inbound
+    if direct_outreach_blocked:
+        return SpamBotRestrictionScope.DIRECT_OUTREACH, allows_reply_to_inbound
+    return SpamBotRestrictionScope.UNSPECIFIED, allows_reply_to_inbound
 
 
 def _find_restriction_expiry(text: str, now: datetime) -> datetime | None:

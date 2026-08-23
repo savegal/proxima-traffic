@@ -10,6 +10,7 @@ import struct
 import tempfile
 import zipfile
 from collections.abc import AsyncIterator, Iterator
+from datetime import timedelta
 
 import pytest
 import pytest_asyncio
@@ -23,7 +24,9 @@ from proxima_traffic.accounts import (  # noqa: E402
     AccountImportError,
     AccountProfileError,
     AccountService,
+    _account_check_failure_code,
     _ConvertedSession,
+    _safe_account_error,
     _safe_extract_zip,
 )
 from proxima_traffic.config import Settings  # noqa: E402
@@ -31,10 +34,12 @@ from proxima_traffic.db import Database  # noqa: E402
 from proxima_traffic.models import (  # noqa: E402
     Account,
     AccountGroupMember,
+    AccountOperationLease,
     AccountSessionSource,
     AccountStatus,
+    utc_now,
 )
-from proxima_traffic.services import ConflictError  # noqa: E402
+from proxima_traffic.services import ConflictError, NotFoundError  # noqa: E402
 
 TEST_USER_ID = 123456789
 SERVER_AUTH_KEY = bytes([42]) * 256
@@ -703,6 +708,97 @@ async def test_account_check_keeps_last_known_authorization_on_network_failure(
     assert stored.status == AccountStatus.ACTIVE
 
 
+async def test_account_check_records_unreadable_local_session_without_revoking_access(
+    service: AccountService,
+) -> None:
+    """A broken encrypted payload is a local repair task, never a Telegram ban."""
+    source = StringSession()
+    source.set_dc(2, "149.154.167.51", 443)
+    source.auth_key = AuthKey(os.urandom(256))
+    account = await service.import_session_string(session_string=source.save())
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        stored = await session.get(Account, account.id)
+        assert stored is not None
+        stored.session_encrypted = None
+        stored.authorized = True
+        await session.commit()
+
+    result = await service.check_account(int(account.id))
+
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        stored = await session.get(Account, account.id)
+    assert result.authorized is True
+    assert result.failure_code == "session_material_invalid"
+    assert result.error is not None and "сессии" in result.error
+    assert stored is not None
+    assert stored.authorized is True
+    assert stored.status is AccountStatus.ACTIVE
+    assert stored.last_checked_at is not None
+    assert stored.last_error == result.error
+
+
+async def test_successful_check_recovers_only_expired_temporary_cooldown(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = StringSession()
+    source.set_dc(2, "149.154.167.51", 443)
+    source.auth_key = AuthKey(os.urandom(256))
+    account = await service.import_session_string(session_string=source.save())
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        stored = await session.get(Account, account.id)
+        assert stored is not None
+        stored.status = AccountStatus.DISABLED
+        stored.cooldown_reason = "flood_wait"
+        stored.cooldown_until = utc_now() - timedelta(seconds=1)
+        await session.commit()
+
+    async def healthy(*args: object) -> object:
+        del args
+        return type("Me", (), {"id": 42})()
+
+    monkeypatch.setattr(service, "_fetch_me", healthy)
+    result = await service.check_account(int(account.id))
+
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        stored = await session.get(Account, account.id)
+    assert result.authorized is True
+    assert stored is not None and stored.status is AccountStatus.ACTIVE
+    assert stored.cooldown_reason is None
+
+
+def test_account_check_error_masks_proxy_passwords() -> None:
+    error = RuntimeError("socks5://operator:secret-password@proxy.example:1080 failed")
+
+    safe = _safe_account_error(error)
+
+    assert "operator:***@proxy.example:1080" in safe
+    assert "secret-password" not in safe
+
+
+def test_account_check_classifies_all_fatal_auth_failures() -> None:
+    auth_key_error = type("AuthKeyError", (Exception,), {})()
+    raw_auth_error = type(
+        "RpcError",
+        (Exception,),
+        {"message": "AUTH_KEY_PERM_EMPTY"},
+    )()
+
+    assert _account_check_failure_code(auth_key_error) == "account_dead"
+    assert _account_check_failure_code(raw_auth_error) == "account_dead"
+
+
+def test_account_session_import_requires_a_dedicated_encryption_key(tmp_path: pathlib.Path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'missing-account-key.db'}",
+        admin_api_key="admin-key-is-not-a-session-key",
+    )
+    service = AccountService(Database(settings.database_url).session_factory, settings)
+
+    with pytest.raises(AccountImportError, match="PROXIMA_ACCOUNT_ENCRYPTION_KEY"):
+        service._require_dedicated_account_encryption_key()  # noqa: SLF001
+
+
 async def test_account_check_disables_a_definitively_revoked_session(
     service: AccountService,
     monkeypatch: pytest.MonkeyPatch,
@@ -821,6 +917,125 @@ async def test_bulk_session_check_never_marks_unknown_authorization_for_deletion
     assert [entry.label for entry in summary.issues] == ["network-unknown"]
 
 
+async def test_bulk_invalid_session_cleanup_rechecks_and_removes_only_confirmed_access(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Network or proxy trouble must never be elevated into mass deletion."""
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        accounts = [
+            Account(
+                label="confirmed-dead",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            ),
+            Account(
+                label="temporary-proxy-error",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            ),
+            Account(
+                label="healthy-session",
+                ownership_confirmed=True,
+                session_source=AccountSessionSource.SESSION_STRING,
+            ),
+        ]
+        session.add_all(accounts)
+        await session.commit()
+        account_ids = {account.label: int(account.id) for account in accounts}
+
+    async def fake_check(account_id: int, *, actor: str = "control-bot") -> AccountCheckResult:
+        del actor
+        if account_id == account_ids["confirmed-dead"]:
+            return AccountCheckResult(
+                account_id=account_id,
+                authorized=False,
+                telegram_user_id=None,
+                phone=None,
+                username=None,
+                error="session revoked",
+                failure_code="account_dead",
+            )
+        if account_id == account_ids["temporary-proxy-error"]:
+            return AccountCheckResult(
+                account_id=account_id,
+                authorized=False,
+                telegram_user_id=None,
+                phone=None,
+                username=None,
+                error="proxy unavailable",
+                failure_code="proxy_unavailable",
+            )
+        return AccountCheckResult(
+            account_id=account_id,
+            authorized=True,
+            telegram_user_id=None,
+            phone=None,
+            username=None,
+            error=None,
+        )
+
+    monkeypatch.setattr(service, "check_account", fake_check)
+
+    cleanup = await service.remove_confirmed_invalid_sessions()
+
+    assert [entry.label for entry in cleanup.check_summary.session_revoked] == ["confirmed-dead"]
+    assert [result.label for result in cleanup.deleted] == ["confirmed-dead"]
+    assert cleanup.skipped == ()
+    with pytest.raises(NotFoundError):
+        await service.get_account(account_ids["confirmed-dead"])
+    assert (await service.get_account(account_ids["temporary-proxy-error"])).label == (
+        "temporary-proxy-error"
+    )
+    assert (await service.get_account(account_ids["healthy-session"])).label == "healthy-session"
+
+
+async def test_bulk_invalid_session_cleanup_never_interrupts_an_active_operation(
+    service: AccountService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with service._session_factory() as session:  # type: ignore[attr-defined]
+        account = Account(
+            label="busy-but-dead",
+            ownership_confirmed=True,
+            session_source=AccountSessionSource.SESSION_STRING,
+        )
+        session.add(account)
+        await session.flush()
+        session.add(
+            AccountOperationLease(
+                account_id=int(account.id),
+                owner_id="worker",
+                lease_token="active-test-lease",
+                lease_until=utc_now() + timedelta(minutes=2),
+            )
+        )
+        await session.commit()
+        account_id = int(account.id)
+
+    async def revoked_check(account_id: int, *, actor: str = "control-bot") -> AccountCheckResult:
+        del actor
+        return AccountCheckResult(
+            account_id=account_id,
+            authorized=False,
+            telegram_user_id=None,
+            phone=None,
+            username=None,
+            error="session revoked",
+            failure_code="account_dead",
+        )
+
+    monkeypatch.setattr(service, "check_account", revoked_check)
+
+    cleanup = await service.remove_confirmed_invalid_sessions()
+
+    assert cleanup.removed == ()
+    assert [(item.label, item.reason) for item in cleanup.skipped] == [
+        ("busy-but-dead", "появилась активная задача: текущая Telegram-операция: 1")
+    ]
+    assert (await service.get_account(account_id)).label == "busy-but-dead"
+
+
 async def test_bulk_session_check_runs_a_bounded_parallel_batch(
     service: AccountService,
     monkeypatch: pytest.MonkeyPatch,
@@ -858,7 +1073,14 @@ async def test_bulk_session_check_runs_a_bounded_parallel_batch(
 
     monkeypatch.setattr(service, "check_account", fake_check)
 
-    summary = await service.check_all_sessions(concurrency=3)
+    progress: list[tuple[int, int]] = []
+
+    async def on_progress(completed: int, total: int) -> None:
+        progress.append((completed, total))
+
+    summary = await service.check_all_sessions(concurrency=3, on_progress=on_progress)
 
     assert [entry.label for entry in summary.entries] == [f"parallel-{index}" for index in range(6)]
     assert peak == 3
+    assert progress[0] == (0, 6)
+    assert progress[-1] == (6, 6)

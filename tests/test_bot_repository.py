@@ -87,6 +87,59 @@ async def test_broadcast_content_variants_are_manageable_as_a_rotation(
         await repository.delete_campaign_content_variant(campaign.id, "primary")
 
 
+async def test_checked_chat_selection_is_atomic_and_replaces_only_its_campaign_audience(
+    app: FastAPI,
+) -> None:
+    repository = AdminRepository(app.state.database.session_factory)
+    account = await repository.create_account(
+        label="checked-selection-sender",
+        telegram_user_id=4811,
+        ownership_confirmed=True,
+    )
+    first = await repository.create_target(chat_ref="@checked_first", title="Checked first")
+    second = await repository.create_target(chat_ref="@checked_second", title="Checked second")
+    await repository.set_target_approval(first.id, True)
+    await repository.set_target_approval(second.id, True)
+
+    campaign = await repository.create_campaign(
+        name="Checked selection",
+        mode=CampaignMode.BROADCAST,
+        primary_account_id=account.id,
+        target_id=None,
+        target_list_id=None,
+        selected_target_ids=[first.id, second.id, first.id],
+        selected_target_list_name="Checked selection audience",
+        primary_text="Offer",
+        reactions_enabled=True,
+        reaction_count=2,
+        reaction_emoji="🔥",
+        hidden_mentions_enabled=True,
+        mention_cooldown_days=14,
+    )
+
+    assert campaign.target_id is None
+    assert campaign.target_list_id is not None
+    assert campaign.audience_label == "Checked selection audience"
+    assert campaign.audience_target_count == 2
+    assert campaign.reactions_enabled is True
+    assert campaign.hidden_mentions_enabled is True
+    old_list_id = campaign.target_list_id
+    assert (await repository.get_target_list_view(old_list_id)).approved_count == 2
+
+    updated = await repository.update_campaign_selected_targets(
+        campaign.id,
+        target_ids=[second.id],
+        target_list_name="Checked selection replacement",
+    )
+
+    assert updated.target_id is None
+    assert updated.target_list_id is not None and updated.target_list_id != old_list_id
+    assert updated.audience_label == "Checked selection replacement"
+    assert updated.audience_target_count == 1
+    assert (await repository.get_target_list_view(old_list_id)).approved_count == 2
+    assert (await repository.get_target_list_view(updated.target_list_id)).approved_count == 1
+
+
 async def test_contact_variant_can_be_managed_and_sent_as_the_only_post(
     app: FastAPI,
 ) -> None:
@@ -267,6 +320,14 @@ async def test_existing_standalone_target_is_found_before_duplicate_creation(app
     assert existing.id == target.id
     with pytest.raises(ConflictError, match="этот чат уже добавлен"):
         await repository.create_target(chat_ref="@already_added", title="Duplicate")
+
+
+async def test_manual_target_creation_does_not_require_an_operator_alias(app: FastAPI) -> None:
+    repository = AdminRepository(app.state.database.session_factory)
+
+    target = await repository.create_target(chat_ref="@telegram_named_chat")
+
+    assert target.title == "@telegram_named_chat"
 
 
 async def test_named_target_list_fans_out_to_one_run_per_approved_target(

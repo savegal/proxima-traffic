@@ -62,7 +62,10 @@ class AccountUpdate(BaseModel):
 
 class TargetCreate(BaseModel):
     chat_ref: str = Field(min_length=1, max_length=255)
-    title: str = Field(min_length=1, max_length=150)
+    # The API may still accept a title for backward compatibility, but the
+    # control bot no longer asks for a hand-written alias. A real Telegram
+    # title is stored once an account resolves the chat during preflight.
+    title: str | None = Field(default=None, max_length=150)
 
 
 class TargetRead(ORMModel):
@@ -154,6 +157,7 @@ class MessageTemplateRead(ORMModel):
 class DialogueStepPayload(BaseModel):
     account_id: int = Field(gt=0)
     text: str = Field(default="", max_length=4096)
+    html_text: str | None = Field(default=None, max_length=16_384)
     delay_seconds: int = Field(default=0, ge=0, le=24 * 3600)
     reply_to_previous: bool = True
     media_path: str | None = Field(default=None, max_length=500)
@@ -179,13 +183,14 @@ class CampaignCreate(BaseModel):
     repeat_count: int = Field(default=1, ge=1, le=100)
     repeat_interval_seconds: int = Field(default=0, ge=0, le=7 * 24 * 3600)
     smart_timer_mode: bool = False
+    repeat_forever: bool = False
     smart_duration_seconds: int = Field(default=0, ge=0, le=7 * 24 * 3600)
     smart_no_timer_interval_seconds: int = Field(default=900, ge=60, le=7 * 24 * 3600)
     auto_sender_failover: bool = False
     activity_aware: bool = False
     min_messages_between_posts: int = Field(default=0, ge=0, le=100_000)
     activity_check_interval_seconds: int = Field(default=300, ge=30, le=3600)
-    visibility_max_wait_seconds: int = Field(default=3600, ge=60, le=7 * 24 * 3600)
+    visibility_max_wait_seconds: int = Field(default=3600, ge=0, le=7 * 24 * 3600)
     hidden_mentions_enabled: bool = False
     mention_cooldown_days: int = Field(default=30, ge=1, le=365)
     dialogue_steps: list[DialogueStepPayload] = Field(
@@ -250,13 +255,18 @@ class CampaignCreate(BaseModel):
             ):
                 raise ValueError("для диалога доступен один проход или умный режим")
             if self.smart_timer_mode:
-                if not 60 <= self.smart_duration_seconds <= 7 * 24 * 3600:
+                if (
+                    not self.repeat_forever
+                    and not 60 <= self.smart_duration_seconds <= 7 * 24 * 3600
+                ):
                     raise ValueError("smart_duration_seconds must be between 1 minute and 7 days")
+                if self.repeat_forever and self.smart_duration_seconds != 0:
+                    raise ValueError("repeat_forever requires a zero smart_duration_seconds")
                 if self.activity_aware and self.min_messages_between_posts < 1:
                     raise ValueError(
                         "min_messages_between_posts must be positive in activity-aware mode"
                     )
-            elif self.smart_duration_seconds != 0:
+            elif self.smart_duration_seconds != 0 or self.repeat_forever:
                 raise ValueError("smart_duration_seconds requires smart_timer_mode")
             elif self.activity_aware:
                 raise ValueError("activity_aware requires smart_timer_mode")
@@ -282,11 +292,16 @@ class CampaignCreate(BaseModel):
                     raise ValueError(
                         "timer-driven broadcasts use smart duration and no-timer interval fields"
                     )
-                if not 60 <= self.smart_duration_seconds <= 7 * 24 * 3600:
+                if (
+                    not self.repeat_forever
+                    and not 60 <= self.smart_duration_seconds <= 7 * 24 * 3600
+                ):
                     raise ValueError("smart_duration_seconds must be between 1 minute and 7 days")
+                if self.repeat_forever and self.smart_duration_seconds != 0:
+                    raise ValueError("repeat_forever requires a zero smart_duration_seconds")
             elif self.repeat_count == 1 and self.repeat_interval_seconds != 0:
                 raise ValueError("one-pass broadcast must have a zero repeat interval")
-            elif self.smart_duration_seconds != 0:
+            elif self.smart_duration_seconds != 0 or self.repeat_forever:
                 raise ValueError("smart_duration_seconds requires smart_timer_mode")
             if self.repeat_count > 1 and self.repeat_interval_seconds < 60:
                 raise ValueError("repeat_interval_seconds must be at least 60 for repeats")
@@ -321,6 +336,7 @@ class CampaignRead(ORMModel):
     repeat_count: int
     repeat_interval_seconds: int
     smart_timer_mode: bool
+    repeat_forever: bool
     smart_duration_seconds: int
     smart_no_timer_interval_seconds: int
     auto_sender_failover: bool
@@ -347,6 +363,7 @@ class CampaignUpdate(BaseModel):
     repeat_count: int | None = Field(default=None, ge=1, le=100)
     repeat_interval_seconds: int | None = Field(default=None, ge=0, le=7 * 24 * 3600)
     smart_timer_mode: bool | None = None
+    repeat_forever: bool | None = None
     smart_duration_seconds: int | None = Field(default=None, ge=0, le=7 * 24 * 3600)
     smart_no_timer_interval_seconds: int | None = Field(default=None, ge=60, le=7 * 24 * 3600)
     auto_sender_failover: bool | None = None
@@ -354,7 +371,7 @@ class CampaignUpdate(BaseModel):
     activity_aware: bool | None = None
     min_messages_between_posts: int | None = Field(default=None, ge=0, le=100_000)
     activity_check_interval_seconds: int | None = Field(default=None, ge=30, le=3600)
-    visibility_max_wait_seconds: int | None = Field(default=None, ge=60, le=7 * 24 * 3600)
+    visibility_max_wait_seconds: int | None = Field(default=None, ge=0, le=7 * 24 * 3600)
     hidden_mentions_enabled: bool | None = None
     mention_cooldown_days: int | None = Field(default=None, ge=1, le=365)
     sender_account_ids: list[int] | None = Field(default=None, max_length=100)
@@ -394,6 +411,15 @@ class CampaignPreflightRead(BaseModel):
     target_count: int
     checked_pairs: int
     ready_pairs: int
+    routable_pairs: int
+    joinable_pairs: int
+    planned_join_attempts: int
+    ready_now_pairs: int
+    ready_now_targets: int
+    deferred_pairs: int
+    earliest_resume_at: datetime | None
+    independent_mode: bool
+    requires_all_accounts: bool
     member_targets: int
     joinable_targets: int
     blocked_targets: int
@@ -411,6 +437,11 @@ def _reject_explicit_nulls(payload: BaseModel) -> None:
 
 class RunCreate(BaseModel):
     request_key: str = Field(min_length=8, max_length=64)
+    # A preflight can confirm chat access while every selected sender is still
+    # paused by FloodWait/daily pacing.  API clients need the same explicit
+    # safe scheduling path as the control bot, rather than treating that case
+    # as an opaque launch failure.
+    allow_deferred_start: bool = False
 
 
 class ActiveLaunchUpdate(BaseModel):

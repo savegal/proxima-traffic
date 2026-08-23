@@ -258,6 +258,49 @@ async def test_dialogue_delivers_captionless_voice_and_circle_steps(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_dialogue_delivers_premium_emoji_markup_for_every_step(tmp_path: Path) -> None:
+    gateway = MediaDialogueGateway()
+    app, client, campaign, accounts = await _build_smart_dialogue(tmp_path, gateway)
+    first_text = "Question ⭐"
+    first_html = 'Question <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>'
+    second_text = "Answer 🔥"
+    second_html = 'Answer <tg-emoji emoji-id="543210987654322">🔥</tg-emoji>'
+    try:
+        update = await client.patch(
+            f"/api/v1/campaigns/{campaign['id']}",
+            headers={"X-Admin-Key": "test-admin-key"},
+            json={
+                "dialogue_steps": [
+                    {
+                        "account_id": accounts[0]["id"],
+                        "text": first_text,
+                        "html_text": first_html,
+                        "reply_to_previous": False,
+                    },
+                    {
+                        "account_id": accounts[1]["id"],
+                        "text": second_text,
+                        "html_text": second_html,
+                        "reply_to_previous": True,
+                    },
+                ]
+            },
+        )
+        assert update.status_code == 200, update.text
+
+        await app.state.run_queue.enqueue_campaign(int(campaign["id"]), "premium-dialogue")
+        first = await app.state.queue_worker.process_next()
+        second = await app.state.queue_worker.process_next()
+
+        assert first is not None and first.status == RunStatus.QUEUED
+        assert second is not None and second.status == RunStatus.SUCCEEDED
+        assert [call["html_text"] for call in gateway.calls] == [first_html, second_html]
+    finally:
+        await client.aclose()
+        await app.state.database.dispose()
+
+
+@pytest.mark.asyncio
 async def test_dialogue_stops_before_reply_when_moderation_deleted_primary(tmp_path: Path) -> None:
     gateway = DeletedDialogueAnchorGateway()
     app, client, campaign, _ = await _build_smart_dialogue(tmp_path, gateway)

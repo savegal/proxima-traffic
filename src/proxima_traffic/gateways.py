@@ -9,7 +9,17 @@ from proxima_traffic.content import ContentError, parse_stored_contact, render_t
 from proxima_traffic.models import Account, MembershipStatus, Target
 from proxima_traffic.spambot import SpamBotResult, SpamBotStatus
 
-ORDINARY_REACTION_EMOJI = frozenset({"👍", "🔥", "❤️", "⚡"})
+REACTION_FALLBACK_EMOJIS = ("👍", "🔥", "❤️", "⚡")
+ORDINARY_REACTION_EMOJI = frozenset(REACTION_FALLBACK_EMOJIS)
+
+
+def reaction_candidates(preferred_emoji: str) -> tuple[str, ...]:
+    """Return the configured emoji first, followed by safe ordinary fallbacks."""
+    if preferred_emoji not in ORDINARY_REACTION_EMOJI:
+        return ()
+    return (preferred_emoji,) + tuple(
+        emoji for emoji in REACTION_FALLBACK_EMOJIS if emoji != preferred_emoji
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +81,10 @@ class TargetReadiness:
     media_kinds: frozenset[str] = frozenset()
     error_code: str | None = None
     error: str | None = None
+    # A title is accepted only when Telegram returned an actual chat entity.
+    # It lets the control panel use Telegram's name instead of an operator
+    # alias without requiring a second input step during target creation.
+    telegram_title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,7 +260,7 @@ class MessageGateway(Protocol):
 
     async def send_reaction(
         self, *, account: Account, target: Target, message_id: int, emoji: str
-    ) -> None: ...
+    ) -> str: ...
 
     async def collect_mentionable_user_ids(
         self,
@@ -318,6 +332,7 @@ class ChannelCommentGateway(Protocol):
         message_id: int,
         text: str,
         idempotency_key: str,
+        html_text: str | None = None,
     ) -> ChannelCommentDelivery: ...
 
     async def send_channel_comment_reaction(
@@ -328,7 +343,7 @@ class ChannelCommentGateway(Protocol):
         channel_post_id: int,
         message_id: int,
         emoji: str,
-    ) -> None: ...
+    ) -> str: ...
 
 
 class ParticipantReactionGateway(Protocol):
@@ -493,8 +508,9 @@ class DryRunGateway:
         message_id: int,
         text: str,
         idempotency_key: str,
+        html_text: str | None = None,
     ) -> ChannelCommentDelivery:
-        del channel_ref, idempotency_key
+        del channel_ref, html_text, idempotency_key
         if account.id is None:
             raise PermanentGatewayError("dry-run context is missing persisted identifiers")
         if channel_post_id <= 0 or message_id <= 0 or not 1 <= len(text.strip()) <= 4096:
@@ -515,12 +531,13 @@ class DryRunGateway:
         channel_post_id: int,
         message_id: int,
         emoji: str,
-    ) -> None:
+    ) -> str:
         del channel_ref
         if account.id is None:
             raise PermanentGatewayError("dry-run context is missing persisted identifiers")
         if channel_post_id <= 0 or message_id <= 0 or emoji not in ORDINARY_REACTION_EMOJI:
             raise PermanentGatewayError("reaction is invalid", code="reaction_invalid")
+        return emoji
 
     async def collect_mentionable_user_ids(
         self,
@@ -567,11 +584,12 @@ class DryRunGateway:
 
     async def send_reaction(
         self, *, account: Account, target: Target, message_id: int, emoji: str
-    ) -> None:
+    ) -> str:
         if account.id is None or target.id is None:
             raise PermanentGatewayError("dry-run context is missing persisted identifiers")
         if message_id <= 0 or emoji not in ORDINARY_REACTION_EMOJI:
             raise PermanentGatewayError("reaction is invalid", code="reaction_invalid")
+        return emoji
 
     async def scan_participant_messages(
         self,

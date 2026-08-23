@@ -5,7 +5,10 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from proxima_traffic.accounts import AccountBulkCheckSummary
+from proxima_traffic.accounts import (
+    AccountBulkCheckSummary,
+    AccountInvalidSessionCleanupSummary,
+)
 from proxima_traffic.bot.repository import (
     AccountGroupView,
     DashboardStats,
@@ -41,16 +44,29 @@ from proxima_traffic.preflight import CampaignPreflightSummary
 from proxima_traffic.profile_names import NameLocale, profile_name_capacity
 from proxima_traffic.proxies import ProxyPage, ProxyView
 from proxima_traffic.scheduling import BROADCAST_PROFILES, detect_broadcast_profile
+from proxima_traffic.spambot import SpamBotStatus
+from proxima_traffic.spambot_checks import SpamBotBulkCheckSummary
 from proxima_traffic.worker_supervision import WorkerHealthSnapshot
 
 
 def _campaign_preflight_state(summary: CampaignPreflightSummary) -> str:
     if summary.target_count == 0:
         return "🔴 Нет включённых чатов"
-    if summary.routable_targets == summary.target_count:
+    if summary.independent_mode:
+        expected_pairs = summary.target_count * summary.account_count
+        if summary.launchable_units == expected_pairs:
+            return "🟢 Все направления аккаунт–чат готовы"
+        if summary.launchable_units:
+            return "🟡 Готова только часть направлений аккаунт–чат"
+        if summary.deferred_pairs:
+            return "🟠 Доступ подтверждён, но аккаунты на безопасной паузе"
+        return "🔴 Нет готовых направлений аккаунт–чат"
+    if summary.launchable_units == summary.target_count:
         return "🟢 Всё готово к отправке"
-    if summary.routable_targets:
+    if summary.launchable_units:
         return "🟡 Готова только часть аудитории"
+    if summary.deferred_pairs:
+        return "🟠 Доступ подтверждён, но аккаунты на безопасной паузе"
     return "🔴 Нет готовых маршрутов"
 
 
@@ -60,11 +76,52 @@ def _campaign_preflight_details(summary: CampaignPreflightSummary) -> str:
         if summary.newest_checked_at is not None
         else "ещё не выполнялась"
     )
+    route_details = ""
+    if summary.independent_mode:
+        pair_total = summary.target_count * summary.account_count
+        skipped_pairs = max(0, pair_total - summary.routable_pairs)
+        route_details = (
+            f"🔐 Маршрутов аккаунт→чат с доступом: "
+            f"<b>{summary.routable_pairs}/{pair_total}</b>\n"
+            f"🚀 Можно начать сейчас: "
+            f"<b>{summary.launchable_units}/{pair_total}</b>\n"
+        )
+        if skipped_pairs:
+            route_details += (
+                f"⏭ Не готовых пар: <b>{skipped_pairs}</b> — они будут пропущены, "
+                "а готовые пары продолжат работу.\n"
+            )
+    else:
+        route_details = (
+            f"🚀 Чатов можно начать сейчас: "
+            f"<b>{summary.launchable_units}/{summary.target_count}</b>\n"
+        )
+    if summary.deferred_pairs:
+        resume_label = (
+            summary.earliest_resume_at.astimezone(UTC).strftime("%d.%m.%Y %H:%M UTC")
+            if summary.earliest_resume_at is not None
+            else "после завершения защитной паузы"
+        )
+        route_details += (
+            f"⏸ На безопасной паузе Telegram: <b>{summary.deferred_pairs}</b> пар; "
+            f"ближайшая готовность — <b>{resume_label}</b>. "
+            "Обычный запуск их пропустит; отдельной кнопкой ниже их можно "
+            "запланировать на безопасное время.\n"
+        )
+    if summary.auto_join_enabled and summary.planned_join_attempts:
+        route_details += (
+            f"⚠️ Перед отправкой потребуется до <b>{summary.planned_join_attempts}</b> "
+            f"вступлений в <b>{summary.joinable_targets}</b> чатов. "
+            "К каждому аккаунту применяются дневной лимит и минимальный интервал вступлений.\n"
+        )
+    if summary.requires_all_accounts:
+        route_details += "👥 Для диалога должны быть готовы все аккаунты цепочки в каждом чате.\n"
     return (
         f"👥 Аккаунты: <b>{summary.account_count}</b>\n"
         f"🎯 Чаты: <b>{summary.target_count}</b>\n"
         f"🔎 Проверено пар: <b>{summary.checked_pairs}</b>\n"
-        f"✅ Готовых пар: <b>{summary.ready_pairs}</b>\n\n"
+        f"✅ Уже в чатах и могут писать: <b>{summary.ready_pairs}</b> пар\n"
+        f"{route_details}\n"
         f"🕓 Последняя проверка: <b>{checked_label}</b>\n\n"
         "<b>Покрытие чатов</b>\n"
         f"✅ Можно отправлять: <b>{summary.member_targets}</b>\n"
@@ -73,21 +130,96 @@ def _campaign_preflight_details(summary: CampaignPreflightSummary) -> str:
         f"⏳ Заблокированы/ожидают: <b>{summary.blocked_targets}</b>\n"
         f"❌ Недоступны: <b>{summary.unavailable_targets}</b>\n"
         f"❔ Без готового маршрута: <b>{summary.uncovered_targets}</b>\n\n"
-        "<i>Проверка ничего не отправляет и не вступает в группы.</i>"
+        "<i>Проверка ничего не отправляет и не вступает в группы. Если включено "
+        "автовступление, оно выполняется только после подтверждения запуска.</i>"
+    )
+
+
+def campaign_preflight_progress_text(
+    *,
+    checked_pairs: int,
+    total_pairs: int,
+    checked_accounts: int,
+    total_accounts: int,
+) -> str:
+    """Live, factual progress while preflight reads Telegram state."""
+    return (
+        screen_title("Проверка перед запуском", "⏳ идёт")
+        + "\n\n"
+        + "Проверено аккаунтов: "
+        + f"<b>{checked_accounts}/{total_accounts}</b>\n"
+        + "Проверено направлений аккаунт→чат: "
+        + f"<b>{checked_pairs}/{total_pairs}</b>\n\n"
+        + "Сейчас сервис только читает состояние Telegram: доступ к чату, право писать и "
+        + "необходимость вступления. Сообщения не отправляются, а вступления не выполняются "
+        + "до отдельного подтверждения запуска."
     )
 
 
 def campaign_preflight_text(summary: CampaignPreflightSummary) -> str:
+    if summary.launchable_units:
+        next_step = (
+            "Свежий результат можно использовать сразу: подтвердите запуск готовых "
+            "направлений кнопкой ниже. Повторной Telegram-проверки не будет — перед "
+            "очередью сервис сверит только срок актуальности результата."
+        )
+    elif summary.deferred_pairs:
+        next_step = (
+            "Сейчас отправлять небезопасно. Можно вернуться к настройкам или поставить "
+            "рассылку на ближайшее безопасное время кнопкой ниже."
+        )
+    else:
+        next_step = (
+            "Сейчас запускать нечего: исправьте доступ к чатам или аккаунтам и выполните "
+            "проверку заново."
+        )
     return (
         screen_title("Готовность рассылки", _campaign_preflight_state(summary))
         + "\n\n"
         + _campaign_preflight_details(summary)
+        + "\n\n"
+        + section("Зачем нужна эта проверка")
+        + "\n"
+        + "Telegram может изменить доступ, право писать или защитную паузу в любой "
+        "момент. Поэтому перед живым запуском выполняется одна проверка без публикаций "
+        "и вступлений. После подтверждения повторного Telegram-прогона нет: сервис "
+        "использует этот свежий результат и сверяет только его актуальность."
+        + "\n\n"
+        + section("Что дальше")
+        + "\n"
+        + next_step
     )
 
 
-def campaign_launch_not_ready_text(summary: CampaignPreflightSummary) -> str:
+def campaign_launch_not_ready_text(
+    summary: CampaignPreflightSummary,
+    *,
+    planning_reason: str | None = None,
+) -> str:
     """Explain an automatic LIVE preflight without exposing a technical alert."""
 
+    if planning_reason is not None:
+        reason = planning_reason
+        next_step = (
+            "Измените срок active-рассылки, её частоту, аудиторию или пул отправителей, "
+            "затем выполните проверку и подтвердите запуск снова."
+        )
+    elif summary.deferred_pairs:
+        reason = (
+            "Доступ к чатам подтверждён, но Telegram временно ограничил отправку "
+            "выбранных аккаунтов."
+        )
+        next_step = (
+            "Дождитесь указанного времени, не сбрасывая FloodWait, либо выберите аккаунты, "
+            "которые уже готовы к отправке. Затем просто нажмите «Запустить» снова."
+        )
+    else:
+        reason = "Ни один готовый маршрут до выбранных чатов сейчас не найден."
+        next_step = (
+            "Откройте «Проверить доступ без запуска», посмотрите состояние чатов и аккаунтов, "
+            "исправьте доступ или выберите другой чат, затем выполните проверку и подтвердите "
+            "запуск снова."
+        )
     return (
         screen_title(
             "Отправка пока не началась",
@@ -95,7 +227,7 @@ def campaign_launch_not_ready_text(summary: CampaignPreflightSummary) -> str:
         )
         + "\n\n"
         + section("Что произошло")
-        + "\nНи один готовый маршрут до выбранных чатов сейчас не найден. "
+        + f"\n{reason} "
         "Очередь не создана, чтобы не тратить аккаунты на заведомо недоступную отправку."
         + "\n\n"
         + section("Результат проверки")
@@ -103,8 +235,7 @@ def campaign_launch_not_ready_text(summary: CampaignPreflightSummary) -> str:
         + _campaign_preflight_details(summary)
         + "\n\n"
         + section("Что делать")
-        + "\nОткройте «Проверить перед отправкой», посмотрите состояние чатов и аккаунтов, "
-        "исправьте доступ или выберите другой чат — затем просто нажмите «Запустить» снова."
+        + f"\n{next_step}"
     )
 
 
@@ -114,6 +245,7 @@ def dashboard_text(
     dry_run: bool,
     require_proxy: bool = True,
     worker_health: tuple[WorkerHealthSnapshot, ...] = (),
+    worker_campaign_scope: frozenset[int] | None = None,
 ) -> str:
     mode = (
         "Тестовый режим · сообщения не отправляются"
@@ -191,6 +323,7 @@ def dashboard_text(
         else "\n\n<b>Следующий шаг</b>\n• 🚀 Создайте рассылку или откройте текущий запуск"
     )
     worker_block = _worker_health_block(worker_health)
+    worker_scope_block = _worker_campaign_scope_block(worker_campaign_scope)
     return (
         screen_title("PROXIMA", "Операционный центр") + "\n"
         f"<code>{mode}</code>\n\n"
@@ -217,6 +350,7 @@ def dashboard_text(
         f"{proxy_line}"
         f"{next_action_block}"
         f"{worker_block}\n\n"
+        f"{worker_scope_block}"
         f"{section('За всё время')}\n"
         f"✅ Завершено: <b>{stats.succeeded_runs}</b>"
         f" · ❌ проблем: <b>{stats.failed_runs}</b>"
@@ -246,6 +380,18 @@ def _worker_health_block(worker_health: tuple[WorkerHealthSnapshot, ...]) -> str
     return "\n".join(lines)
 
 
+def _worker_campaign_scope_block(scope: frozenset[int] | None) -> str:
+    if scope is None:
+        return ""
+    campaign_ids = ", ".join(f"#{campaign_id}" for campaign_id in sorted(scope))
+    return (
+        "<b>⚠️ Ограничение фонового worker</b>\n"
+        f"Сейчас он обслуживает только: <code>{campaign_ids}</code>. "
+        "Задания остальных рассылок останутся в очереди, пока ограничение не снимут "
+        "и worker не перезапустят.\n\n"
+    )
+
+
 def guide_text() -> str:
     return (
         screen_title("Как начать", "Четыре понятных шага до первой рассылки и её контроля.")
@@ -272,8 +418,8 @@ def order_type_text() -> str:
         screen_title("Создание рассылки", "Выберите формат — дальше сервис проведёт по шагам.")
         + "\n\n"
         "<b>📢 Рассылка</b>\n"
-        "Один пост в выбранных чатах. Можно оставить разовую отправку или включить "
-        "автоматические повторы.\n\n"
+        "Активная рассылка выбрана по умолчанию: сервис поддерживает позицию поста в чате. "
+        "Один проход можно выбрать в черновике.\n\n"
         "<b>💬 Диалог</b>\n"
         "Несколько сообщений от разных аккаунтов с паузами и ответами друг на друга.\n\n"
         "<i>Сначала вы всё увидите в черновике. Отправка начнётся только после отдельного "
@@ -293,7 +439,7 @@ def order_draft_text(
     if launch_confirmation:
         launch_mode = "Тестовый режим · сообщения не отправятся" if dry_run else "Рабочая отправка"
         lines = [
-            "<b>🔎 Проверить и запустить?</b>",
+            "<b>🔎 Проверить готовность?</b>",
             f"<code>{launch_mode}</code>\n",
             f"<b>{'📢' if mode == 'broadcast' else '💬'} {name}</b>",
         ]
@@ -302,6 +448,11 @@ def order_draft_text(
             f"<b>{'📢' if mode == 'broadcast' else '💬'} {name}</b>",
             f"<code>{'РАССЫЛКА' if mode == 'broadcast' else 'ДИАЛОГ'} · НАСТРОЙКА</code>\n",
         ]
+    if launch_confirmation:
+        lines.append(
+            "<i>Сначала бот покажет, какая часть аудитории доступна. "
+            "Постановка в очередь потребует отдельного подтверждения.</i>"
+        )
     has_audience = data.get("target_id") is not None or data.get("target_list_id") is not None
     if not has_audience:
         # Old saved drafts may only have a label.  Do not make their interface look
@@ -360,7 +511,7 @@ def order_draft_text(
                 ),
             ]
         )
-        if bool(data.get("smart_timer_mode", False)):
+        if bool(data.get("smart_timer_mode", mode == "broadcast")):
             default_profile = BROADCAST_PROFILES["active"]
             profile = BROADCAST_PROFILES.get(str(data.get("broadcast_profile", "active")))
             activity_aware = bool(data.get("activity_aware", True))
@@ -398,15 +549,25 @@ def order_draft_text(
                         if profile is not None
                         else "🛠 Профиль: <b>ручная настройка</b>"
                     ),
-                    "♻️ Повторять автоматически до конца срока",
+                    (
+                        "♾ Повторять автоматически до ручной остановки"
+                        if bool(data.get("repeat_forever", False))
+                        else "♻️ Активная рассылка · повторять до конца срока"
+                    ),
                     "• с таймером — сразу после разрешённого времени",
                     "• без таймера — стартовый ритм <b>"
                     f"{no_timer_interval_minutes} мин.</b>, затем свой интервал для каждого чата",
-                    f"• срок работы — <b>{int(data.get('smart_duration_hours', 24))} ч.</b>",
                     (
-                        "• авточастота — учится по скорости чата; ориентир <b>"
-                        f"{visibility_depth} сообщений</b>, предел ожидания "
-                        f"<b>{_duration_text(visibility_wait)}</b>"
+                        "• срок работы — <b>до ручной остановки</b>"
+                        if bool(data.get("repeat_forever", False))
+                        else (
+                            f"• срок работы — <b>{int(data.get('smart_duration_hours', 24))} ч.</b>"
+                        )
+                    ),
+                    (
+                        "• пост вернётся после <b>"
+                        f"{visibility_depth} новых сообщений</b>; "
+                        f"{_visibility_wait_text(visibility_wait)}"
                         if activity_aware
                         else "• адаптивная видимость — <b>выключена</b>"
                     ),
@@ -601,11 +762,39 @@ def order_advanced_text(data: dict[str, object]) -> str:
         f"Без таймера чата: <b>раз в {no_timer_minutes} мин.</b>\n\n"
         "<b>Когда повторять пост</b>\n"
         f"Подстраиваться к активности: <b>{activity_label}</b>\n"
-        f"Ориентир: <b>{depth} новых сообщений</b>\n"
+        f"Ориентир: <b>{depth} новых сообщений после нашего поста</b>\n"
         f"Проверять чат: <b>раз в {_duration_text(check_seconds)}</b>\n"
-        f"Ожидание при низкой активности: <b>до {_duration_text(maximum_wait_seconds)}</b>\n\n"
-        "<i>Главное правило действует всегда: если публикация сервиса остаётся последней в "
-        "чате, повтор не отправится. Время ожидания не отменяет это правило.</i>"
+        f"Ожидание при низкой активности: <b>{_visibility_wait_text(maximum_wait_seconds)}</b>\n\n"
+        "<i>Сервис учитывает все новые сообщения, кроме публикаций, отправленных им самим; "
+        "он не пытается угадывать, является ли чужое сообщение рекламой. Если публикация "
+        "сервиса остаётся последней в чате, повтор не отправится. Время ожидания не отменяет "
+        "это правило.</i>"
+    )
+
+
+def order_schedule_mode_text(data: dict[str, object]) -> str:
+    """Explain the two delivery modes before the operator makes a choice."""
+
+    mode = str(data.get("order_mode", "broadcast"))
+    duration_hours = max(1, int(data.get("smart_duration_hours", 24)))
+    if mode == "dialogue":
+        active = (
+            "Активный режим повторяет всю цепочку сообщений, только после завершения "
+            "предыдущей цепочки в конкретном чате."
+        )
+    else:
+        active = (
+            "Активный режим поддерживает позицию поста: после публикации он ждёт новые "
+            "сообщения в конкретном чате и затем планирует следующий пост."
+        )
+    return (
+        "<b>♻️ Режим запуска</b>\n\n"
+        "<b>1️⃣ Один проход</b> — один раз отправить по аудитории и завершить запуск.\n\n"
+        f"<b>♻️ Активная рассылка</b> — {active} По умолчанию она работает "
+        f"<b>{duration_hours} ч.</b>; срок и условие повтора можно изменить на следующем "
+        "экране.\n\n"
+        "<i>Следующий пост никогда не будет добавлен, пока предыдущая публикация сервиса "
+        "остаётся последней. Остановить работающий запуск можно из его карточки.</i>"
     )
 
 
@@ -633,8 +822,8 @@ def audiences_text(stats: DashboardStats) -> str:
         f"🚫 Исключено сервисом: <b>{stats.bad_targets}</b>\n\n"
         "Чаты, загруженные из TXT или Telegram-папки, находятся только внутри своего "
         "списка и не засоряют раздел отдельных чатов и выбор аудитории.\n\n"
-        "<i>Для одной рассылки можно выбрать либо список целиком, либо отдельный вручную "
-        "добавленный чат.</i>"
+        "<i>Для рассылки можно выбрать готовый список целиком или отметить несколько "
+        "отдельных чатов галочками.</i>"
     )
 
 
@@ -715,6 +904,8 @@ def accounts_text(
             session_note = f"🔓 сессия подтверждена · {source_label}"
         else:
             session_note = f"🟡 сессия загружена, нужна проверка · {source_label}"
+        if getattr(account, "last_error", None):
+            session_note += " · ⚠️ есть диагностика"
         used, remaining, _ = _account_daily_load(account, daily_limit)
         load_note = (
             f" · 📤 {used}/{daily_limit}, осталось {remaining}"
@@ -790,6 +981,95 @@ def account_bulk_check_text(summary: AccountBulkCheckSummary) -> str:
         if len(summary.issues) > 6:
             lines.append(f"• …и ещё <b>{len(summary.issues) - 6}</b>")
         lines.append("Эти случаи обычно связаны с сетью, прокси или данными импорта.")
+    return "\n".join(lines)
+
+
+def account_bulk_check_progress_text(*, completed: int, total: int) -> str:
+    return (
+        screen_title("Быстрая проверка сессий", "⏳ идёт")
+        + "\n\n"
+        + f"Проверено аккаунтов: <b>{completed}/{total}</b>\n\n"
+        + "Каждая сессия проверяется через её назначенный маршрут. Сообщения не отправляются, "
+        + "@SpamBot не запрашивается, а ошибки связи и прокси не приводят к удалению аккаунта."
+    )
+
+
+def account_bulk_spambot_progress_text(*, completed: int, total: int) -> str:
+    return (
+        screen_title("Проверка @SpamBot", "⏳ идёт")
+        + "\n\n"
+        + f"Проверено аккаунтов: <b>{completed}/{total}</b>\n\n"
+        + "Проверяется только ответ @SpamBot через маршрут каждого аккаунта. "
+        + "Сессии отдельно не тестируются, сообщения не отправляются и вступления в чаты "
+        + "не выполняются."
+    )
+
+
+def account_bulk_spambot_text(summary: SpamBotBulkCheckSummary) -> str:
+    lines = [
+        screen_title("Проверка @SpamBot", "завершена"),
+        "",
+        section("Итог"),
+        f"Проверено через @SpamBot: <b>{summary.checked}</b>",
+        f"✅ Без ограничений: <b>{summary.count(SpamBotStatus.FREE)}</b>",
+        f"⏳ Временное ограничение: <b>{summary.count(SpamBotStatus.TEMPORARY_RESTRICTION)}</b>",
+        f"⛔ Активное без даты: <b>{summary.count(SpamBotStatus.ACTIVE_RESTRICTION)}</b>",
+        f"⛔ Постоянное: <b>{summary.count(SpamBotStatus.PERMANENT_RESTRICTION)}</b>",
+        f"⚠️ Ограничение с неясной формулировкой: "
+        f"<b>{summary.count(SpamBotStatus.RESTRICTION_UNCLEAR)}</b>",
+        f"❔ Неоднозначный ответ: <b>{summary.count(SpamBotStatus.UNKNOWN)}</b>",
+        f"🌐 Нет ответа из-за связи/прокси: <b>{len(summary.transport_errors)}</b>",
+    ]
+    if summary.skipped_without_session:
+        lines.append(
+            f"⏭ Без сохранённой сессии, не запрашивались: <b>{summary.skipped_without_session}</b>"
+        )
+    if not summary.entries:
+        lines.append("\nНет аккаунтов с загруженной Telegram-сессией.")
+    if summary.transport_errors:
+        lines.extend(["\n" + section("Связь не установлена")])
+        for entry in summary.transport_errors[:8]:
+            signal = escape(entry.parser_signal or "проверка не завершена")
+            lines.append(f"• ⚠️ <b>{escape(entry.label)}</b> · <code>{signal}</code>")
+        if len(summary.transport_errors) > 8:
+            lines.append(f"• …и ещё <b>{len(summary.transport_errors) - 8}</b>")
+        lines.append("Это не бан: проверьте маршрут/прокси и повторите только эту проверку позже.")
+    lines.append(
+        "\n<i>Проверка не отправляет сообщений и не вступает в чаты. Ограниченный аккаунт "
+        "остается на защитной паузе до свободного ответа @SpamBot.</i>"
+    )
+    return "\n".join(lines)
+
+
+def account_bulk_cleanup_text(summary: AccountInvalidSessionCleanupSummary) -> str:
+    """Render a precise outcome for the destructive bulk-session action."""
+    checks = summary.check_summary
+    lines = [
+        screen_title(
+            "Очистка невалидных сессий",
+            "Перед удалением Telegram-сессии были проверены заново; сообщения не отправлялись.",
+        ),
+        "",
+        section("Итог повторной проверки"),
+        f"Проверено: <b>{len(checks.entries)}</b>",
+        f"Telegram подтвердил недействительный доступ: <b>{len(checks.session_revoked)}</b>",
+        f"Полностью удалено: <b>{len(summary.deleted)}</b>",
+        f"Доступ стёрт, запись оставлена для истории: <b>{len(summary.preserved_for_history)}</b>",
+        f"Не тронуто из-за активной работы или гонки данных: <b>{len(summary.skipped)}</b>",
+        f"Неопределённых ошибок (не удалялись): <b>{len(checks.issues)}</b>",
+    ]
+    if not checks.session_revoked:
+        lines.append("\n✅ Сейчас нет сессий, для которых Telegram подтвердил потерю доступа.")
+    if summary.skipped:
+        lines.extend(["\n" + section("Оставлены без изменений")])
+        for item in summary.skipped[:8]:
+            lines.append(f"• ⚠️ <b>{escape(item.label)}</b> · {escape(item.reason)}")
+        if len(summary.skipped) > 8:
+            lines.append(f"• …и ещё <b>{len(summary.skipped) - 8}</b>")
+    if checks.issues:
+        lines.append(
+            "\nОшибки сети, прокси, flood и неопределённые статусы не являются причиной удаления."
+        )
     return "\n".join(lines)
 
 
@@ -888,6 +1168,21 @@ def account_details_text(
         )
     elif not getattr(account, "authorized", False):
         next_step = "🔍 Следующий шаг: проверьте сессию. При ошибке соединения назначьте прокси."
+    elif account.status.value == "paused" and getattr(account, "cooldown_reason", None) in {
+        "spambot_temp_ban",
+        "spambot_restriction_no_expiry",
+        "spambot_restriction_unclear",
+        "spambot_parse_unknown",
+    }:
+        next_step = (
+            "🩺 Следующий шаг: это защитная пауза @SpamBot. Нажмите «Проверить сессию + "
+            "@SpamBot»; после подтверждения свободного статуса аккаунт включится сам."
+        )
+    elif account.status.value == "paused" and getattr(account, "spambot_status", None) == "error":
+        next_step = (
+            "⚠️ Следующий шаг: @SpamBot сейчас недоступен, поэтому защитная пауза сохранена. "
+            "Повторите проверку позже; вручную включать аккаунт не нужно."
+        )
     elif get_settings().account_require_proxy and not proxy_slot:
         next_step = "🌐 Следующий шаг: назначьте рабочий прокси для этого аккаунта."
     elif proxy_view is not None and proxy_view.proxy.status.value in {
@@ -927,7 +1222,7 @@ def account_details_text(
     else:
         lines.append("За 24 часа: <b>лимит выключен</b>")
     if account.last_checked_at is not None:
-        checked = account.last_checked_at.isoformat(timespec="seconds")
+        checked = _date_time(account.last_checked_at)
         lines.append(f"Последняя проверка: <code>{checked}</code>")
     if account.spambot_checked_at is not None:
         checked = _date_time(account.spambot_checked_at)
@@ -936,6 +1231,7 @@ def account_details_text(
             "temporary_restriction": "⏳ временное ограничение",
             "active_restriction": "⛔ активное ограничение без указанной даты",
             "permanent_restriction": "⛔ постоянное ограничение",
+            "restriction_unclear": "⚠️ ограничение подтверждено, точный вид не распознан",
             "unknown": "❔ ответ пока не распознан",
             "error": "⚠️ проверка не завершена",
         }.get(account.spambot_status or "unknown", account.spambot_status or "unknown")
@@ -947,15 +1243,57 @@ def account_details_text(
         except (TypeError, ValueError):
             spambot_snapshot = {}
         if isinstance(spambot_snapshot, dict):
-            response_text = str(spambot_snapshot.get("text") or "")
+            check_error_code = str(spambot_snapshot.get("check_error_code") or "")
+            if check_error_code:
+                check_error_text = {
+                    "proxy_unavailable": ("нет доступного подключения через прокси аккаунта"),
+                    "account_operation_busy": "аккаунт занят другой операцией",
+                }.get(check_error_code, "ответ Telegram не был получен")
+                lines.append(
+                    "⚠️ <b>Проверка @SpamBot не состоялась:</b> "
+                    f"{check_error_text}. Статус ограничения не менялся."
+                )
+            previous_snapshot = spambot_snapshot.get("previous")
+            observation = (
+                previous_snapshot
+                if check_error_code and isinstance(previous_snapshot, dict)
+                else spambot_snapshot
+            )
+            restriction_scope = str(observation.get("restriction_scope") or "none")
+            scope_text = {
+                "direct_outreach": (
+                    "Telegram запретил первые личные сообщения людям, у которых нет номера "
+                    "аккаунта в контактах."
+                ),
+                "direct_outreach_and_invites": (
+                    "Telegram запретил первые личные сообщения незнакомым и добавление людей "
+                    "в группы/каналы."
+                ),
+                "unspecified": (
+                    "Telegram подтвердил ограничение, но в ответе не указан его точный объём."
+                ),
+            }.get(restriction_scope)
+            if scope_text:
+                lines.append(f"<b>Что именно ограничено:</b> {scope_text}")
+                if observation.get("allows_reply_to_inbound") is True:
+                    lines.append(
+                        "↩️ Telegram разрешает отвечать только после входящего сообщения. "
+                        "Это не разрешение на автоматическую рассылку."
+                    )
+                lines.append(
+                    "💡 Доступ к отдельному старому чату не считается разрешением на публикацию: "
+                    "рассылки этим аккаунтом остаются на паузе до свободного статуса @SpamBot."
+                )
+            response_text = str(observation.get("text") or "")
             if response_text:
                 visible_response = response_text[:1200]
                 suffix = "\n…" if len(response_text) > len(visible_response) else ""
+                response_label = "Последний успешный" if check_error_code else "Последний"
                 lines.append(
-                    "<b>Последний ответ @SpamBot:</b>\n"
+                    f"<b>{response_label} ответ @SpamBot:</b>\n"
                     f"<pre>{escape(visible_response + suffix)}</pre>"
                 )
-            button_rows = spambot_snapshot.get("button_rows")
+            button_rows = observation.get("button_rows")
             if isinstance(button_rows, list) and button_rows:
                 visible_buttons = "\n".join(
                     " | ".join(str(button) for button in row)
@@ -965,7 +1303,9 @@ def account_details_text(
                 if visible_buttons:
                     lines.append(f"Кнопки ответа:\n<pre>{escape(visible_buttons)}</pre>")
     if account.last_error:
-        lines.append(f"\n❌ <b>Последняя ошибка</b>\n<code>{escape(account.last_error)}</code>")
+        lines.append(
+            f"\n❌ <b>Последняя диагностика</b>\n<code>{escape(account.last_error)}</code>"
+        )
     return "\n".join(lines)
 
 
@@ -1306,7 +1646,11 @@ def target_details_text(
     return "\n".join(lines)
 
 
-def campaigns_text(page: Page[Campaign]) -> str:
+def campaigns_text(
+    page: Page[Campaign],
+    *,
+    worker_campaign_scope: frozenset[int] | None = None,
+) -> str:
     lines = [
         screen_title(
             "Рассылки",
@@ -1314,19 +1658,48 @@ def campaigns_text(page: Page[Campaign]) -> str:
         ),
         "",
     ]
+    if worker_campaign_scope is not None:
+        campaign_ids = ", ".join(f"#{campaign_id}" for campaign_id in sorted(worker_campaign_scope))
+        lines.extend(
+            [
+                "<b>⚠️ Важно: очередь сейчас ограничена</b>",
+                f"Фоновый worker берёт только рассылки: <code>{campaign_ids}</code>.",
+                "Другие запуски не начнутся, пока это ограничение не снимут и worker не "
+                "перезапустят.",
+                "",
+            ]
+        )
     for campaign in page.items:
         status = "🟢 включена" if campaign.enabled else "⏸ выключена"
-        target_source = (
-            f"чат #{campaign.target_id}"
-            if campaign.target_id is not None
-            else f"список #{campaign.target_list_id}"
+        audience_name = escape(
+            str(
+                campaign.audience_label
+                or (
+                    f"чат #{campaign.target_id}"
+                    if campaign.target_id is not None
+                    else f"список #{campaign.target_list_id}"
+                )
+            )
         )
+        target_source = (
+            f"чат · {audience_name}"
+            if campaign.target_id is not None
+            else f"список · {audience_name}"
+        )
+        audience_count = getattr(campaign, "audience_target_count", None)
+        if audience_count is not None:
+            target_source += f" · {int(audience_count)} чатов"
         if campaign.mode == CampaignMode.BROADCAST:
             mode_label = "📢 Посты"
             if campaign.smart_timer_mode:
+                duration = (
+                    "до остановки"
+                    if campaign.repeat_forever
+                    else _duration_text(campaign.smart_duration_seconds)
+                )
                 timing = (
-                    f"умная · {_duration_text(campaign.smart_duration_seconds)} · "
-                    f"без таймера / {_duration_text(campaign.smart_no_timer_interval_seconds)}"
+                    f"умная · {duration} · без таймера / "
+                    f"{_duration_text(campaign.smart_no_timer_interval_seconds)}"
                 )
             else:
                 timing = (
@@ -1378,11 +1751,24 @@ def campaigns_text(page: Page[Campaign]) -> str:
 
 
 def campaign_details_text(campaign: Campaign, sender_ids: list[int]) -> str:
-    target = (
-        f"Чат <code>#{campaign.target_id}</code>"
-        if campaign.target_id is not None
-        else f"Список чатов <code>#{campaign.target_list_id}</code>"
+    audience_name = escape(
+        str(
+            campaign.audience_label
+            or (
+                f"чат #{campaign.target_id}"
+                if campaign.target_id is not None
+                else f"список #{campaign.target_list_id}"
+            )
+        )
     )
+    target = (
+        f"Чат: <b>{audience_name}</b>"
+        if campaign.target_id is not None
+        else f"Список чатов: <b>{audience_name}</b>"
+    )
+    audience_count = getattr(campaign, "audience_target_count", None)
+    if audience_count is not None:
+        target += f" · <b>{int(audience_count)}</b> чатов в подборке"
     status = "🟢 Готова" if campaign.enabled else "⏸ Остановлена"
     lines = [
         screen_title(escape(campaign.name), status),
@@ -1390,6 +1776,10 @@ def campaign_details_text(campaign: Campaign, sender_ids: list[int]) -> str:
         section("Настройки сценария"),
         f"🎯 {target}",
     ]
+    lines.append(
+        "<i>Изменения сценария применятся к будущим запускам. Уже поставленные в очередь "
+        "посты сохраняют свой текст, аудиторию и пул отправителей.</i>"
+    )
     if campaign.mode == CampaignMode.BROADCAST:
         variants = _campaign_content_variants(campaign)
         enabled_variants = sum(variant.enabled for variant in variants)
@@ -1454,18 +1844,24 @@ def campaign_details_text(campaign: Campaign, sender_ids: list[int]) -> str:
                         else f"Пул: <b>{len(sender_ids)} аккаунтов</b> · "
                         "для каждого чата выбирается доступный аккаунт со свободным лимитом"
                     ),
-                    f"Срок активности: <b>{_duration_text(campaign.smart_duration_seconds)}</b>",
+                    (
+                        "Срок активности: <b>до ручной остановки</b>"
+                        if campaign.repeat_forever
+                        else (
+                            "Срок активности: <b>"
+                            f"{_duration_text(campaign.smart_duration_seconds)}</b>"
+                        )
+                    ),
                     "Чаты с таймером: <b>сразу после окончания таймера</b>",
                     "Чаты без таймера: стартовый интервал "
                     f"<b>{_duration_text(campaign.smart_no_timer_interval_seconds)}</b>, "
                     "затем авточастота",
                     (
-                        "Умная частота: отдельно для каждого аккаунта и чата · ориентир "
-                        f"<b>{campaign.min_messages_between_posts} сообщений</b> · "
+                        "Умная частота: отдельно для каждого аккаунта и чата · после "
+                        f"<b>{campaign.min_messages_between_posts} новых сообщений</b> · "
                         "проверка раз в "
                         f"<b>{_duration_text(campaign.activity_check_interval_seconds)}</b> · "
-                        "максимум ожидания "
-                        f"<b>{_duration_text(campaign.visibility_max_wait_seconds)}</b>"
+                        f"{_visibility_wait_text(campaign.visibility_max_wait_seconds)}"
                         if campaign.activity_aware
                         else "Умная видимость: <b>выключена</b>"
                     ),
@@ -1548,7 +1944,14 @@ def campaign_details_text(campaign: Campaign, sender_ids: list[int]) -> str:
                         if profile is not None
                         else "Профиль: <b>🛠 ручная настройка</b>"
                     ),
-                    f"Срок активности: <b>{_duration_text(campaign.smart_duration_seconds)}</b>",
+                    (
+                        "Срок активности: <b>до ручной остановки</b>"
+                        if campaign.repeat_forever
+                        else (
+                            "Срок активности: <b>"
+                            f"{_duration_text(campaign.smart_duration_seconds)}</b>"
+                        )
+                    ),
                     "Следующий диалог: <b>только после завершения всей цепочки</b>",
                     "Чаты без таймера: базовый интервал "
                     f"<b>{_duration_text(campaign.smart_no_timer_interval_seconds)}</b>",
@@ -1663,16 +2066,21 @@ def campaign_advanced_text(campaign: Campaign) -> str:
         f"Глубина: <b>{campaign.min_messages_between_posts} новых сообщений</b>\n"
         "Проверка позиции: каждые "
         f"<b>{_duration_text(campaign.activity_check_interval_seconds)}</b>\n"
-        "Максимальное ожидание: "
-        f"<b>{_duration_text(campaign.visibility_max_wait_seconds)}</b>\n"
+        "Условие без тайм-аута: "
+        f"<b>{_visibility_wait_text(campaign.visibility_max_wait_seconds)}</b>\n"
         f"{account_line}\n\n"
-        "<i>Повтор разрешается при достижении глубины или дедлайна, но не выполняется, "
-        "пока сообщение сервиса остаётся последним. Telegram slow mode, "
+        "<i>Повтор разрешается при достижении глубины или по выбранному тайм-ауту, "
+        "но не выполняется, пока сообщение сервиса остаётся последним. Telegram slow mode, "
         "ручной интервал чата, FloodWait и лимиты аккаунта всегда имеют приоритет.</i>"
     )
 
 
-def campaign_reactions_text(campaign: Campaign, step_count: int) -> str:
+def campaign_reactions_text(
+    campaign: Campaign,
+    step_count: int,
+    *,
+    sender_count: int | None = None,
+) -> str:
     place = (
         "к каждому посту рассылки"
         if campaign.mode == CampaignMode.BROADCAST
@@ -1688,7 +2096,23 @@ def campaign_reactions_text(campaign: Campaign, step_count: int) -> str:
         f"Сколько: <b>{campaign.reaction_count}</b>",
         f"Куда: <b>{place}</b>",
     ]
-    if campaign.mode == CampaignMode.DIALOGUE:
+    if campaign.mode == CampaignMode.BROADCAST:
+        if sender_count is not None:
+            maximum_reactors = max(0, sender_count - 1)
+            lines.append(f"Максимум из выбранного пула: <b>{maximum_reactors}</b> реакций")
+            if campaign.reactions_enabled and campaign.reaction_count > maximum_reactors:
+                reason = (
+                    "нужен второй готовый аккаунт"
+                    if maximum_reactors == 0
+                    else "автор поста не ставит реакцию, а каждый другой аккаунт — только одну"
+                )
+                lines.extend(
+                    [
+                        "",
+                        "⚠️ <b>Реакций в очереди будет меньше настройки:</b> " + reason + ".",
+                    ]
+                )
+    else:
         try:
             steps = parse_dialogue_steps(
                 campaign.dialogue_steps_json,
@@ -1726,6 +2150,8 @@ def campaign_reactions_text(campaign: Campaign, step_count: int) -> str:
             "<i>После успешной отправки ставятся обычные реакции выбранными аккаунтами "
             "сценария, кроме автора самого сообщения. Они идут отдельной очередью с "
             "короткой разной паузой; публикация и её отчёт от этого не ждут. "
+            "Если Telegram не принимает выбранный emoji, сервис безопасно попробует другой "
+            "из списка 👍, 🔥, ❤️, ⚡ и покажет фактический результат в отчёте. "
             "Платные реакции не используются.</i>",
         ]
     )
@@ -1938,14 +2364,16 @@ def launches_text(
         name = _preview(launch.campaign_name, 64)
         if launch.smart_timer_mode:
             next_send = _date_time(launch.next_scheduled_for)
-            active_until = _date_time(launch.active_until)
+            active_until = (
+                "до ручной остановки" if launch.repeat_forever else _date_time(launch.active_until)
+            )
             problem = f" · ❌ {launch.failed}" if launch.failed else ""
             lines.append(
                 f"{icon} <b>{name}</b>\n"
                 f"├ опубликовано <b>{launch.sent_publications}</b> · "
                 f"в работе <b>{launch.active}</b>"
                 f"{problem}\n"
-                f"└ следующий пост: <code>{next_send}</code> · до {active_until}"
+                f"└ следующий пост: <code>{next_send}</code> · {active_until}"
             )
             continue
         mode = "рассылка" if launch.mode == CampaignMode.BROADCAST else "диалог"
@@ -2021,6 +2449,7 @@ def launch_details_text(
             f"⏭ Не готовы при проверке: <b>{len(preflight_skipped)}</b> чатов; остальные запущены"
         )
     lines.extend(_variant_delivery_lines(runs))
+    lines.extend(_reaction_task_lines(launch))
 
     failed = [run for run in runs if run.status == RunStatus.FAILED]
     if failed or launch.attempt_failures or preflight_skipped:
@@ -2114,7 +2543,6 @@ def launch_details_text(
         if len(pending) > 5:
             lines.append(f"• ещё в очереди: {len(pending) - 5}")
     lines.extend(_hidden_mention_delivery_lines(runs))
-    lines.extend(_reaction_task_lines(launch))
     return _report_text(lines)
 
 
@@ -2169,7 +2597,11 @@ def _smart_launch_details_text(
         f"⏭ Ближайшая отправка: {next_send}",
         f"📡 Активных направлений: <b>{len(active_streams)}/{stream_count}</b> · "
         f"отправляется {launch.running} · готово сейчас {due_now}",
-        f"🗓 Работает до: <code>{_date_time(launch.active_until)}</code>",
+        (
+            "♾ Работает: <b>до ручной остановки</b>"
+            if launch.repeat_forever
+            else f"🗓 Работает до: <code>{_date_time(launch.active_until)}</code>"
+        ),
         "",
         "<b>Итог</b>",
         (
@@ -2193,6 +2625,7 @@ def _smart_launch_details_text(
     if launch.attempt_failures:
         lines.append(f"🔄 Сбоев отдельных попыток: <b>{len(launch.attempt_failures)}</b>")
     lines.extend(_variant_delivery_lines(runs))
+    lines.extend(_reaction_task_lines(launch))
 
     lines.extend(
         [
@@ -2223,15 +2656,26 @@ def _smart_launch_details_text(
         check_interval = _duration_text(
             latest_settings.activity_check_interval_seconds_snapshot or 0
         )
-        maximum_wait = _duration_text(latest_settings.visibility_max_wait_seconds_snapshot or 0)
+        maximum_wait = _visibility_wait_text(
+            latest_settings.visibility_max_wait_seconds_snapshot or 0
+        )
         lines.append(
-            f"🧠 Умная частота: ориентир <b>"
-            f"{latest_settings.min_messages_between_posts_snapshot or '—'} сообщений</b> · "
-            f"проверка {check_interval} · максимум {maximum_wait}"
+            f"🧠 Умная частота: после <b>"
+            f"{latest_settings.min_messages_between_posts_snapshot or '—'} новых сообщений</b> · "
+            f"проверка {check_interval} · {maximum_wait}"
         )
         lines.append(f"📈 Настроено по активности: <b>{len(learned_timings)}/{stream_count}</b>")
     elif latest_settings is not None:
         lines.append("🧠 Авточастота: <b>выключена</b>")
+
+    waiting_runs = [run for run in active_runs if run.status == RunStatus.QUEUED]
+    if waiting_runs and not launch.running:
+        first_waiting = min(waiting_runs, key=lambda run: (_as_utc(run.scheduled_for), run.id))
+        if first_waiting.error_code:
+            lines.append(
+                "💡 <b>Почему сейчас ждёт:</b> "
+                + _smart_waiting_state(first_waiting.error_code, first_waiting.scheduled_for)
+            )
 
     if launch.failed or blocked_timings or preflight_skipped:
         lines.append("\n<b>⚠️ Требует внимания</b>")
@@ -2335,10 +2779,11 @@ def _smart_launch_details_text(
                 # created runs are UTC-aware.  Always normalize before comparing so
                 # opening a live launch report cannot fail on a mixed dataset.
                 next_target_send = min(_as_utc(run.scheduled_for) for run in active)
-                state_text = (
-                    f"следующая <code>{_date_time(next_target_send)}</code> · "
-                    f"{_schedule_distance(next_target_send)}"
+                wait_reason = next(
+                    (run.error_code for run in active if run.error_code),
+                    None,
                 )
+                state_text = _smart_waiting_state(wait_reason, next_target_send)
             elif running:
                 next_target_send = min(_as_utc(run.scheduled_for) for run in active)
             issue_count = failed + blocked + (1 if skipped_before_launch is not None else 0)
@@ -2528,7 +2973,6 @@ def _smart_launch_details_text(
         f"\n<i>Технических отправок создано: {launch.total}. Данные обновляются кнопкой ниже.</i>"
     )
     lines.extend(_hidden_mention_delivery_lines(runs))
-    lines.extend(_reaction_task_lines(launch))
     return _report_text(lines)
 
 
@@ -2537,6 +2981,7 @@ _PREFLIGHT_SKIP_CODES = frozenset(
         "preflight_no_ready_sender",
         "preflight_independent_not_ready",
         "preflight_dialogue_not_ready",
+        "preflight_account_cooldown",
     }
 )
 
@@ -2553,9 +2998,12 @@ def _preflight_skip_reason(error_code: str | None) -> str:
     return {
         "preflight_no_ready_sender": "нет аккаунта с подтверждённым доступом к чату",
         "preflight_independent_not_ready": (
-            "не все независимые аккаунты имеют подтверждённый доступ"
+            "этот аккаунт не имеет подтверждённого доступа; другие пары продолжают работу"
         ),
         "preflight_dialogue_not_ready": "не все аккаунты диалога готовы работать в чате",
+        "preflight_account_cooldown": (
+            "у аккаунта есть доступ к чату, но Telegram временно поставил его на паузу"
+        ),
     }.get(error_code or "", "чат не прошёл проверку готовности")
 
 
@@ -2627,18 +3075,49 @@ def _reaction_task_lines(launch: LaunchView) -> list[str]:
         + launch.reaction_skipped
         + launch.reaction_cancelled
     )
-    if total == 0:
+    if not launch.reactions_enabled:
         return []
+    configured = (
+        f"Настроено: <b>{launch.reaction_requested_count}</b> на публикацию · "
+        f"реакция <b>{escape(launch.reaction_emoji)}</b>"
+    )
+    if total == 0:
+        if launch.sent_publications:
+            status = "Задач пока нет: для реакции нужен другой готовый аккаунт с доступом к чату."
+        else:
+            status = "Задачи появятся после первой подтверждённой публикации."
+        return ["\n<b>Реакции к публикациям</b>", configured, status]
     lines = [
         "\n<b>Реакции к публикациям</b>",
-        f"Всего: <b>{total}</b> · ✅ {launch.reaction_succeeded} · "
+        configured,
+        f"Всего: <b>{total}</b> · ✅ подтверждено Telegram: {launch.reaction_succeeded} · "
         f"❌ {launch.reaction_failed} · 🚫 {launch.reaction_cancelled}",
         f"🕒 ждёт <b>{launch.reaction_queued}</b> · "
         f"🔵 выполняется <b>{launch.reaction_running}</b> · "
         f"⏭ пропущено <b>{launch.reaction_skipped}</b>",
     ]
+    if launch.reaction_delivered_emojis:
+        actual = " · ".join(
+            f"{escape(emoji)} × <b>{count}</b>" for emoji, count in launch.reaction_delivered_emojis
+        )
+        lines.append(f"✅ Фактически поставлено: {actual}")
+        if any(emoji != launch.reaction_emoji for emoji, _ in launch.reaction_delivered_emojis):
+            lines.append(
+                "🔁 Telegram не принял часть выбранных реакций: использован другой emoji "
+                "из списка панели."
+            )
+    for code, count in launch.reaction_skipped_reasons:
+        lines.append(f"• Пропущено · {escape(failure_label(code))}: <b>{count}</b>")
     if launch.reaction_last_error:
-        lines.append(f"Последняя ошибка реакции: {_preview(launch.reaction_last_error, 140)}")
+        reason = (
+            failure_label(launch.reaction_last_error_code)
+            if launch.reaction_last_error_code
+            else _preview(launch.reaction_last_error, 140)
+        )
+        lines.append(f"Последняя причина реакции: {escape(reason)}")
+        hint = failure_hint(launch.reaction_last_error_code or "")
+        if hint:
+            lines.append(f"<i>{escape(hint)}</i>")
     return lines
 
 
@@ -2989,15 +3468,30 @@ def campaign_run_confirmation_text(
     target_count: int | None = None,
     capacity_warning: str | None = None,
 ) -> str:
-    target = (
-        f"чат #{campaign.target_id}"
-        if campaign.target_id is not None
-        else f"список чатов #{campaign.target_list_id}"
-        + (f" · <b>{target_count}</b> чатов" if target_count is not None else "")
+    audience_name = escape(
+        str(
+            campaign.audience_label
+            or (
+                f"чат #{campaign.target_id}"
+                if campaign.target_id is not None
+                else f"список #{campaign.target_list_id}"
+            )
+        )
     )
+    target = (
+        f"чат · <b>{audience_name}</b>"
+        if campaign.target_id is not None
+        else f"список чатов · <b>{audience_name}</b>"
+    )
+    if target_count is not None:
+        target += f" · <b>{target_count}</b> чатов"
     if campaign.mode == CampaignMode.BROADCAST:
         if campaign.smart_timer_mode:
-            timing = f"срок активности: <b>{_duration_text(campaign.smart_duration_seconds)}</b>"
+            timing = (
+                "срок активности: <b>до ручной остановки</b>"
+                if campaign.repeat_forever
+                else f"срок активности: <b>{_duration_text(campaign.smart_duration_seconds)}</b>"
+            )
         elif campaign.spread_seconds >= 3600:
             timing = f"окно отправки: <b>{campaign.spread_seconds // 3600} ч.</b>"
         elif campaign.spread_seconds >= 60:
@@ -3056,6 +3550,67 @@ def campaign_run_confirmation_text(
     )
 
 
+def campaign_launch_review_text(
+    campaign: Campaign,
+    summary: CampaignPreflightSummary,
+    *,
+    planned_tasks: int,
+    capacity_warning: str | None = None,
+) -> str:
+    """Render the operator's last review before a partial launch can be queued."""
+
+    independent = (
+        campaign.mode == CampaignMode.BROADCAST
+        and campaign.sender_mode == BroadcastSenderMode.INDEPENDENT
+    )
+    ready = summary.launchable_units
+    total = summary.target_count * summary.account_count if independent else summary.target_count
+    unit = "направлений аккаунт–чат" if independent else "чатов"
+    if ready == 0:
+        decision = (
+            "<b>В очередь ничего не будет поставлено.</b> Telegram временно поставил "
+            "доступные аккаунты на защитную паузу; дождитесь указанного времени или "
+            "выберите готовые аккаунты."
+            if summary.deferred_pairs
+            else "<b>В очередь ничего не будет поставлено.</b> Исправьте доступ к чатам или "
+            "аккаунтам и проверьте рассылку ещё раз."
+        )
+    elif ready == total:
+        decision = (
+            f"<b>В очередь войдут все {total} {unit}.</b> Подтвердите запуск ниже: "
+            "сервис использует именно этот свежий результат и перед очередью проверит "
+            "только его актуальность, без повторного Telegram-прогона."
+        )
+    else:
+        decision = (
+            f"<b>В очередь войдут только {ready} из {total} {unit}.</b> Остальные "
+            "не будут получать попытки отправки. Подтвердите запуск ниже: сервис "
+            "использует именно этот свежий результат и проверит только его актуальность, "
+            "без повторного Telegram-прогона."
+        )
+    task_line = (
+        f"Ожидаемых технических отправок: <b>{planned_tasks}</b>"
+        if ready
+        else "Ожидаемых технических отправок: <b>0</b>"
+    )
+    warning = f"\n\n{capacity_warning}" if capacity_warning else ""
+    return (
+        screen_title(
+            "Готовность перед запуском",
+            f"{escape(campaign.name)} · свежая проверка завершена",
+        )
+        + "\n\n"
+        + _campaign_preflight_details(summary)
+        + "\n\n"
+        + section("Решение")
+        + "\n"
+        + decision
+        + "\n"
+        + task_line
+        + warning
+    )
+
+
 def campaign_confirmation_text(data: dict[str, object]) -> str:
     target_source = (
         f"Чат: <code>#{data['target_id']}</code>"
@@ -3068,6 +3623,7 @@ def campaign_confirmation_text(data: dict[str, object]) -> str:
     repeat_count = int(data.get("repeat_count", 1))
     repeat_minutes = int(data.get("repeat_interval_minutes", 0))
     smart_timer_mode = bool(data.get("smart_timer_mode", False))
+    repeat_forever = bool(data.get("repeat_forever", False))
     smart_duration_hours = int(data.get("smart_duration_hours", 0))
     default_profile = BROADCAST_PROFILES["active"]
     smart_no_timer_interval_minutes = int(
@@ -3100,7 +3656,11 @@ def campaign_confirmation_text(data: dict[str, object]) -> str:
                 f"Отправители: <code>{escape(sender_text)}</code>",
                 target_source,
                 (
-                    f"Срок активности: <b>{smart_duration_hours} ч.</b>\n"
+                    (
+                        "Срок активности: <b>до ручной остановки</b>\n"
+                        if repeat_forever
+                        else f"Срок активности: <b>{smart_duration_hours} ч.</b>\n"
+                    )
                     if smart_timer_mode
                     else f"Окно отправки: <b>{spread_label}</b>\n"
                 ),
@@ -3110,11 +3670,18 @@ def campaign_confirmation_text(data: dict[str, object]) -> str:
                     "• без таймера — каждые "
                     f"<b>{_duration_text(smart_no_timer_interval_minutes * 60)}</b>\n"
                     "• видимость — после "
-                    f"<b>{min_messages_between_posts} новых сообщений</b> или максимум через "
-                    f"<b>{_duration_text(visibility_max_wait_seconds)}</b>\n"
-                    "• проверка позиции — каждые "
-                    f"<b>{_duration_text(activity_check_interval_seconds)}</b>\n"
-                    "• автозамена — <b>включена для выбранных аккаунтов</b>"
+                    f"<b>{min_messages_between_posts} новых сообщений</b>"
+                    + (
+                        " · только после порога\n"
+                        if visibility_max_wait_seconds == 0
+                        else (
+                            " или максимум через <b>"
+                            f"{_duration_text(visibility_max_wait_seconds)}</b>\n"
+                        )
+                    )
+                    + "• проверка позиции — каждые "
+                    + f"<b>{_duration_text(activity_check_interval_seconds)}</b>\n"
+                    + "• автозамена — <b>включена для выбранных аккаунтов</b>"
                     if smart_timer_mode
                     else "Повторы: <b>один проход</b>"
                     if repeat_count == 1
@@ -3389,6 +3956,25 @@ def _date_time(value: object) -> str:
     normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value
     local_value = normalized.astimezone(display_timezone)
     return f"{local_value:%d.%m · %H:%M} ({timezone_name})"
+
+
+def _visibility_wait_text(seconds: int) -> str:
+    if seconds <= 0:
+        return "без тайм-аутной публикации · только после порога"
+    return f"максимум через {_duration_text(seconds)}"
+
+
+def _smart_waiting_state(reason: str | None, scheduled_for: datetime) -> str:
+    when = f"<code>{_date_time(scheduled_for)}</code> · {_schedule_distance(scheduled_for)}"
+    if reason == "chat_idle_last_managed_post":
+        return f"ждём первое новое сообщение: наш пост последний · проверка {when}"
+    if reason == "visibility_wait":
+        return f"ждём достижения порога новых сообщений · проверка {when}"
+    if reason == "activity_probe_unavailable":
+        return f"не удалось проверить активность; безопасно ждём повторную проверку {when}"
+    if reason == "chat_timer":
+        return f"ждём таймер чата · следующая {when}"
+    return f"следующая {when}"
 
 
 def _duration_text(seconds: int) -> str:

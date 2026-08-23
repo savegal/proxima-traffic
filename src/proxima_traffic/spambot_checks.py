@@ -5,15 +5,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxima_traffic.failure_policy import ACCOUNT_FATAL_CODES, failure_code
-from proxima_traffic.models import Account, AccountStatus, AuditEvent, ensure_utc, utc_now
-from proxima_traffic.spambot import SpamBotResult, SpamBotStatus
+from proxima_traffic.models import (
+    Account,
+    AccountSessionSource,
+    AccountStatus,
+    AuditEvent,
+    ensure_utc,
+    utc_now,
+)
+from proxima_traffic.spambot import SpamBotRestrictionScope, SpamBotResult, SpamBotStatus
 from proxima_traffic.worker_supervision import WorkerIterationReporter
 
 logger = logging.getLogger(__name__)
@@ -22,12 +31,47 @@ SPAMBOT_REASONS = frozenset(
     {
         "spambot_temp_ban",
         "spambot_restriction_no_expiry",
+        "spambot_restriction_unclear",
         "spambot_permanent_ban",
         "spambot_parse_unknown",
     }
 )
 
 LEGACY_UNKNOWN_REASON = "spambot_parse_unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class SpamBotBulkCheckEntry:
+    """One account in an explicitly requested @SpamBot-only check."""
+
+    account_id: int
+    label: str
+    status: str | None
+    parser_signal: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        return self.status is not None and self.status != "error"
+
+
+@dataclass(frozen=True, slots=True)
+class SpamBotBulkCheckSummary:
+    """Outcome of a manual @SpamBot check without a session or chat probe."""
+
+    entries: tuple[SpamBotBulkCheckEntry, ...]
+    skipped_without_session: int = 0
+
+    @property
+    def checked(self) -> int:
+        return len(self.entries)
+
+    def count(self, status: SpamBotStatus | str) -> int:
+        expected = status.value if isinstance(status, SpamBotStatus) else status
+        return sum(entry.status == expected for entry in self.entries)
+
+    @property
+    def transport_errors(self) -> tuple[SpamBotBulkCheckEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.status in {None, "error"})
 
 
 class SpamBotGateway(Protocol):
@@ -106,6 +150,81 @@ class SpamBotCheckService:
             if result is not None:
                 checked += 1
         return checked
+
+    async def check_all_accounts(
+        self,
+        *,
+        trigger: str = "manual_bulk_check",
+        concurrency: int = 2,
+        on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+    ) -> SpamBotBulkCheckSummary:
+        """Force a @SpamBot-only check for every account with a saved session.
+
+        The operation neither checks session validity nor inspects or joins
+        chats. A small bounded fan-out prevents a burst of Telegram account
+        connections, while the progress callback is called only after a real
+        account check has completed.
+        """
+        async with self._session_factory() as session:
+            total_accounts = int(await session.scalar(select(func.count(Account.id))) or 0)
+            accounts = list(
+                await session.execute(
+                    select(Account.id, Account.label)
+                    .where(Account.session_source != AccountSessionSource.NONE)
+                    .order_by(Account.id)
+                )
+            )
+
+        total = len(accounts)
+        if on_progress is not None:
+            await on_progress(0, total)
+        semaphore = asyncio.Semaphore(max(1, min(int(concurrency), 2)))
+        progress_lock = asyncio.Lock()
+        completed = 0
+
+        async def report_progress() -> None:
+            nonlocal completed
+            if on_progress is None:
+                return
+            async with progress_lock:
+                completed += 1
+                await on_progress(completed, total)
+
+        async def check_one(account_id: int, label: str) -> SpamBotBulkCheckEntry:
+            async with semaphore:
+                try:
+                    result = await self.check_account(
+                        account_id,
+                        trigger=trigger,
+                        force=True,
+                    )
+                    if result is not None:
+                        return SpamBotBulkCheckEntry(
+                            account_id=account_id,
+                            label=label,
+                            status=result.status.value,
+                            parser_signal=result.parser_signal,
+                        )
+                    async with self._session_factory() as session:
+                        account = await session.get(Account, account_id)
+                        return SpamBotBulkCheckEntry(
+                            account_id=account_id,
+                            label=label,
+                            status=account.spambot_status if account is not None else None,
+                            parser_signal=(
+                                account.spambot_parser_signal if account is not None else None
+                            ),
+                        )
+                finally:
+                    await report_progress()
+
+        entries = await asyncio.gather(
+            *(check_one(int(account_id), str(label)) for account_id, label in accounts)
+        )
+        return SpamBotBulkCheckSummary(
+            entries=tuple(entries),
+            skipped_without_session=max(0, total_accounts - total),
+        )
 
     async def prepare_legacy_unknown_rechecks(self) -> int:
         """Schedule former UNKNOWN pauses for an immediate authoritative recheck.
@@ -209,12 +328,30 @@ class SpamBotCheckService:
             status = SpamBotStatus(account.spambot_status or "")
         except ValueError:
             return None
+        restriction_scope = SpamBotRestrictionScope.NONE
+        allows_reply_to_inbound: bool | None = None
+        try:
+            snapshot = json.loads(account.spambot_response_json or "{}")
+        except (TypeError, ValueError):
+            snapshot = {}
+        if isinstance(snapshot, dict):
+            try:
+                restriction_scope = SpamBotRestrictionScope(
+                    str(snapshot.get("restriction_scope") or "none")
+                )
+            except ValueError:
+                restriction_scope = SpamBotRestrictionScope.UNSPECIFIED
+            raw_reply_permission = snapshot.get("allows_reply_to_inbound")
+            if isinstance(raw_reply_permission, bool):
+                allows_reply_to_inbound = raw_reply_permission
         restricted_until = ensure_utc(account.cooldown_until)
         return SpamBotResult(
             status=status,
             raw_text="",
             restricted_until=restricted_until,
             parser_signal="cached",
+            restriction_scope=restriction_scope,
+            allows_reply_to_inbound=allows_reply_to_inbound,
         )
 
     async def _persist_result(
@@ -241,6 +378,8 @@ class SpamBotCheckService:
                     parser_signal="temporary_without_expiry",
                     button_rows=result.button_rows,
                     format_entities=result.format_entities,
+                    restriction_scope=result.restriction_scope,
+                    allows_reply_to_inbound=result.allows_reply_to_inbound,
                 )
             account.spambot_checked_at = now
             account.spambot_status = result.status.value
@@ -250,6 +389,8 @@ class SpamBotCheckService:
                     "text": result.raw_text,
                     "button_rows": [list(row) for row in result.button_rows],
                     "format_entities": [list(entity) for entity in result.format_entities],
+                    "restriction_scope": result.restriction_scope.value,
+                    "allows_reply_to_inbound": result.allows_reply_to_inbound,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -275,7 +416,7 @@ class SpamBotCheckService:
                     f"@SpamBot: temporary restriction until {account.cooldown_until.isoformat()}"
                 )
                 event_type = "account.spambot_temporary_ban"
-            if result.status is SpamBotStatus.ACTIVE_RESTRICTION:
+            elif result.status is SpamBotStatus.ACTIVE_RESTRICTION:
                 account.status = AccountStatus.PAUSED
                 account.cooldown_until = now + timedelta(
                     seconds=max(60, int(self._cfg("spambot_unknown_cooldown_seconds", 7200)))
@@ -283,6 +424,20 @@ class SpamBotCheckService:
                 account.cooldown_reason = "spambot_restriction_no_expiry"
                 account.last_error = "@SpamBot: active restriction; expiry was not provided"
                 event_type = "account.spambot_active_restriction"
+            elif result.status is SpamBotStatus.RESTRICTION_UNCLEAR:
+                # The bot explicitly said that a restriction exists, but the
+                # exact wording/scope was new.  This must not be treated as a
+                # clean account merely because the locale is unfamiliar.
+                account.status = AccountStatus.PAUSED
+                account.cooldown_until = now + timedelta(
+                    seconds=max(60, int(self._cfg("spambot_unknown_cooldown_seconds", 7200)))
+                )
+                account.cooldown_reason = "spambot_restriction_unclear"
+                account.last_error = (
+                    "@SpamBot: Telegram confirmed a restriction, but its exact scope "
+                    "was not recognised"
+                )
+                event_type = "account.spambot_restriction_unclear"
             elif result.status is SpamBotStatus.PERMANENT_RESTRICTION:
                 account.status = AccountStatus.DISABLED
                 account.cooldown_until = None
@@ -319,6 +474,8 @@ class SpamBotCheckService:
                                 else None
                             ),
                             "parser_signal": result.parser_signal,
+                            "restriction_scope": result.restriction_scope.value,
+                            "allows_reply_to_inbound": result.allows_reply_to_inbound,
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -343,6 +500,30 @@ class SpamBotCheckService:
             account.spambot_status = "error"
             code = failure_code(error, "spambot_check_failed")
             account.spambot_parser_signal = f"gateway_error:{code}"[:100]
+            # Do not leave a prior successful reply labelled as the latest
+            # @SpamBot response after a transport failure.  Preserve it only
+            # as a previous observation so the operator can still understand
+            # an existing protective pause without confusing it with a fresh
+            # Telegram verdict.
+            previous_snapshot: dict[str, object] = {}
+            try:
+                decoded = json.loads(account.spambot_response_json or "{}")
+            except (TypeError, ValueError):
+                decoded = {}
+            if isinstance(decoded, dict):
+                nested_previous = decoded.get("previous")
+                if isinstance(nested_previous, dict):
+                    decoded = nested_previous
+                if not decoded.get("check_error_code"):
+                    previous_snapshot = decoded
+            account.spambot_response_json = json.dumps(
+                {
+                    "check_error_code": code,
+                    "previous": previous_snapshot,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             if code in ACCOUNT_FATAL_CODES:
                 account.status = AccountStatus.DISABLED
                 account.authorized = False

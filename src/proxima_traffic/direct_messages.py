@@ -258,12 +258,13 @@ class DirectMessageService:
                 list_id = int(subscriber_list.id)
 
                 batch: list[SubscriberRecord] = []
+                touched_subscriber_ids: set[int] = set()
                 imported_batches = 0
                 for record in iter_subscriber_records(path, stats=stats):
                     batch.append(record)
                     if len(batch) < IMPORT_BATCH_SIZE:
                         continue
-                    inserted, updated, members = await self._import_batch(
+                    inserted, updated, members, touched_ids = await self._import_batch(
                         session,
                         list_id=list_id,
                         records=batch,
@@ -272,13 +273,14 @@ class DirectMessageService:
                     inserted_profiles += inserted
                     updated_profiles += updated
                     added_members += members
+                    touched_subscriber_ids.update(touched_ids)
                     batch.clear()
                     imported_batches += 1
                     if imported_batches % IMPORT_COMMIT_EVERY_BATCHES == 0:
                         await session.commit()
                     await asyncio.sleep(0)
                 if batch:
-                    inserted, updated, members = await self._import_batch(
+                    inserted, updated, members, touched_ids = await self._import_batch(
                         session,
                         list_id=list_id,
                         records=batch,
@@ -287,13 +289,18 @@ class DirectMessageService:
                     inserted_profiles += inserted
                     updated_profiles += updated
                     added_members += members
+                    touched_subscriber_ids.update(touched_ids)
                     imported_batches += 1
                     if imported_batches % IMPORT_COMMIT_EVERY_BATCHES == 0:
                         await session.commit()
                 if stats.valid_records == 0:
                     raise SubscriberImportError("в файле нет ни одной корректной записи")
 
-                counts = await self._list_counts(session, list_id)
+                counts_by_list = await self._refresh_list_counts_for_subscribers(
+                    session,
+                    touched_subscriber_ids,
+                )
+                counts = counts_by_list.get(list_id, (0, 0, 0, 0))
                 subscriber_list.status = SubscriberListStatus.READY
                 subscriber_list.member_count = counts[0]
                 subscriber_list.premium_count = counts[1]
@@ -332,7 +339,7 @@ class DirectMessageService:
         list_id: int,
         records: Sequence[SubscriberRecord],
         imported_at: datetime,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, set[int]]:
         telegram_ids = [item.telegram_user_id for item in records]
         existing_ids = set(
             await session.scalars(
@@ -428,26 +435,58 @@ class DirectMessageService:
                 )
             )
         updated = len(existing_ids)
-        return len(records) - updated, updated, len(new_member_ids)
+        return len(records) - updated, updated, len(new_member_ids), set(subscriber_ids)
 
     @staticmethod
-    async def _list_counts(session: AsyncSession, list_id: int) -> tuple[int, int, int, int]:
-        row = (
-            await session.execute(
-                select(
-                    func.count(Subscriber.id),
-                    func.sum(case((Subscriber.is_premium.is_(True), 1), else_=0)),
-                    func.sum(case((Subscriber.is_premium.is_(False), 1), else_=0)),
-                    func.sum(case((Subscriber.username.is_not(None), 1), else_=0)),
-                )
-                .join(
-                    SubscriberListMember,
-                    SubscriberListMember.subscriber_id == Subscriber.id,
-                )
-                .where(SubscriberListMember.subscriber_list_id == list_id)
+    async def _refresh_list_counts_for_subscribers(
+        session: AsyncSession,
+        subscriber_ids: set[int],
+    ) -> dict[int, tuple[int, int, int, int]]:
+        """Refresh denormalized counters for every list sharing changed profiles."""
+
+        if not subscriber_ids:
+            return {}
+        list_ids = list(
+            await session.scalars(
+                select(SubscriberListMember.subscriber_list_id)
+                .where(SubscriberListMember.subscriber_id.in_(subscriber_ids))
+                .distinct()
             )
-        ).one()
-        return tuple(int(value or 0) for value in row)  # type: ignore[return-value]
+        )
+        if not list_ids:
+            return {}
+        rows = list(
+            (
+                await session.execute(
+                    select(
+                        SubscriberListMember.subscriber_list_id,
+                        func.count(Subscriber.id),
+                        func.sum(case((Subscriber.is_premium.is_(True), 1), else_=0)),
+                        func.sum(case((Subscriber.is_premium.is_(False), 1), else_=0)),
+                        func.sum(case((Subscriber.username.is_not(None), 1), else_=0)),
+                    )
+                    .join(Subscriber, Subscriber.id == SubscriberListMember.subscriber_id)
+                    .where(SubscriberListMember.subscriber_list_id.in_(list_ids))
+                    .group_by(SubscriberListMember.subscriber_list_id)
+                )
+            ).all()
+        )
+        counts_by_list = {
+            int(row[0]): tuple(int(value or 0) for value in row[1:])
+            for row in rows
+        }
+        lists = list(
+            await session.scalars(select(SubscriberList).where(SubscriberList.id.in_(list_ids)))
+        )
+        for subscriber_list in lists:
+            counts = counts_by_list.get(int(subscriber_list.id), (0, 0, 0, 0))
+            (
+                subscriber_list.member_count,
+                subscriber_list.premium_count,
+                subscriber_list.non_premium_count,
+                subscriber_list.username_count,
+            ) = counts
+        return counts_by_list
 
     async def _mark_import_failed(self, list_id: int, exc: BaseException) -> None:
         try:
@@ -757,6 +796,10 @@ class DirectMessageService:
         if not unique_account_ids:
             raise ConflictError("выберите хотя бы один аккаунт-отправитель")
         has_media = media_path is not None
+        if not has_media and any(
+            value is not None for value in (media_kind, media_name, media_size)
+        ):
+            raise ConflictError("метаданные вложения нельзя сохранить без самого файла")
         media_without_caption = has_media
         try:
             validate_telegram_text(
@@ -1839,11 +1882,17 @@ class DirectMessageService:
             subscriber.last_error_code = None
             subscriber.last_error = None
             subscriber.reserved_direct_launch_id = None
+            profile_changed = False
             if delivery.username is not None:
-                subscriber.username = delivery.username
+                if subscriber.username != delivery.username:
+                    subscriber.username = delivery.username
+                    profile_changed = True
             if delivery.is_premium is not None:
+                profile_changed = profile_changed or subscriber.is_premium != delivery.is_premium
                 subscriber.is_premium = delivery.is_premium
                 subscriber.premium_checked_at = now
+            if profile_changed:
+                await self._refresh_list_counts_for_subscribers(session, {subscriber_id})
             statement = sqlite_insert(SubscriberAccountPeer).values(
                 subscriber_id=subscriber_id,
                 account_id=account_id,

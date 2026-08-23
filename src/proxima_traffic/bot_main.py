@@ -6,8 +6,8 @@ from collections.abc import Awaitable
 from contextlib import suppress
 from uuid import uuid4
 
-from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from aiogram.types import BotCommand
 
 from proxima_traffic.accounts import AccountService
@@ -37,8 +37,69 @@ from proxima_traffic.worker_supervision import WorkerSupervisor
 
 logger = logging.getLogger(__name__)
 
+_CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS = 15.0
+_CONTROL_BOT_POLL_RETRY_INITIAL_SECONDS = 1.0
+_CONTROL_BOT_POLL_RETRY_MAX_SECONDS = 30.0
+_CONTROL_BOT_READY_RETRY_INITIAL_SECONDS = 30.0
+_CONTROL_BOT_READY_RETRY_MAX_SECONDS = 300.0
+_RESTART_UPDATE_NOTICE = (
+    "<b>В этом обновлении</b>\n"
+    "• Ошибки доступа Telegram разделены: подтверждённый бан, отсутствие права писать, "
+    "потеря доступа и права публикации больше не смешиваются.\n"
+    "• Удалённые и переименованные публичные @чаты теперь помечаются как недоступная цель, "
+    "а не неясная системная ошибка.\n"
+    "• Публичные чаты из папок вступают напрямую, без лишнего расхода слотов папок.\n"
+    "• Ошибка папки Telegram от замороженного аккаунта теперь определяется как ограничение "
+    "аккаунта, а не выводится сырым кодом 420 или ошибкой отдельной пары.\n"
+    "• В независимой рассылке сбой одной пары отменяет только её поток.\n"
+    "• Предзапуск теперь отдельно проверяет, может ли аккаунт отправлять именно сейчас: "
+    "пары с FloodWait, суточным лимитом или другой защитной паузой не попадут в скрытую "
+    "очередь на завтра. Панель покажет число таких пар и ближайшее время готовности.\n"
+    "• Проверка перед стартом показывает, сколько вступлений понадобится; само вступление "
+    "остаётся ленивым, с дневным лимитом и паузой между вступлениями. Если все доступные "
+    "аккаунты временно на паузе, можно безопасно запланировать запуск на ближайшее время, "
+    "а не получать тупиковый отказ.\n"
+    "• Повторное подтверждение запуска не запускает второй тяжёлый Telegram-предзапуск: "
+    "используется только что сохранённый результат, а очередь всё равно проверяет его "
+    "свежесть. Большие проверки ограничены матрицей 5000 пар и 4 одновременными аккаунтами.\n"
+    "• Active-рассылка больше не может формально стартовать пустой: если планировщик не "
+    "нашёл хотя бы одной публикации, которая успевает до конца активного окна, запуск "
+    "не создаётся и панель сразу объясняет причину.\n"
+    "• Перед запуском видно три разных состояния: маршрут к чату, возможность отправить "
+    "сейчас и безопасная отложенная готовность. Прогноз capacity заранее показывает, "
+    "какие публикации не успеют в конечное окно, а не скрывает это в финальном отчёте.\n"
+    "• Новые рассылки по умолчанию создаются с умным распределением: один пост на чат; "
+    "режим «каждый аккаунт в каждый чат» остаётся отдельным явным выбором.\n"
+    "• Новая рассылка теперь сразу создаётся активной на 24 часа: она ждёт новые сообщения "
+    "после своего поста и ясно объясняет это в отчёте; «один проход» остаётся доступным "
+    "в настройках.\n"
+    "• Реакции могут использовать безопасное автовступление и показывают понятный статус в отчёте."
+    " В независимой рассылке для реакций теперь берётся полный выбранный пул, а не только "
+    "автор поста; пропущенные реакции можно безопасно восстановить без дублей. "
+    "Успешная реакция теперь подтверждается обратным чтением сообщения из Telegram; в отчёте "
+    "видны причины пропусков и подсказка, что делать дальше. Если Telegram не принимает "
+    "выбранный emoji, сервис переберёт безопасные варианты из панели и покажет фактически "
+    "поставленную реакцию.\n"
+    "• Для точечного восстановления worker можно ограничить одной рассылкой: старые очереди, "
+    "комментарии и личные сообщения при этом не запускаются. Просроченная аренда "
+    "остановленного старого запуска больше не удерживает тот же аккаунт в такой очереди."
+    "\n• Если для worker включено временное ограничение рассылок, панель теперь явно "
+    "показывает его и не даёт молча поставить другую рассылку в неисполняемую очередь."
+    "\n• В разделе «Рассылки» добавлена отдельная кнопка остановки текущих публикаций "
+    "по чатам и их реакций: она не трогает ЛС, приглашения, комментарии и сохранённые сценарии."
+    "\n• Проверка сессий теперь умеет одной подтверждённой командой очистить только "
+    "доступы, которые Telegram повторно признал недействительными; ошибки сети и прокси "
+    "не удаляются."
+)
 
-async def _notify_control_bot_ready(bot: Bot, admin_ids: frozenset[int]) -> None:
+
+async def _notify_control_bot_ready(
+    bot: Bot,
+    admin_ids: frozenset[int],
+    *,
+    worker_enabled: bool,
+    campaign_id_scope: frozenset[int] | None,
+) -> frozenset[int]:
     """Confirm a completed control-bot restart to every configured operator.
 
     This is intentionally best-effort: an administrator may have blocked the
@@ -46,26 +107,128 @@ async def _notify_control_bot_ready(bot: Bot, admin_ids: frozenset[int]) -> None
     restart into an unavailable control panel for the remaining operators.
     """
 
+    if not worker_enabled:
+        worker_status = (
+            "Очередь рассылок и реакций временно выключена: накопленные задания не будут "
+            "отправляться до отдельного включения."
+        )
+    elif campaign_id_scope is None:
+        worker_status = "Очередь рассылок и реакций включена."
+    else:
+        campaign_labels = ", ".join(str(item) for item in sorted(campaign_id_scope))
+        worker_status = (
+            "Включен безопасный режим восстановления: обрабатываются только рассылки "
+            f"#{campaign_labels}; остальные накопленные задания не затрагиваются."
+        )
     message = (
         "🟢 <b>Proxima перезапущен и готов к работе.</b>\n\n"
-        "Панель управления и фоновые сервисы запущены."
+        "Панель управления запущена. "
+        + worker_status
+        + "\n\n"
+        + _RESTART_UPDATE_NOTICE
     )
     results = await asyncio.gather(
-        *(bot.send_message(chat_id=admin_id, text=message) for admin_id in sorted(admin_ids)),
+        *(
+            asyncio.wait_for(
+                bot.send_message(chat_id=admin_id, text=message),
+                timeout=_CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
+            )
+            for admin_id in sorted(admin_ids)
+        ),
         return_exceptions=True,
     )
+    failed_admin_ids: set[int] = set()
     for admin_id, result in zip(sorted(admin_ids), results, strict=True):
-        if isinstance(result, TelegramAPIError):
+        if isinstance(result, TimeoutError):
+            failed_admin_ids.add(admin_id)
+            logger.warning(
+                "Ready notification to administrator %s timed out after %.0f seconds",
+                admin_id,
+                _CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
+            )
+        elif isinstance(result, TelegramAPIError):
+            failed_admin_ids.add(admin_id)
             logger.warning(
                 "Could not send ready notification to administrator %s: %s",
                 admin_id,
                 result,
             )
         elif isinstance(result, Exception):  # noqa: BLE001 - readiness notice must stay best-effort
+            failed_admin_ids.add(admin_id)
             logger.warning(
                 "Unexpected error sending ready notification to administrator %s: %s",
                 admin_id,
                 result,
+            )
+    return frozenset(failed_admin_ids)
+
+
+async def _retry_control_bot_ready_notification(
+    bot: Bot,
+    admin_ids: frozenset[int],
+    *,
+    worker_enabled: bool,
+    campaign_id_scope: frozenset[int] | None,
+) -> None:
+    """Deliver a restart notice after a transient Telegram API outage.
+
+    Startup must remain non-blocking, but a timed-out initial request should
+    not silently discard the operator's requested deployment notification.
+    Successful recipients are removed on every round, so retries never spam
+    operators who already received it.
+    """
+
+    pending_admin_ids = admin_ids
+    delay = _CONTROL_BOT_READY_RETRY_INITIAL_SECONDS
+    while pending_admin_ids:
+        await asyncio.sleep(delay)
+        pending_admin_ids = await _notify_control_bot_ready(
+            bot,
+            pending_admin_ids,
+            worker_enabled=worker_enabled,
+            campaign_id_scope=campaign_id_scope,
+        )
+        if pending_admin_ids:
+            logger.warning(
+                "Restart notification remains pending for %d administrator(s); retrying later",
+                len(pending_admin_ids),
+            )
+            delay = min(delay * 2, _CONTROL_BOT_READY_RETRY_MAX_SECONDS)
+
+
+async def _start_polling_with_network_retries(
+    dispatcher: Dispatcher,
+    bot: Bot,
+    **dependencies: object,
+) -> None:
+    """Keep workers alive if Telegram is unreachable during the initial getMe call.
+
+    Aiogram retries transient failures after polling is established, but an outage
+    during the initial connection raises out of ``start_polling``. Without this
+    wrapper that one short outage tears down the already started campaign and
+    reaction workers as well.
+    """
+
+    retry_seconds = _CONTROL_BOT_POLL_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            await dispatcher.start_polling(
+                bot,
+                close_bot_session=False,
+                **dependencies,
+            )
+            return
+        except TelegramNetworkError as exc:
+            logger.warning(
+                "Control bot cannot reach Telegram yet: %s. "
+                "Workers remain active; retrying polling in %.0f seconds.",
+                exc,
+                retry_seconds,
+            )
+            await asyncio.sleep(retry_seconds)
+            retry_seconds = min(
+                _CONTROL_BOT_POLL_RETRY_MAX_SECONDS,
+                max(_CONTROL_BOT_POLL_RETRY_INITIAL_SECONDS, retry_seconds * 2),
             )
 
 
@@ -136,10 +299,12 @@ async def _run_control_bot(
 
     database = Database(settings.database_url)
     if settings.auto_create_schema:
-        await database.create_schema()
+        await database.migrate_to_head_if_needed()
 
     proxy_service = ProxyService(database.session_factory, settings)
     account_service = AccountService(database.session_factory, settings, proxy_service)
+    campaign_id_scope = settings.worker_campaign_id_scope
+    scoped_worker_concurrency = 1 if campaign_id_scope is not None else settings.worker_concurrency
     gateway = build_gateway(
         database.session_factory,
         settings,
@@ -167,6 +332,8 @@ async def _run_control_bot(
         runner,
         allow_auto_join=settings.account_auto_join,
         require_live_session=not settings.dry_run,
+        max_pairs=settings.preflight_max_pairs,
+        account_concurrency=settings.preflight_account_concurrency,
     )
     delayed_delivery_monitor = DelayedDeliveryMonitor(
         database.session_factory,
@@ -187,6 +354,7 @@ async def _run_control_bot(
         runner,
         settings,
         worker_id=f"bot-reactions-{uuid4().hex[:10]}",
+        campaign_id_scope=campaign_id_scope,
     )
     participant_reactions = ParticipantReactionService(
         database.session_factory,
@@ -227,6 +395,7 @@ async def _run_control_bot(
         preflight_required=(settings.preflight_required_live and not settings.dry_run),
         preflight_max_age_seconds=settings.preflight_max_age_seconds,
         proxy_service=proxy_service,
+        campaign_id_scope=campaign_id_scope,
     )
     spambot_maintenance = SpamBotMaintenanceWorker(spambot_checks, settings)
     queue_worker = QueueWorker(
@@ -236,7 +405,7 @@ async def _run_control_bot(
         poll_seconds=settings.worker_poll_seconds,
         heartbeat_seconds=settings.worker_heartbeat_seconds,
         step_timeout_seconds=settings.worker_step_timeout_seconds,
-        concurrency=settings.worker_concurrency,
+        concurrency=scoped_worker_concurrency,
     )
     repository = AdminRepository(database.session_factory)
     await repository.ensure_system_account_groups(actor="bot-startup")
@@ -250,14 +419,25 @@ async def _run_control_bot(
     worker_supervisor = WorkerSupervisor(
         alert_sender=send_worker_health_alert if settings.bot_log_chat_id is not None else None
     )
-    await bot.set_my_commands(
-        [
-            BotCommand(command="admin", description="Открыть панель управления"),
-            BotCommand(command="proxies", description="Открыть пул прокси"),
-            BotCommand(command="help", description="Краткая справка"),
-            BotCommand(command="cancel", description="Отменить текущий ввод"),
-        ]
-    )
+    try:
+        await asyncio.wait_for(
+            bot.set_my_commands(
+                [
+                    BotCommand(command="admin", description="Открыть панель управления"),
+                    BotCommand(command="proxies", description="Открыть пул прокси"),
+                    BotCommand(command="help", description="Краткая справка"),
+                    BotCommand(command="cancel", description="Отменить текущий ввод"),
+                ]
+            ),
+            timeout=_CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Updating control-bot commands timed out after %.0f seconds; continuing startup",
+            _CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+    except TelegramAPIError as exc:
+        logger.warning("Could not update control-bot commands; continuing startup: %s", exc)
     dispatcher = create_dispatcher(
         admin_ids,
         storage=DatabaseFsmStorage(database.session_factory),
@@ -272,30 +452,36 @@ async def _run_control_bot(
     spambot_task: asyncio.Task[None] | None = None
     notifier: RunNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
+    ready_notification_task: asyncio.Task[None] | None = None
     if settings.worker_enabled:
         worker_task = worker_supervisor.start("campaigns", queue_worker.run_forever)
-        if settings.channel_comments_enabled:
+        if campaign_id_scope is None and settings.channel_comments_enabled:
             channel_comments_task = worker_supervisor.start(
                 "channel-comments", channel_comments.run_forever
             )
         reactions_task = worker_supervisor.start("reactions", reactions.run_forever)
-        if settings.participant_reactions_enabled:
+        if campaign_id_scope is None and settings.participant_reactions_enabled:
             participant_reactions_task = worker_supervisor.start(
                 "participant-reactions", participant_reactions.run_forever
             )
-        if settings.direct_messages_enabled:
+        if campaign_id_scope is None and settings.direct_messages_enabled:
             direct_messages_task = worker_supervisor.start(
                 "direct-messages", direct_messages.run_forever
             )
-        if settings.subscriber_invites_enabled:
+        if campaign_id_scope is None and settings.subscriber_invites_enabled:
             subscriber_invites_task = worker_supervisor.start(
                 "subscriber-invites", subscriber_invites.run_forever
             )
-        if settings.delayed_delivery_verify_enabled:
+        if campaign_id_scope is None and settings.delayed_delivery_verify_enabled:
             delayed_delivery_task = worker_supervisor.start(
                 "delayed-delivery", delayed_delivery_monitor.run_forever
             )
-    if settings.worker_enabled and settings.spambot_enabled and not settings.dry_run:
+    if (
+        settings.worker_enabled
+        and campaign_id_scope is None
+        and settings.spambot_enabled
+        and not settings.dry_run
+    ):
         spambot_task = worker_supervisor.start("spambot", spambot_maintenance.run_forever)
     if settings.bot_log_chat_id is not None:
 
@@ -307,20 +493,39 @@ async def _run_control_bot(
 
     logger.info(
         "Control services are ready: worker=%s, comments=%s, direct_messages=%s, "
-        "subscriber_invites=%s, "
+        "subscriber_invites=%s, campaign_scope=%s, worker_concurrency=%s, "
         "graceful stop=%.0f seconds",
         "enabled" if settings.worker_enabled else "disabled",
         "enabled" if channel_comments_task is not None else "disabled",
         "enabled" if direct_messages_task is not None else "disabled",
         "enabled" if subscriber_invites_task is not None else "disabled",
+        ",".join(str(item) for item in sorted(campaign_id_scope))
+        if campaign_id_scope is not None
+        else "all",
+        scoped_worker_concurrency,
         settings.shutdown_grace_seconds,
     )
-    await _notify_control_bot_ready(bot, admin_ids)
+    failed_ready_notification_ids = await _notify_control_bot_ready(
+        bot,
+        admin_ids,
+        worker_enabled=settings.worker_enabled,
+        campaign_id_scope=campaign_id_scope,
+    )
+    if failed_ready_notification_ids:
+        ready_notification_task = asyncio.create_task(
+            _retry_control_bot_ready_notification(
+                bot,
+                failed_ready_notification_ids,
+                worker_enabled=settings.worker_enabled,
+                campaign_id_scope=campaign_id_scope,
+            ),
+            name="control-bot-ready-notification",
+        )
     logger.info("Starting Proxima control bot for %d administrator(s)", len(admin_ids))
     try:
-        await dispatcher.start_polling(
+        await _start_polling_with_network_retries(
+            dispatcher,
             bot,
-            close_bot_session=False,
             settings=settings,
             repository=repository,
             run_queue=run_queue,
@@ -395,6 +600,11 @@ async def _run_control_bot(
         await _finish_background_task(
             notifier_task,
             name="Run notifier",
+            grace_seconds=settings.shutdown_grace_seconds,
+        )
+        await _finish_background_task(
+            ready_notification_task,
+            name="Restart notification retry",
             grace_seconds=settings.shutdown_grace_seconds,
         )
         close = getattr(gateway, "close", None)

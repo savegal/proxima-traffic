@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -35,7 +36,7 @@ from proxima_traffic.scheduling import (
     broadcast_profile,
     detect_broadcast_profile,
 )
-from proxima_traffic.services import RunQueue
+from proxima_traffic.services import CampaignRunner, RunQueue
 
 
 class SlowModeGateway:
@@ -91,6 +92,30 @@ def test_broadcast_profiles_are_complete_and_detectable() -> None:
         )
         == active
     )
+
+
+def test_broadcast_failover_route_respects_auto_join_setting() -> None:
+    route = TargetAccountState(
+        target_id=1,
+        account_id=1,
+        membership_checked_at=utc_now(),
+        membership_status=MembershipStatus.NOT_MEMBER,
+        membership_error_code="target_not_joined",
+        can_send=False,
+    )
+    disabled = CampaignRunner(  # type: ignore[arg-type]
+        None,
+        object(),
+        settings=SimpleNamespace(account_auto_join=False),
+    )
+    enabled = CampaignRunner(  # type: ignore[arg-type]
+        None,
+        object(),
+        settings=SimpleNamespace(account_auto_join=True),
+    )
+
+    assert disabled._broadcast_route_is_eligible(route) is False
+    assert enabled._broadcast_route_is_eligible(route) is True
 
 
 @pytest.mark.asyncio
@@ -393,6 +418,197 @@ async def test_campaign_runner_reads_pacing_from_settings(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_campaign_scoped_queue_claim_skips_other_campaigns(app) -> None:
+    now = utc_now()
+    async with app.state.database.session_factory() as session:
+        account = Account(label="scoped-queue-account", ownership_confirmed=True)
+        target = Target(chat_ref="@scoped_queue_target", title="Scoped queue target")
+        session.add_all([account, target])
+        await session.flush()
+        older_campaign = Campaign(
+            name="scoped queue older campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=account.id,
+            target_id=target.id,
+            primary_text="Older",
+        )
+        scoped_campaign = Campaign(
+            name="scoped queue selected campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=account.id,
+            target_id=target.id,
+            primary_text="Selected",
+        )
+        session.add_all([older_campaign, scoped_campaign])
+        await session.flush()
+        session.add_all(
+            [
+                CampaignRun(
+                    campaign_id=older_campaign.id,
+                    target_id=target.id,
+                    sender_account_id=account.id,
+                    request_key="scoped-queue-older",
+                    scheduled_for=now - timedelta(minutes=2),
+                ),
+                CampaignRun(
+                    campaign_id=scoped_campaign.id,
+                    target_id=target.id,
+                    sender_account_id=account.id,
+                    request_key="scoped-queue-selected",
+                    scheduled_for=now - timedelta(minutes=1),
+                ),
+            ]
+        )
+        await session.commit()
+        selected_id = int(scoped_campaign.id)
+        older_id = int(older_campaign.id)
+
+    queue = RunQueue(
+        app.state.database.session_factory,
+        lease_seconds=30,
+        max_attempts=5,
+        retry_base_seconds=2,
+        campaign_id_scope=frozenset({selected_id}),
+    )
+    claimed = await queue.claim_next("scoped-queue-worker")
+
+    assert claimed is not None and claimed.campaign_id == selected_id
+    async with app.state.database.session_factory() as session:
+        statuses = {
+            run.campaign_id: run.status
+            for run in await session.scalars(select(CampaignRun))
+        }
+    assert statuses[older_id] == RunStatus.QUEUED
+    assert statuses[selected_id] == RunStatus.RUNNING
+
+
+async def test_queue_claim_gives_another_campaign_a_worker_before_an_old_backlog(app) -> None:
+    now = utc_now()
+    async with app.state.database.session_factory() as session:
+        first_sender = Account(label="fair-queue-first", ownership_confirmed=True)
+        second_sender = Account(label="fair-queue-second", ownership_confirmed=True)
+        target = Target(chat_ref="@fair_queue_target", title="Fair queue target")
+        session.add_all([first_sender, second_sender, target])
+        await session.flush()
+        backlog_campaign = Campaign(
+            name="large older backlog",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=first_sender.id,
+            target_id=target.id,
+            primary_text="Older",
+        )
+        waiting_campaign = Campaign(
+            name="newer waiting campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=second_sender.id,
+            target_id=target.id,
+            primary_text="Newer",
+        )
+        session.add_all([backlog_campaign, waiting_campaign])
+        await session.flush()
+        session.add_all(
+            [
+                CampaignRun(
+                    campaign_id=backlog_campaign.id,
+                    target_id=target.id,
+                    sender_account_id=first_sender.id,
+                    request_key="fair-backlog-first",
+                    scheduled_for=now - timedelta(minutes=3),
+                ),
+                CampaignRun(
+                    campaign_id=backlog_campaign.id,
+                    target_id=target.id,
+                    sender_account_id=second_sender.id,
+                    request_key="fair-backlog-second",
+                    scheduled_for=now - timedelta(minutes=2),
+                ),
+                CampaignRun(
+                    campaign_id=waiting_campaign.id,
+                    target_id=target.id,
+                    sender_account_id=second_sender.id,
+                    request_key="fair-waiting-campaign",
+                    scheduled_for=now - timedelta(minutes=1),
+                ),
+            ]
+        )
+        await session.commit()
+        backlog_id = int(backlog_campaign.id)
+        waiting_id = int(waiting_campaign.id)
+
+    first = await app.state.run_queue.claim_next("fair-queue-worker-one")
+    second = await app.state.run_queue.claim_next("fair-queue-worker-two")
+
+    assert first is not None and first.campaign_id == backlog_id
+    assert second is not None and second.campaign_id == waiting_id
+
+
+@pytest.mark.asyncio
+async def test_scoped_queue_claim_ignores_an_expired_lease_outside_its_scope(app) -> None:
+    """A stopped old campaign must not silently hold an account's new lane."""
+
+    now = utc_now()
+    async with app.state.database.session_factory() as session:
+        account = Account(label="expired-scoped-queue-account", ownership_confirmed=True)
+        target = Target(chat_ref="@expired_scoped_queue_target", title="Expired scoped queue")
+        session.add_all([account, target])
+        await session.flush()
+        older_campaign = Campaign(
+            name="expired lease outside scope",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=account.id,
+            target_id=target.id,
+            primary_text="Older",
+        )
+        scoped_campaign = Campaign(
+            name="selected campaign after expired lease",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=account.id,
+            target_id=target.id,
+            primary_text="Selected",
+        )
+        session.add_all([older_campaign, scoped_campaign])
+        await session.flush()
+        stale = CampaignRun(
+            campaign_id=older_campaign.id,
+            target_id=target.id,
+            sender_account_id=account.id,
+            request_key="expired-lease-outside-scope",
+            status=RunStatus.RUNNING,
+            lease_owner="stopped-worker",
+            lease_token="a" * 32,
+            lease_until=now - timedelta(seconds=1),
+            scheduled_for=now - timedelta(minutes=2),
+        )
+        queued = CampaignRun(
+            campaign_id=scoped_campaign.id,
+            target_id=target.id,
+            sender_account_id=account.id,
+            request_key="selected-after-expired-lease",
+            scheduled_for=now - timedelta(minutes=1),
+        )
+        session.add_all([stale, queued])
+        await session.commit()
+        scoped_campaign_id = int(scoped_campaign.id)
+        stale_id = int(stale.id)
+
+    queue = RunQueue(
+        app.state.database.session_factory,
+        lease_seconds=30,
+        max_attempts=5,
+        retry_base_seconds=2,
+        campaign_id_scope=frozenset({scoped_campaign_id}),
+    )
+    claimed = await queue.claim_next("scoped-after-expired-worker")
+
+    assert claimed is not None
+    assert claimed.campaign_id == scoped_campaign_id
+    async with app.state.database.session_factory() as session:
+        stale_after = await session.get(CampaignRun, stale_id)
+    assert stale_after is not None
+    assert stale_after.status == RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
 async def test_account_daily_limit_pauses_at_200_and_plans_next_window(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'daily-limit.db'}",
@@ -538,6 +754,114 @@ async def test_independent_mode_builds_every_account_chat_pair(tmp_path) -> None
     assert {(run.sender_account_id, run.target_id) for run in runs} == expected_pairs
     assert all(run.sender_mode_snapshot == BroadcastSenderMode.INDEPENDENT for run in runs)
     await app.state.database.dispose()
+
+
+async def test_independent_preflight_skips_only_the_unready_account_chat_pair(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'independent-partial-preflight.db'}",
+        admin_api_key="test-admin-key",
+        dry_run=True,
+        worker_enabled=False,
+    )
+    app = create_app(settings=settings)
+    await app.state.database.create_schema()
+    now = utc_now()
+    try:
+        async with app.state.database.session_factory() as session:
+            first = Account(label="independent-ready", ownership_confirmed=True)
+            second = Account(label="independent-blocked", ownership_confirmed=True)
+            target_list = TargetList(name="independent partial targets")
+            first_target = Target(
+                chat_ref="@independent_first",
+                title="Independent first",
+                approved_by_operator=True,
+                approved_at=now,
+            )
+            second_target = Target(
+                chat_ref="@independent_second",
+                title="Independent second",
+                approved_by_operator=True,
+                approved_at=now,
+            )
+            session.add_all([first, second, target_list, first_target, second_target])
+            await session.flush()
+            session.add_all(
+                TargetListItem(
+                    target_list_id=target_list.id,
+                    target_id=target.id,
+                    enabled=True,
+                )
+                for target in (first_target, second_target)
+            )
+            campaign = Campaign(
+                name="independent partial preflight",
+                mode=CampaignMode.BROADCAST,
+                primary_account_id=first.id,
+                target_list_id=target_list.id,
+                primary_text="Hello",
+                sender_mode=BroadcastSenderMode.INDEPENDENT,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add_all(
+                CampaignAccount(campaign_id=campaign.id, account_id=account.id)
+                for account in (first, second)
+            )
+            session.add_all(
+                [
+                    TargetAccountState(
+                        target_id=target.id,
+                        account_id=account.id,
+                        membership_status=MembershipStatus.MEMBER,
+                        can_send=True,
+                        membership_checked_at=now,
+                    )
+                    for target, account in (
+                        (first_target, first),
+                        (first_target, second),
+                        (second_target, first),
+                    )
+                ]
+            )
+            session.add(
+                TargetAccountState(
+                    target_id=second_target.id,
+                    account_id=second.id,
+                    membership_status=MembershipStatus.BANNED,
+                    can_send=False,
+                    membership_checked_at=now,
+                    send_blocked=True,
+                    blocked_reason="account_banned_in_chat",
+                )
+            )
+            await session.commit()
+            campaign_id = int(campaign.id)
+            first_id = int(first.id)
+            second_id = int(second.id)
+            first_target_id = int(first_target.id)
+            second_target_id = int(second_target.id)
+
+        queue = RunQueue(
+            app.state.database.session_factory,
+            lease_seconds=30,
+            max_attempts=5,
+            retry_base_seconds=2,
+            preflight_required=True,
+            preflight_max_age_seconds=3600,
+        )
+        runs = await queue.enqueue_campaign(campaign_id, "independent-partial-preflight")
+        by_pair = {(run.sender_account_id, run.target_id): run for run in runs}
+
+        assert len(runs) == 4
+        assert by_pair[(first_id, first_target_id)].status == RunStatus.QUEUED
+        assert by_pair[(second_id, first_target_id)].status == RunStatus.QUEUED
+        assert by_pair[(first_id, second_target_id)].status == RunStatus.QUEUED
+        blocked = by_pair[(second_id, second_target_id)]
+        assert blocked.status == RunStatus.CANCELLED
+        assert blocked.error_code == "preflight_independent_not_ready"
+        assert blocked.attempt_count == 0
+    finally:
+        await app.state.database.dispose()
 
 
 async def test_independent_mode_skips_unavailable_selected_senders(tmp_path) -> None:

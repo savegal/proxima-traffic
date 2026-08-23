@@ -244,6 +244,24 @@ async def test_batch_rule_creation_reuses_one_flow_for_each_channel(app: FastAPI
 
 
 @pytest.mark.asyncio
+async def test_channel_comment_accepts_preview_links_and_explains_private_links(
+    app: FastAPI,
+) -> None:
+    service = _service(app, RecordingChannelGateway())
+
+    assert (
+        service._normalize_channel_ref("https://t.me/s/batch_comments_one/123?single=true")
+        == "@batch_comments_one"
+    )
+    assert (
+        service._normalize_channel_ref("https://telegram.me/batch_comments_two/456#comments")
+        == "@batch_comments_two"
+    )
+    with pytest.raises(ConflictError, match="приватные invite-ссылки"):
+        service._normalize_channel_ref("https://t.me/+privateInviteToken")
+
+
+@pytest.mark.asyncio
 async def test_batch_rule_creation_does_not_write_when_one_channel_fails_preflight(
     app: FastAPI,
 ) -> None:
@@ -251,7 +269,7 @@ async def test_batch_rule_creation_does_not_write_when_one_channel_fails_preflig
     service = _service(app, gateway)
     account = await _account(app, "batch-comment-failure-account")
 
-    with pytest.raises(ConflictError, match="не прошёл проверку комментариев"):
+    with pytest.raises(ConflictError, match="@batch_comments_fail"):
         await service.create_rules(
             name="Пакет с ошибкой",
             channel_refs=("@batch_comments_ok", "@batch_comments_fail"),
@@ -365,6 +383,10 @@ async def test_channel_comment_reactions_exclude_author_and_fail_over_blocked_ro
         "reactor is blocked in discussion",
         code="account_banned_in_chat",
     )
+    # The comment-reactor pool is preflighted on configuration, but unlike a
+    # campaign chat it has no TargetAccountState. Exercise the live path so a
+    # replacement is not rejected by that unrelated campaign-only gate.
+    app.state.settings.dry_run = False
     worker = ReactionWorker(
         app.state.database.session_factory,
         gateway,
@@ -458,6 +480,65 @@ async def test_channel_comment_timeout_releases_the_run_for_retry(app: FastAPI) 
     assert run.status == ChannelCommentRunStatus.QUEUED
     assert run.error_code == "comment_timeout"
     assert run.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_busy_account_defers_comment_without_using_delivery_attempt(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    gateway.delivery_error = TemporaryGatewayError(
+        "account is busy",
+        code="account_operation_busy",
+        retry_after=5,
+    )
+    service = _service(app, gateway)
+    account = await _account(app, "busy-comment-sender")
+    rule = await service.create_rule(
+        name="Busy account comment",
+        channel_ref="@busy_comment_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Comment",
+        initial_delay_seconds=0,
+    )
+    gateway.posts = (ChannelPost(message_id=14, published_at=utc_now()),)
+    await service.scan_rule(int(rule.id))
+
+    assert await service.process_next() is True
+
+    async with app.state.database.session_factory() as session:
+        run = await session.scalar(select(ChannelCommentRun))
+    assert run is not None
+    assert run.status == ChannelCommentRunStatus.QUEUED
+    assert run.error_code == "account_operation_busy"
+    assert run.attempt_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["content_forbidden", "media_unavailable"])
+async def test_fixed_comment_content_errors_auto_pause_the_rule(
+    app: FastAPI,
+    code: str,
+) -> None:
+    gateway = RecordingChannelGateway()
+    gateway.delivery_error = PermanentGatewayError("fixed content error", code=code)
+    service = _service(app, gateway)
+    account = await _account(app, f"paused-comment-{code}")
+    rule = await service.create_rule(
+        name=f"Pause fixed content {code}",
+        channel_ref=f"@pause_{code}",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Comment",
+        initial_delay_seconds=0,
+    )
+    gateway.posts = (ChannelPost(message_id=15, published_at=utc_now()),)
+    await service.scan_rule(int(rule.id))
+
+    assert await service.process_next() is True
+
+    view = await service.get_rule_view(int(rule.id))
+    assert view.rule.enabled is False
+    assert view.rule.last_error_code == code
 
 
 @pytest.mark.asyncio
@@ -565,6 +646,54 @@ async def test_channel_comment_dialogue_replies_to_previous_comment(app: FastAPI
     assert [call["account"].id for call in gateway.calls] == [first.id, second.id]
     assert gateway.calls[0]["reply_to_message_id"] is None
     assert gateway.calls[1]["reply_to_message_id"] == 40_001
+
+
+@pytest.mark.asyncio
+async def test_channel_comment_dialogue_preserves_premium_emoji_markup(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    first = await _account(app, "premium-comment-first")
+    second = await _account(app, "premium-comment-second")
+    first_text = "Первый ⭐"
+    first_html = 'Первый <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>'
+    second_text = "Ответ 🔥"
+    second_html = 'Ответ <tg-emoji emoji-id="543210987654322">🔥</tg-emoji>'
+    rule = await service.create_rule(
+        name="Premium Emoji в комментариях",
+        channel_ref="@premium_comment_channel",
+        mode=ChannelCommentMode.DIALOGUE,
+        primary_account_id=int(first.id),
+        primary_text=first_text,
+        primary_html=first_html,
+        initial_delay_seconds=0,
+        dialogue_steps=[
+            DialogueStep(
+                account_id=int(first.id),
+                text=first_text,
+                html_text=first_html,
+                reply_to_previous=False,
+            ),
+            DialogueStep(
+                account_id=int(second.id),
+                text=second_text,
+                html_text=second_html,
+                delay_seconds=1,
+                reply_to_previous=True,
+            ),
+        ],
+    )
+    gateway.posts = (ChannelPost(message_id=21, published_at=utc_now()),)
+    await service.scan_rule(int(rule.id))
+    assert await service.process_next() is True
+
+    async with app.state.database.session_factory() as session:
+        run = await session.scalar(select(ChannelCommentRun))
+        assert run is not None
+        run.scheduled_for = utc_now() - timedelta(seconds=1)
+        await session.commit()
+
+    assert await service.process_next() is True
+    assert [call["html_text"] for call in gateway.calls] == [first_html, second_html]
 
 
 @pytest.mark.asyncio
@@ -737,9 +866,11 @@ async def test_message_edit_replaces_the_original_comment_after_its_due_time(
         channel_ref="@message_edit_channel",
         mode=ChannelCommentMode.MESSAGE_EDIT,
         primary_account_id=account.id,
-        primary_text="Финальный комментарий",
+        primary_text="Финальный комментарий ⭐",
+        primary_html='Финальный комментарий <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>',
         initial_delay_seconds=0,
-        message_edit_initial_text="Ага",
+        message_edit_initial_text="Ага 🔥",
+        message_edit_initial_html='Ага <tg-emoji emoji-id="543210987654322">🔥</tg-emoji>',
         message_edit_delay_seconds=15 * 60,
     )
     gateway.posts = (ChannelPost(message_id=25, published_at=utc_now()),)
@@ -758,7 +889,10 @@ async def test_message_edit_replaces_the_original_comment_after_its_due_time(
         run.scheduled_for = utc_now() - timedelta(seconds=1)
         await session.commit()
 
-    assert gateway.calls[0]["text"] == "Ага"
+    assert gateway.calls[0]["text"] == "Ага 🔥"
+    assert gateway.calls[0]["html_text"] == (
+        'Ага <tg-emoji emoji-id="543210987654322">🔥</tg-emoji>'
+    )
     assert await service.process_next() is True
 
     async with app.state.database.session_factory() as session:
@@ -776,7 +910,10 @@ async def test_message_edit_replaces_the_original_comment_after_its_due_time(
     assert edit["channel_ref"] == "@message_edit_channel"
     assert edit["channel_post_id"] == 25
     assert edit["message_id"] == 40_001
-    assert edit["text"] == "Финальный комментарий"
+    assert edit["text"] == "Финальный комментарий ⭐"
+    assert edit["html_text"] == (
+        'Финальный комментарий <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>'
+    )
     assert edit["idempotency_key"] == f"channel-comment:{run.id}:step:1"
 
 

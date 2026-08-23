@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from html import escape
 from math import ceil
 
@@ -67,7 +68,8 @@ def invite_destination_prompt_text() -> str:
     return (
         _invite_wizard_title(1) + "\n\n"
         "Отправьте <b>@username</b> своего канала/супергруппы или публичную ссылку "
-        "<code>https://t.me/name</code>.\n\n"
+        "<code>https://t.me/name</code> (также подходят ссылки на пост "
+        "или <code>/s/name</code>).\n\n"
         "Для закрытой цели укажите invite-ссылку только если выбранные аккаунты уже "
         "являются администраторами. Перед запуском сервис всё равно проверит права."
     )
@@ -363,6 +365,25 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
         DirectLaunchStatus.CANCELLED: "⚪ остановлен",
         DirectLaunchStatus.FAILED: "🔴 ошибка",
     }.get(launch.status, escape(launch.status.value))
+    timing = ""
+    if view.next_scheduled_for is not None:
+        timing = (
+            "\n⏱ Ближайшая безопасная попытка: "
+            f"<code>{_invite_date_time(view.next_scheduled_for)}</code>"
+        )
+    issue_summary = ""
+    if view.issues:
+        status_labels = {
+            DirectMessageTaskStatus.QUEUED: "отложено",
+            DirectMessageTaskStatus.FAILED: "ошибка",
+            DirectMessageTaskStatus.SKIPPED: "пропущено",
+        }
+        issue_summary = "\n\n<b>📌 Основные причины</b>\n" + "\n".join(
+            "• "
+            f"<b>{count:,}</b> · {escape(failure_label(code))} "
+            f"<i>({status_labels.get(status, status.value)})</i>"
+            for status, code, count in view.issues
+        )
     problem = ""
     if view.last_error_code:
         problem = "\n\n<b>⚠️ Последняя ситуация</b>"
@@ -393,8 +414,16 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
         f"ℹ️ Уже участники: <b>{view.already_participant:,}</b>\n"
         f"⏳ В очереди: <b>{view.queued:,}</b> · выполняется: <b>{view.running:,}</b>\n"
         f"⏭ Пропущено: <b>{view.skipped:,}</b> · ❌ ошибки: <b>{view.failed:,}</b>"
+        f"{timing}"
+        f"{issue_summary}"
         f"{problem}"
     )
+
+
+def _invite_date_time(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).strftime("%d.%m %H:%M UTC")
 
 
 def invite_launches_text(

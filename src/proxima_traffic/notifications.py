@@ -9,8 +9,9 @@ from datetime import timedelta
 from html import escape
 from uuid import uuid4
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from proxima_traffic.models import Campaign, CampaignRun, RunStatus, Target, utc_now
 from proxima_traffic.worker_supervision import WorkerIterationReporter
@@ -79,6 +80,35 @@ class RunNotifier:
             CampaignRun.notification_next_attempt_at.is_(None),
             CampaignRun.notification_next_attempt_at <= now,
         )
+        launch_peer = aliased(CampaignRun)
+        launch_has_active_work = (
+            select(launch_peer.id)
+            .where(
+                launch_peer.launch_key == CampaignRun.launch_key,
+                launch_peer.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
+            )
+            .exists()
+        )
+        launch_anchor_id = (
+            select(func.min(launch_peer.id))
+            .where(launch_peer.launch_key == CampaignRun.launch_key)
+            .scalar_subquery()
+        )
+        launch_summary_due = and_(
+            CampaignRun.launch_key.is_not(None),
+            CampaignRun.repeat_until.is_(None),
+            CampaignRun.id == launch_anchor_id,
+            ~launch_has_active_work,
+        )
+        # Legacy standalone runs retain their individual delivery message. A
+        # finite launch with a shared key is represented by its durable anchor
+        # once all of its tasks have reached a terminal state. Repeating smart
+        # runs deliberately preserve their existing per-run suppression.
+        notification_due = or_(
+            CampaignRun.launch_key.is_(None),
+            CampaignRun.repeat_until.is_not(None),
+            launch_summary_due,
+        )
         async with self._session_factory() as session:
             run_id = await session.scalar(
                 select(CampaignRun.id)
@@ -89,6 +119,7 @@ class RunNotifier:
                     CampaignRun.notified_at.is_(None),
                     available,
                     due,
+                    notification_due,
                 )
                 .order_by(CampaignRun.id)
                 .limit(1)
@@ -152,6 +183,11 @@ class RunNotifier:
 
     async def _mark_delivered(self, run_id: int, token: str) -> bool:
         async with self._session_factory() as session:
+            run = await session.get(CampaignRun, run_id)
+            if run is None:
+                return False
+            is_launch_summary = self._is_finite_launch_summary(run)
+            now = utc_now()
             stored = await session.execute(
                 update(CampaignRun)
                 .where(
@@ -161,7 +197,7 @@ class RunNotifier:
                     CampaignRun.notification_lease_token == token,
                 )
                 .values(
-                    notified_at=utc_now(),
+                    notified_at=now,
                     notification_lease_owner=None,
                     notification_lease_token=None,
                     notification_lease_until=None,
@@ -169,6 +205,29 @@ class RunNotifier:
                     notification_last_error=None,
                 )
             )
+            if stored.rowcount == 1 and is_launch_summary and run.launch_key is not None:
+                # The anchor owns the summary notification. Mark all terminal
+                # siblings delivered together only after that notification is
+                # accepted, so retry and leasing remain durable and no later
+                # per-chat messages can flood the operator's log chat.
+                await session.execute(
+                    update(CampaignRun)
+                    .where(
+                        CampaignRun.launch_key == run.launch_key,
+                        CampaignRun.status.in_(
+                            [RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED]
+                        ),
+                        CampaignRun.notified_at.is_(None),
+                    )
+                    .values(
+                        notified_at=now,
+                        notification_lease_owner=None,
+                        notification_lease_token=None,
+                        notification_lease_until=None,
+                        notification_next_attempt_at=None,
+                        notification_last_error=None,
+                    )
+                )
             await session.commit()
             return stored.rowcount == 1
 
@@ -218,6 +277,8 @@ class RunNotifier:
         self._stop_event.set()
 
     async def _render(self, run: CampaignRun) -> str | None:
+        if self._is_finite_launch_summary(run):
+            return await self._render_finite_launch_summary(run)
         async with self._session_factory() as session:
             campaign = await session.get(Campaign, run.campaign_id)
             target = await session.get(Target, run.target_id)
@@ -241,4 +302,72 @@ class RunNotifier:
         ]
         if run.error:
             lines.append(f"Ошибка: <code>{escape(run.error[:500])}</code>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_finite_launch_summary(run: CampaignRun) -> bool:
+        return run.launch_key is not None and run.repeat_until is None
+
+    async def _render_finite_launch_summary(self, anchor: CampaignRun) -> str:
+        """Render one concise result for all tasks created by a finite launch."""
+
+        if anchor.launch_key is None:  # pragma: no cover - guarded by caller
+            raise RuntimeError("finite launch summary requires a launch key")
+        async with self._session_factory() as session:
+            campaign = await session.get(Campaign, anchor.campaign_id)
+            runs = list(
+                await session.scalars(
+                    select(CampaignRun)
+                    .where(CampaignRun.launch_key == anchor.launch_key)
+                    .order_by(CampaignRun.id)
+                )
+            )
+        succeeded = sum(run.status == RunStatus.SUCCEEDED for run in runs)
+        failed = sum(run.status == RunStatus.FAILED for run in runs)
+        cancelled = sum(run.status == RunStatus.CANCELLED for run in runs)
+        delivered_targets = len(
+            {
+                run.target_id
+                for run in runs
+                if run.primary_message_id is not None or run.reply_message_id is not None
+            }
+        )
+        started_at = min((run.created_at for run in runs), default=anchor.created_at)
+        finished_at = max(
+            (run.finished_at or run.updated_at for run in runs),
+            default=anchor.updated_at,
+        )
+        duration_seconds = max(0, int((finished_at - started_at).total_seconds()))
+        if duration_seconds >= 3600:
+            duration = f"{duration_seconds // 3600} ч {duration_seconds % 3600 // 60} мин"
+        elif duration_seconds >= 60:
+            duration = f"{duration_seconds // 60} мин"
+        else:
+            duration = "меньше минуты"
+        campaign_name = escape(campaign.name) if campaign is not None else f"#{anchor.campaign_id}"
+        lines = [
+            "📊 <b>Рассылка завершена</b>",
+            f"Кампания: <b>{campaign_name}</b>",
+            f"Запуск: <code>#{anchor.id}</code>",
+            "",
+            f"✅ Отправлено: <b>{succeeded}</b>",
+            f"❌ Ошибок: <b>{failed}</b>",
+            f"🚫 Пропущено/остановлено: <b>{cancelled}</b>",
+            f"🎯 Чатов с доставкой: <b>{delivered_targets}</b>",
+            f"⏱ Длительность: <b>{duration}</b>",
+        ]
+        if failed:
+            failed_codes: dict[str, int] = {}
+            for run in runs:
+                if run.status == RunStatus.FAILED:
+                    code = run.error_code or "неизвестная ошибка"
+                    failed_codes[code] = failed_codes.get(code, 0) + 1
+            summary = ", ".join(
+                f"{escape(code)} × {count}"
+                for code, count in sorted(
+                    failed_codes.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:3]
+            )
+            lines.append(f"Причины ошибок: <code>{summary}</code>")
         return "\n".join(lines)

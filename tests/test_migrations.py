@@ -54,7 +54,7 @@ def test_create_schema_runs_data_migrations_and_serializes_first_start(tmp_path)
                 revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
                 return [
                     count,
-                    int(revision == "0062_system_premium_account_group"),
+                    int(revision == "0065_indefinite_smart_campaigns"),
                     int(await first.ready()),
                 ]
         finally:
@@ -62,3 +62,22 @@ def test_create_schema_runs_data_migrations_and_serializes_first_start(tmp_path)
             await second.dispose()
 
     assert asyncio.run(initialize()) == [1057, 1, 1]
+
+
+def test_migrate_to_head_if_needed_skips_a_database_that_is_already_ready(tmp_path) -> None:
+    database_path = tmp_path / "ready.db"
+    database = Database(f"sqlite+aiosqlite:///{database_path.as_posix()}")
+
+    async def initialize() -> bool:
+        try:
+            await database.create_schema()
+
+            async def unexpected_upgrade() -> None:
+                raise AssertionError("a ready database must not rerun Alembic")
+
+            database.create_schema = unexpected_upgrade  # type: ignore[method-assign]
+            return await database.migrate_to_head_if_needed()
+        finally:
+            await database.dispose()
+
+    assert asyncio.run(initialize()) is False

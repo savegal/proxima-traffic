@@ -17,11 +17,12 @@ from proxima_traffic.models import (
     Account,
     Campaign,
     CampaignRun,
+    RunStatus,
     Target,
     ensure_utc,
     utc_now,
 )
-from proxima_traffic.services import LeaseLostError, safe_error_message
+from proxima_traffic.services import LeaseLostError, QueueWorker, safe_error_message
 
 
 class BlockingGateway:
@@ -44,6 +45,32 @@ class ErrorGateway:
     async def send_message(self, **kwargs: object) -> SentMessage:
         del kwargs
         raise self.error
+
+
+class LeaseReleasingRunner:
+    """Mimics the durable terminal write performed inside CampaignRunner."""
+
+    def __init__(self, session_factory) -> None:
+        self._session_factory = session_factory
+
+    async def process_step(self, run_id: int, lease_token: str) -> CampaignRun:
+        async with self._session_factory() as session:
+            run = await session.get(CampaignRun, run_id)
+            assert run is not None
+            assert run.lease_token == lease_token
+            run.status = RunStatus.SUCCEEDED
+            run.primary_message_id = 4242
+            run.finished_at = utc_now()
+            run.lease_owner = None
+            run.lease_token = None
+            run.lease_until = None
+            run.heartbeat_at = None
+            await session.commit()
+            await session.refresh(run)
+        # Give QueueWorker's heartbeat a chance to observe the deliberate
+        # lease release before this method returns.
+        await asyncio.sleep(0.12)
+        return run
 
 
 async def test_stale_runner_is_fenced_after_lease_is_reclaimed(tmp_path) -> None:
@@ -125,6 +152,35 @@ async def test_heartbeat_extends_current_lease_and_worker_metrics(app) -> None:
     snapshot = app.state.queue_worker.snapshot()
     assert snapshot.active_steps == 0
     assert snapshot.processed_steps == 0
+
+
+async def test_terminal_write_does_not_report_a_false_heartbeat_lease_loss(
+    tmp_path,
+    caplog,
+) -> None:
+    settings = _settings(tmp_path, "terminal-heartbeat-race.db")
+    settings.worker_heartbeat_seconds = 0.02
+    app = create_app(settings=settings, gateway=ErrorGateway(RuntimeError("unused")))
+    await app.state.database.create_schema()
+    campaign_id = await _create_ready_campaign(app)
+    await app.state.run_queue.enqueue(campaign_id, "terminal-heartbeat-race")
+    worker = QueueWorker(
+        app.state.run_queue,
+        LeaseReleasingRunner(app.state.database.session_factory),
+        worker_id="terminal-heartbeat-race-worker",
+        poll_seconds=0.01,
+        heartbeat_seconds=settings.worker_heartbeat_seconds,
+        step_timeout_seconds=settings.worker_step_timeout_seconds,
+    )
+
+    result = await worker.process_next()
+
+    assert result is not None
+    assert result.status == RunStatus.SUCCEEDED
+    assert result.primary_message_id == 4242
+    assert "lost its lease" not in caplog.text
+    assert worker.snapshot().processed_steps == 1
+    await app.state.database.dispose()
 
 
 @pytest.mark.parametrize(

@@ -56,7 +56,6 @@ class AccountGroupEditState(StatesGroup):
 
 class TargetCreateState(StatesGroup):
     chat_ref = State()
-    title = State()
 
 
 class TargetImportState(StatesGroup):
@@ -113,6 +112,7 @@ class CampaignCreateState(StatesGroup):
 
 class CampaignEditState(StatesGroup):
     target = State()
+    target_selection = State()
     search = State()
     senders = State()
     mention_cooldown = State()
@@ -141,6 +141,8 @@ class CampaignScheduleEditState(StatesGroup):
 class LaunchEditState(StatesGroup):
     primary_text = State()
     no_timer_interval_minutes = State()
+    min_messages_between_posts = State()
+    visibility_max_wait_minutes = State()
     remaining_duration_hours = State()
 
 
@@ -150,7 +152,10 @@ class OrderDraftState(StatesGroup):
     text = State()
     sender_accounts = State()
     audience = State()
+    audience_targets = State()
     audience_search = State()
+    engagement = State()
+    mention_cooldown_days = State()
     interval_minutes = State()
     visibility_messages = State()
     activity_check_seconds = State()

@@ -8,10 +8,12 @@ from proxima_traffic.dialogues import DialogueStep, serialize_dialogue_steps
 from proxima_traffic.gateways import PermanentGatewayError
 from proxima_traffic.models import (
     Account,
+    BroadcastSenderMode,
     Campaign,
     CampaignAccount,
     CampaignMode,
     CampaignRun,
+    MembershipStatus,
     ReactionTask,
     ReactionTaskStatus,
     RunStatus,
@@ -19,6 +21,7 @@ from proxima_traffic.models import (
     TargetAccountState,
     utc_now,
 )
+from proxima_traffic.reactions import ReactionWorker
 from proxima_traffic.worker_supervision import WorkerSupervisor
 
 
@@ -100,7 +103,10 @@ async def test_dialogue_reactions_wait_for_any_selected_step(app) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reactions_exclude_author_and_are_processed(app) -> None:
+async def test_reactions_exclude_author_and_persist_the_actual_fallback_emoji(
+    app,
+    monkeypatch,
+) -> None:
     async with app.state.database.session_factory() as session:
         accounts = [
             Account(label=f"reactor-{index}", authorized=True, ownership_confirmed=True)
@@ -156,13 +162,136 @@ async def test_reactions_exclude_author_and_are_processed(app) -> None:
         )
         await session.commit()
 
+    async def send_reaction_with_fallback(**kwargs: object) -> str:
+        assert kwargs["emoji"] == "🔥"
+        return "👍"
+
+    monkeypatch.setattr(app.state.gateway, "send_reaction", send_reaction_with_fallback)
     assert await app.state.reactions.process_next() is True
     assert await app.state.reactions.process_next() is True
     async with app.state.database.session_factory() as session:
-        statuses = list(
-            await session.scalars(select(ReactionTask.status).order_by(ReactionTask.id))
+        tasks = list(await session.scalars(select(ReactionTask).order_by(ReactionTask.id)))
+        assert [task.status for task in tasks] == [
+            ReactionTaskStatus.SUCCEEDED,
+            ReactionTaskStatus.SUCCEEDED,
+        ]
+        assert {task.emoji for task in tasks} == {"👍"}
+
+
+@pytest.mark.asyncio
+async def test_live_reactions_are_not_queued_for_an_unverified_reactor(app) -> None:
+    app.state.settings.dry_run = False
+    async with app.state.database.session_factory() as session:
+        source = Account(label="live-source", authorized=True, ownership_confirmed=True)
+        unverified = Account(label="live-unverified", authorized=True, ownership_confirmed=True)
+        target = Target(chat_ref="@live_reactions", title="Live reactions")
+        session.add_all([source, unverified, target])
+        await session.flush()
+        campaign = Campaign(
+            name="Live reaction preflight",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=source.id,
+            target_id=target.id,
+            primary_text="test",
+            reactions_enabled=True,
+            reaction_count=1,
+            reaction_emoji="🔥",
         )
-        assert statuses == [ReactionTaskStatus.SUCCEEDED, ReactionTaskStatus.SUCCEEDED]
+        session.add(campaign)
+        await session.flush()
+        session.add_all(
+            [
+                CampaignAccount(campaign_id=campaign.id, account_id=source.id),
+                CampaignAccount(campaign_id=campaign.id, account_id=unverified.id),
+            ]
+        )
+        run = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            sender_account_id=source.id,
+            request_key="live-reaction-unverified",
+            status=RunStatus.SUCCEEDED,
+        )
+        session.add(run)
+        await session.flush()
+
+        await app.state.campaign_runner._schedule_reactions(  # noqa: SLF001
+            session,
+            run,
+            campaign,
+            target,
+            int(source.id),
+            991,
+            dialogue_step=1,
+        )
+        await session.commit()
+
+    async with app.state.database.session_factory() as session:
+        assert list(await session.scalars(select(ReactionTask))) == []
+
+
+@pytest.mark.asyncio
+async def test_live_reactions_queue_a_fresh_auto_join_route(app) -> None:
+    app.state.settings.dry_run = False
+    app.state.settings.account_auto_join = True
+    async with app.state.database.session_factory() as session:
+        source = Account(label="auto-join-source", authorized=True, ownership_confirmed=True)
+        reactor = Account(label="auto-join-reactor", authorized=True, ownership_confirmed=True)
+        target = Target(chat_ref="@auto_join_reactions", title="Auto join reactions")
+        session.add_all([source, reactor, target])
+        await session.flush()
+        campaign = Campaign(
+            name="Auto join reaction campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=source.id,
+            target_id=target.id,
+            primary_text="test",
+            reactions_enabled=True,
+            reaction_count=1,
+            reaction_emoji="🔥",
+        )
+        session.add(campaign)
+        await session.flush()
+        session.add_all(
+            [
+                CampaignAccount(campaign_id=campaign.id, account_id=source.id),
+                CampaignAccount(campaign_id=campaign.id, account_id=reactor.id),
+            ]
+        )
+        route = TargetAccountState(
+            target_id=target.id,
+            account_id=reactor.id,
+            membership_status=MembershipStatus.NOT_MEMBER,
+            can_send=False,
+            membership_checked_at=utc_now(),
+            membership_error_code="target_not_joined",
+        )
+        session.add(route)
+        run = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            sender_account_id=source.id,
+            request_key="live-reaction-auto-join",
+            status=RunStatus.SUCCEEDED,
+        )
+        session.add(run)
+        await session.flush()
+        await app.state.campaign_runner._schedule_reactions(  # noqa: SLF001
+            session,
+            run,
+            campaign,
+            target,
+            int(source.id),
+            992,
+            dialogue_step=1,
+        )
+        await session.commit()
+
+    async with app.state.database.session_factory() as session:
+        tasks = list(await session.scalars(select(ReactionTask)))
+    assert len(tasks) == 1
+    assert tasks[0].reactor_account_id == reactor.id
+    assert app.state.reactions._route_is_ready(route) is True  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -565,3 +694,143 @@ async def test_reaction_worker_runs_under_the_supervisor(app) -> None:
     worker.stop()
     supervisor.stop()
     await task
+
+
+@pytest.mark.asyncio
+async def test_campaign_scoped_reaction_worker_claims_only_selected_campaign(app) -> None:
+    now = utc_now()
+    async with app.state.database.session_factory() as session:
+        source = Account(label="scoped-reaction-source", ownership_confirmed=True)
+        reactor = Account(label="scoped-reaction-reactor", ownership_confirmed=True)
+        target = Target(chat_ref="@scoped_reaction_target", title="Scoped reaction target")
+        session.add_all([source, reactor, target])
+        await session.flush()
+        older_campaign = Campaign(
+            name="scoped reaction older campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=source.id,
+            target_id=target.id,
+            primary_text="Older",
+        )
+        scoped_campaign = Campaign(
+            name="scoped reaction selected campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=source.id,
+            target_id=target.id,
+            primary_text="Selected",
+        )
+        session.add_all([older_campaign, scoped_campaign])
+        await session.flush()
+        older_run = CampaignRun(
+            campaign_id=older_campaign.id,
+            target_id=target.id,
+            sender_account_id=source.id,
+            request_key="scoped-reaction-older",
+            status=RunStatus.SUCCEEDED,
+        )
+        selected_run = CampaignRun(
+            campaign_id=scoped_campaign.id,
+            target_id=target.id,
+            sender_account_id=source.id,
+            request_key="scoped-reaction-selected",
+            status=RunStatus.SUCCEEDED,
+        )
+        session.add_all([older_run, selected_run])
+        await session.flush()
+        older_task = ReactionTask(
+            campaign_id=older_campaign.id,
+            run_id=older_run.id,
+            target_id=target.id,
+            source_account_id=source.id,
+            reactor_account_id=reactor.id,
+            message_id=801,
+            emoji="🔥",
+            scheduled_for=now - timedelta(minutes=2),
+        )
+        selected_task = ReactionTask(
+            campaign_id=scoped_campaign.id,
+            run_id=selected_run.id,
+            target_id=target.id,
+            source_account_id=source.id,
+            reactor_account_id=reactor.id,
+            message_id=802,
+            emoji="🔥",
+            scheduled_for=now - timedelta(minutes=1),
+        )
+        session.add_all([older_task, selected_task])
+        await session.commit()
+        selected_campaign_id = int(scoped_campaign.id)
+        older_task_id = int(older_task.id)
+        selected_task_id = int(selected_task.id)
+
+    worker = ReactionWorker(
+        app.state.database.session_factory,
+        app.state.gateway,
+        app.state.campaign_runner,
+        app.state.settings,
+        worker_id="scoped-reaction-worker",
+        campaign_id_scope=frozenset({selected_campaign_id}),
+    )
+    claimed = await worker._claim_next()  # noqa: SLF001 - scope is enforced at claim time
+
+    assert claimed is not None and claimed[0] == selected_task_id
+    async with app.state.database.session_factory() as session:
+        older = await session.get(ReactionTask, older_task_id)
+        selected = await session.get(ReactionTask, selected_task_id)
+    assert older is not None and older.status == ReactionTaskStatus.QUEUED
+    assert selected is not None and selected.status == ReactionTaskStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_independent_broadcast_uses_campaign_pool_for_reactions(app) -> None:
+    async with app.state.database.session_factory() as session:
+        source = Account(label="independent-reaction-source", ownership_confirmed=True)
+        reactor = Account(label="independent-reaction-reactor", ownership_confirmed=True)
+        target = Target(chat_ref="@independent_reaction_target", title="Independent target")
+        session.add_all([source, reactor, target])
+        await session.flush()
+        campaign = Campaign(
+            name="independent reaction campaign",
+            mode=CampaignMode.BROADCAST,
+            primary_account_id=source.id,
+            target_id=target.id,
+            primary_text="Test",
+            sender_mode=BroadcastSenderMode.INDEPENDENT,
+            reactions_enabled=True,
+            reaction_count=1,
+        )
+        session.add(campaign)
+        await session.flush()
+        session.add_all(
+            [
+                CampaignAccount(campaign_id=campaign.id, account_id=source.id),
+                CampaignAccount(campaign_id=campaign.id, account_id=reactor.id),
+            ]
+        )
+        run = CampaignRun(
+            campaign_id=campaign.id,
+            target_id=target.id,
+            sender_account_id=source.id,
+            sender_pool_snapshot_json=f"[{source.id}]",
+            sender_mode_snapshot=BroadcastSenderMode.INDEPENDENT,
+            request_key="independent-reaction-run",
+            status=RunStatus.SUCCEEDED,
+        )
+        session.add(run)
+        await session.flush()
+
+        created = await app.state.campaign_runner._schedule_reactions(  # noqa: SLF001
+            session,
+            run,
+            campaign,
+            target,
+            int(source.id),
+            901,
+            dialogue_step=1,
+        )
+        await session.commit()
+
+    assert created == 1
+    async with app.state.database.session_factory() as session:
+        task = await session.scalar(select(ReactionTask))
+    assert task is not None and task.reactor_account_id == reactor.id

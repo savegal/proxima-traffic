@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select, update
 
+from proxima_traffic.bot.subscriber_invite_ui import invite_launch_text
 from proxima_traffic.config import Settings
 from proxima_traffic.db import Database
 from proxima_traffic.direct_messages import DirectMessageService
@@ -62,6 +63,30 @@ class UncertainInviteGateway(DryRunGateway):
     async def invite_subscriber(self, **kwargs):
         del kwargs
         raise TemporaryGatewayError("network reply lost", code="network_error")
+
+
+class PreRpcInviteGateway(DryRunGateway):
+    def __init__(self, code: str) -> None:
+        super().__init__()
+        self.code = code
+
+    async def invite_subscriber(self, **kwargs):
+        del kwargs
+        raise TemporaryGatewayError("invite could not start", code=self.code, retry_after=1)
+
+
+class FatalAccountInviteGateway(DryRunGateway):
+    def __init__(self, blocked_account_id: int) -> None:
+        super().__init__()
+        self.blocked_account_id = blocked_account_id
+        self.sender_ids: list[int] = []
+
+    async def invite_subscriber(self, **kwargs):
+        account = kwargs["account"]
+        self.sender_ids.append(int(account.id))
+        if int(account.id) == self.blocked_account_id:
+            raise PermanentGatewayError("session was revoked", code="account_dead")
+        return await super().invite_subscriber(**kwargs)
 
 
 class DestinationAccessGateway(DryRunGateway):
@@ -248,6 +273,123 @@ async def test_subscriber_invite_never_retries_an_uncertain_telegram_outcome(
     assert await service.process_next() is None
     with pytest.raises(ConflictError, match="нет доступных"):
         await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["proxy_unavailable", "account_operation_busy"])
+async def test_pre_rpc_invite_failures_do_not_become_delivery_unconfirmed(
+    tmp_path: Path,
+    code: str,
+) -> None:
+    database, service, list_id = await _service_with_import(
+        tmp_path,
+        f"invite-pre-rpc-{code}.db",
+        PreRpcInviteGateway(code),
+        records=1,
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name=f"Invite pre-RPC {code}",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[int(account.id)],
+    )
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+
+    first = await service.process_next()
+    assert first is not None
+    assert first.status == DirectMessageTaskStatus.QUEUED
+    assert first.error_code == code
+    assert first.attempt_count == 1
+    assert first.delivery_attempted_at is None
+    retry_view = await service.get_launch_view(int(launch.id))
+    assert retry_view.next_scheduled_for is not None
+    assert (DirectMessageTaskStatus.QUEUED, code, 1) in retry_view.issues
+    retry_text = invite_launch_text(retry_view)
+    assert "Ближайшая безопасная попытка" in retry_text
+    assert "Основные причины" in retry_text
+    async with database.session_factory() as session:
+        task = await session.scalar(
+            select(SubscriberInviteTask).where(SubscriberInviteTask.launch_id == launch.id)
+        )
+        assert task is not None
+        task.scheduled_for = utc_now()
+        task.max_attempts = 2
+        await session.commit()
+
+    second = await service.process_next()
+    assert second is not None
+    assert second.status == DirectMessageTaskStatus.SKIPPED
+    assert second.error_code == code
+    async with database.session_factory() as session:
+        subscriber = await session.scalar(select(Subscriber))
+    assert subscriber is not None
+    assert subscriber.reserved_invite_launch_id is None
+    assert subscriber.last_invited_target_ref is None
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subscriber_invite_fails_over_after_fatal_account_error(tmp_path: Path) -> None:
+    gateway = FatalAccountInviteGateway(blocked_account_id=1)
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-fatal-account-failover.db", gateway, records=1
+    )
+    async with database.session_factory() as session:
+        first = Account(label="revoked", ownership_confirmed=True)
+        second = Account(label="healthy", ownership_confirmed=True)
+        session.add_all([first, second])
+        await session.commit()
+        await session.refresh(first)
+        await session.refresh(second)
+    assert first.id == 1
+    campaign = await service.create_campaign(
+        name="Invite fatal account failover",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=30,
+        account_ids=[int(first.id), int(second.id)],
+    )
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+
+    first_result = await service.process_next()
+    assert first_result is not None
+    assert first_result.status == DirectMessageTaskStatus.QUEUED
+    assert first_result.error_code == "account_dead"
+    assert first_result.attempt_count == 0
+    assert first_result.delivery_attempted_at is None
+    async with database.session_factory() as session:
+        state = await session.scalar(
+            select(SubscriberInviteLaunchAccountState).where(
+                SubscriberInviteLaunchAccountState.launch_id == launch.id,
+                SubscriberInviteLaunchAccountState.account_id == first.id,
+            )
+        )
+        task = await session.scalar(
+            select(SubscriberInviteTask).where(SubscriberInviteTask.launch_id == launch.id)
+        )
+        assert state is not None and state.send_blocked is True
+        assert state.blocked_reason == "account_dead"
+        assert task is not None
+        task.scheduled_for = utc_now()
+        await session.commit()
+
+    second_result = await service.process_next()
+    assert second_result is not None
+    assert second_result.status == DirectMessageTaskStatus.SUCCEEDED
+    assert gateway.sender_ids == [int(first.id), int(second.id)]
+    view = await service.get_launch_view(int(launch.id))
+    assert view.launch.status == DirectLaunchStatus.SUCCEEDED
     await database.dispose()
 
 
@@ -540,6 +682,17 @@ def test_subscriber_invite_destination_normalization() -> None:
         "@owned_channel",
     )
     assert normalize_invite_destination_ref("https://t.me/+A1_b2") == (
+        "https://t.me/+A1_b2",
+        "https://t.me/+a1_b2",
+    )
+    normalized_public = normalize_invite_destination_ref(
+        "https://www.telegram.me/s/Owned_Channel/42?single"
+    )
+    assert normalized_public == (
+        "@Owned_Channel",
+        "@owned_channel",
+    )
+    assert normalize_invite_destination_ref("https://telegram.me/joinchat/A1_b2#details") == (
         "https://t.me/+A1_b2",
         "https://t.me/+a1_b2",
     )

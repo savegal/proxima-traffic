@@ -13,7 +13,6 @@ import hashlib
 import logging
 import math
 import os
-import random
 import socket
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -59,6 +58,7 @@ from proxima_traffic.gateways import (
     SubscriberInviteDestination,
     TargetReadiness,
     TemporaryGatewayError,
+    reaction_candidates,
 )
 from proxima_traffic.membership_gate import InlineButton, parse_membership_gate
 from proxima_traffic.models import (
@@ -186,6 +186,22 @@ class TelethonGateway:
         except Exception:  # noqa: BLE001 - connection cleanup must not hide the check result
             logger.debug("@SpamBot client disconnect failed", exc_info=True)
 
+    async def invalidate_target_membership(self, *, account_id: int, target: Target) -> bool:
+        """Forget one cached membership observation after Telegram contradicts it.
+
+        This performs no Telegram action.  The next normal delivery will
+        resolve the destination again and, when configured, use the existing
+        rate-limited auto-join path.  Returning whether the cache was present
+        lets the runner limit this recovery to one stale-cache retry.
+        """
+
+        cache_key = (account_id, target.chat_ref)
+        async with self._global_lock:
+            had_cached_membership = cache_key in self._joined
+            self._entity_cache.pop(cache_key, None)
+            self._joined.discard(cache_key)
+        return had_cached_membership
+
     async def inspect_target(
         self,
         *,
@@ -197,6 +213,7 @@ class TelethonGateway:
         if account.id is None or target.id is None:
             raise PermanentGatewayError("live context is missing persisted identifiers")
         checked_at = utc_now()
+        telegram_title: str | None = None
         async with self._account_operation(account.id):
             try:
                 client = await self._ensure_client(account.id)
@@ -205,6 +222,8 @@ class TelethonGateway:
                     account.id,
                     target,
                 )
+                candidate_title = str(getattr(entity, "title", "") or "").strip()
+                telegram_title = candidate_title[:150] or None
                 self._ensure_can_send(entity, media_kinds=media_kinds)
                 try:
                     slowmode_seconds = await self._respect_chat_slow_mode(
@@ -235,6 +254,7 @@ class TelethonGateway:
                     slowmode_seconds=slowmode_seconds,
                     next_send_at=next_send_at,
                     media_kinds=media_kinds,
+                    telegram_title=telegram_title,
                 )
             except GatewayError as exc:
                 code = str(getattr(exc, "code", None) or "gateway_error")
@@ -252,6 +272,7 @@ class TelethonGateway:
                     media_kinds=media_kinds,
                     error_code=code,
                     error=str(getattr(exc, "safe_message", None) or exc)[:500],
+                    telegram_title=telegram_title,
                 )
 
     async def inspect_activity(
@@ -539,9 +560,16 @@ class TelethonGateway:
                         newest_post = message
                         break
                 if newest_post is None:
-                    raise PermanentGatewayError(
-                        "в канале пока нет публикаций для проверки комментариев",
-                        code="channel_has_no_posts",
+                    # A newly created public channel may legitimately have no
+                    # post yet. Its linked discussion peer cannot be resolved
+                    # until the first post exists, but refusing to save the
+                    # rule here would make the core auto-comment use case
+                    # impossible. The first real post is checked again before
+                    # any comment is sent.
+                    return ChannelCommentPreflight(
+                        title=str(getattr(channel, "title", "") or "") or None,
+                        channel_post_id=0,
+                        discussion_root_message_id=0,
                     )
                 discussion = await self._discussion_for_post(
                     client,
@@ -588,6 +616,17 @@ class TelethonGateway:
             raise PermanentGatewayError("live context is missing persisted identifiers")
         del media_name
         media_without_caption = media_path is not None
+        try:
+            rendered_text = (
+                render_telegram_html(html_text) if html_text is not None else text.strip()
+            )
+        except ContentError as exc:
+            raise PermanentGatewayError(str(exc), code="comment_invalid") from exc
+        if rendered_text != text.strip():
+            raise PermanentGatewayError(
+                "форматированный текст комментария не совпадает с исходным",
+                code="comment_invalid",
+            )
         if media_path is not None and media_kind not in {
             "photo",
             "video",
@@ -601,7 +640,8 @@ class TelethonGateway:
                 "video notes cannot contain a caption", code="comment_invalid"
             )
         if channel_post_id <= 0 or (
-            not 1 <= len(text.strip()) <= 4096 and not (media_without_caption and not text.strip())
+            not 1 <= len(rendered_text) <= 4096
+            and not (media_without_caption and not rendered_text)
         ):
             raise PermanentGatewayError(
                 "комментарий не должен быть пустым",
@@ -631,7 +671,7 @@ class TelethonGateway:
                     discussion_entity,
                     media_kinds=frozenset({media_kind}) if media_kind else frozenset(),
                 )
-                await self._show_typing_before_send(client, discussion_entity)
+                await self._show_typing_before_send(client, discussion_entity, text=rendered_text)
                 if media_path is None:
                     sent = await self._send(
                         client,
@@ -754,6 +794,7 @@ class TelethonGateway:
         message_id: int,
         text: str,
         idempotency_key: str,
+        html_text: str | None = None,
     ) -> ChannelCommentDelivery:
         """Edit one previously sent comment in the matching discussion thread."""
         from telethon import errors, functions, utils  # noqa: PLC0415
@@ -761,9 +802,18 @@ class TelethonGateway:
         del idempotency_key
         if account.id is None:
             raise PermanentGatewayError("live context is missing persisted identifiers")
+        try:
+            rendered_text = render_telegram_html(html_text) if html_text is not None else text
+        except ContentError as exc:
+            raise PermanentGatewayError(str(exc), code="comment_edit_invalid") from exc
         if channel_post_id <= 0 or message_id <= 0 or not 1 <= len(text.strip()) <= 4096:
             raise PermanentGatewayError(
                 "текст или идентификатор редактируемого комментария некорректен",
+                code="comment_edit_invalid",
+            )
+        if rendered_text != text.strip():
+            raise PermanentGatewayError(
+                "форматированный текст комментария не совпадает с исходным",
                 code="comment_edit_invalid",
             )
         async with self._account_operation(account.id):
@@ -781,11 +831,16 @@ class TelethonGateway:
                     discussion,
                 )
                 try:
+                    message_text = text.strip()
+                    entities = None
+                    if html_text is not None:
+                        message_text, entities = await self._parse_html_message(client, html_text)
                     await client(
                         functions.messages.EditMessageRequest(
                             peer=utils.get_input_peer(discussion_entity),
                             id=message_id,
-                            message=text.strip(),
+                            message=message_text,
+                            entities=entities,
                             no_webpage=True,
                         )
                     )
@@ -828,27 +883,25 @@ class TelethonGateway:
         target: Target,
         message_id: int,
         emoji: str,
-    ) -> None:
-        """Apply one ordinary (never paid) reaction under the shared account lock."""
+    ) -> str:
+        """Apply an ordinary reaction, using a safe fallback only when Telegram rejects it."""
         if account.id is None or target.id is None:
             raise PermanentGatewayError("live context is missing persisted identifiers")
         if message_id <= 0 or emoji not in ORDINARY_REACTION_EMOJI:
             raise PermanentGatewayError("reaction is invalid", code="reaction_invalid")
-        from telethon import functions, types, utils  # noqa: PLC0415
-
         async with self._account_operation(account.id):
             try:
                 client = await self._ensure_client(account.id)
-                entity = await self._resolve_entity(client, account.id, target.chat_ref)
-                await client(
-                    functions.messages.SendReactionRequest(
-                        peer=utils.get_input_peer(entity),
-                        msg_id=message_id,
-                        reaction=[types.ReactionEmoji(emoticon=emoji)],
-                        big=False,
-                        add_to_recent=False,
-                    )
+                # Reactions are Telegram actions, not local markers. Let a
+                # configured auto-join use the same guarded membership path as
+                # the publication; otherwise fresh accounts were excluded from
+                # every reaction before they had a chance to enter the chat.
+                entity = (
+                    await self._join_and_resolve(client, account.id, target)
+                    if self._settings.account_auto_join
+                    else await self._resolve_entity(client, account.id, target.chat_ref)
                 )
+                return await self._send_reaction_with_fallback(client, entity, message_id, emoji)
             except Exception as exc:  # noqa: BLE001 - map RPC errors for the durable worker
                 if isinstance(exc, GatewayError):
                     raise
@@ -862,15 +915,13 @@ class TelethonGateway:
         channel_post_id: int,
         message_id: int,
         emoji: str,
-    ) -> None:
+    ) -> str:
         """React to a comment through the discussion peer linked to its channel post."""
 
         if account.id is None:
             raise PermanentGatewayError("live context is missing persisted identifiers")
         if channel_post_id <= 0 or message_id <= 0 or emoji not in ORDINARY_REACTION_EMOJI:
             raise PermanentGatewayError("reaction is invalid", code="reaction_invalid")
-        from telethon import functions, types, utils  # noqa: PLC0415
-
         async with self._account_operation(account.id):
             try:
                 client = await self._ensure_client(account.id)
@@ -888,14 +939,11 @@ class TelethonGateway:
                     discussion_entity,
                     join_if_needed=True,
                 )
-                await client(
-                    functions.messages.SendReactionRequest(
-                        peer=utils.get_input_peer(discussion_entity),
-                        msg_id=message_id,
-                        reaction=[types.ReactionEmoji(emoticon=emoji)],
-                        big=False,
-                        add_to_recent=False,
-                    )
+                return await self._send_reaction_with_fallback(
+                    client,
+                    discussion_entity,
+                    message_id,
+                    emoji,
                 )
             except Exception as exc:  # noqa: BLE001 - durable worker classifies the RPC
                 if isinstance(exc, GatewayError):
@@ -993,6 +1041,7 @@ class TelethonGateway:
             str(raw_media_items[0].get("kind") or "") if len(raw_media_items) == 1 else None
         )
         maximum_text = 1024 if raw_media_items else 4096
+        rendered_text = ""
         if stored_contact is None:
             try:
                 rendered_text = render_telegram_html(html_text) if html_text is not None else text
@@ -1052,7 +1101,7 @@ class TelethonGateway:
                 entity,
                 known_timer_checked=True,
             )
-            await self._show_typing_before_send(client, entity)
+            await self._show_typing_before_send(client, entity, text=rendered_text)
             try:
                 if stored_contact is not None:
                     sent = await self._send_contact(
@@ -1160,7 +1209,7 @@ class TelethonGateway:
             client = await self._ensure_client(account.id)
             try:
                 entity, profile = await self._resolve_direct_recipient(client, recipient)
-                await self._show_typing_before_send(client, entity)
+                await self._show_typing_before_send(client, entity, text=rendered_text)
                 if resolved_media_path is None:
                     sent = await self._send(
                         client,
@@ -1258,7 +1307,9 @@ class TelethonGateway:
                     client, account.id, destination_ref
                 )
                 await self._ensure_can_invite_subscribers(client, destination)
-                _, profile = await self._resolve_direct_recipient(client, recipient)
+                _, profile = await self._resolve_direct_recipient(
+                    client, recipient, for_invite=True
+                )
                 try:
                     await client(
                         functions.channels.InviteToChannelRequest(
@@ -1367,6 +1418,8 @@ class TelethonGateway:
     async def _resolve_direct_recipient(
         client: object,
         recipient: DirectRecipient,
+        *,
+        for_invite: bool = False,
     ) -> tuple[object, object]:
         from telethon import types  # noqa: PLC0415
 
@@ -1391,7 +1444,7 @@ class TelethonGateway:
         except ValueError as exc:
             raise PermanentGatewayError(
                 "аккаунт не знает этого пользователя: нужен актуальный username или общий чат",
-                code="recipient_unresolvable",
+                code=("invite_recipient_unresolvable" if for_invite else "recipient_unresolvable"),
             ) from exc
 
         resolved_id = (
@@ -1407,12 +1460,12 @@ class TelethonGateway:
         if bool(getattr(profile, "bot", False)) or bool(getattr(profile, "deleted", False)):
             raise PermanentGatewayError(
                 "получатель удалён или является ботом",
-                code="recipient_unavailable",
+                code=("invite_recipient_unavailable" if for_invite else "recipient_unavailable"),
             )
         if bool(getattr(profile, "self", False)):
             raise PermanentGatewayError(
                 "аккаунт не отправляет массовое сообщение самому себе",
-                code="recipient_unavailable",
+                code=("invite_recipient_unavailable" if for_invite else "recipient_unavailable"),
             )
         return entity, profile
 
@@ -1572,7 +1625,12 @@ class TelethonGateway:
             connection_retries=2,
             retry_delay=2,
             timeout=int(self._settings.account_connect_timeout_seconds),
-            flood_sleep_threshold=self._settings.account_flood_sleep_threshold,
+            # Delivery workers must observe every FloodWait and RPC failure so
+            # they can persist the cooldown, retry safely and honour shutdown.
+            # Telethon's default short sleeps/retries bypass that durable flow.
+            request_retries=0,
+            flood_sleep_threshold=0,
+            raise_last_call_error=True,
         )
         try:
             await asyncio.wait_for(
@@ -1704,7 +1762,10 @@ class TelethonGateway:
         try:
             entity = await client.get_entity(target_ref)
         except (ValueError, TypeError) as exc:
-            raise PermanentGatewayError(f"цель {chat_ref!r} не найдена или недоступна") from exc
+            raise PermanentGatewayError(
+                f"цель {chat_ref!r} не найдена или недоступна",
+                code="target_unavailable",
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             raise self._map_rpc_error(exc, context="resolve") from exc
         self._entity_cache[cache_key] = entity
@@ -1720,12 +1781,21 @@ class TelethonGateway:
         from telethon import errors, functions, types  # noqa: PLC0415
 
         if target.folder_slug and target.telegram_peer_id is not None:
-            entity, _ = await self._resolve_folder_target(
-                client,
-                account_id,
-                target,
-                allow_join=False,
-            )
+            # Folder links use a separate Telegram RPC. Its failures used to
+            # escape this preflight path as raw numeric RPC codes (for example
+            # 420 for a frozen account), so the UI presented an account-wide
+            # restriction as an opaque account-chat pair error.
+            try:
+                entity, _ = await self._resolve_folder_target(
+                    client,
+                    account_id,
+                    target,
+                    allow_join=False,
+                )
+            except GatewayError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - normalize folder RPC failures
+                raise self._map_rpc_error(exc, context="preflight") from exc
             return entity
         if target.chat_ref.startswith("https://t.me/+"):
             invite_hash = target.chat_ref.split("+", 1)[1]
@@ -1830,6 +1900,7 @@ class TelethonGateway:
         """Resolve one validated subscription gate in the exact delivery chat."""
 
         gate_detected = False
+        gate_notice: str | None = None
         try:
             recent = await asyncio.wait_for(
                 client.get_messages(  # type: ignore[attr-defined]
@@ -1847,6 +1918,7 @@ class TelethonGateway:
             if gate_message is None or gate is None:
                 return MembershipGateRecovery(detected=False, recovered=False)
             gate_detected = True
+            gate_notice = gate.notice
             if len(gate.channel_refs) > int(self._settings.membership_gate_max_channels):
                 return MembershipGateRecovery(
                     detected=True,
@@ -1880,6 +1952,7 @@ class TelethonGateway:
             return MembershipGateRecovery(
                 detected=gate_detected,
                 recovered=False,
+                notice=gate_notice,
                 error=self._safe_gateway_error(exc),
             )
         except Exception as exc:  # noqa: BLE001 - preserve the deleted post as source of truth
@@ -1887,6 +1960,7 @@ class TelethonGateway:
             return MembershipGateRecovery(
                 detected=gate_detected,
                 recovered=False,
+                notice=gate_notice,
                 error=self._safe_gateway_error(mapped),
             )
 
@@ -1907,7 +1981,7 @@ class TelethonGateway:
         making an account join channels.
         """
 
-        candidates: list[tuple[int, object, object]] = []
+        candidates: list[tuple[int, int, object, object]] = []
         for message in messages:
             raw_id = getattr(message, "id", None)
             if raw_id is None or int(raw_id) <= after_message_id:
@@ -1918,16 +1992,41 @@ class TelethonGateway:
             text = str(
                 getattr(message, "raw_text", None) or getattr(message, "message", None) or ""
             )
-            gate = parse_membership_gate(text, self._inline_buttons(message))
+            gate = parse_membership_gate(
+                text,
+                self._inline_buttons(message),
+                text_links=self._message_text_links(message),
+            )
             if gate is None:
                 continue
             if not await self._is_moderator_bot_message(client, entity, message):
                 continue
-            candidates.append((int(raw_id), message, gate))
+            # A direct reply to the removed post is the strongest association.
+            # Some moderator bots post a standalone notice, so retain that
+            # supported fallback but prefer a precise reply whenever available.
+            candidates.append(
+                (0 if reply_to_id == after_message_id else 1, int(raw_id), message, gate)
+            )
         if not candidates:
             return None, None
-        _, message, gate = min(candidates, key=lambda item: item[0])
+        _, _, message, gate = min(candidates, key=lambda item: (item[0], item[1]))
         return message, gate
+
+    @staticmethod
+    def _message_text_links(message: object) -> tuple[str, ...]:
+        """Return Telegram URLs hidden behind formatted moderator-bot text.
+
+        Plain URLs are parsed from the message body by ``parse_membership_gate``.
+        ``MessageEntityTextUrl`` keeps its destination separately, therefore it
+        must be extracted before the transport object is discarded.
+        """
+
+        values: list[str] = []
+        for entity in tuple(getattr(message, "entities", None) or ()):
+            url = getattr(entity, "url", None)
+            if isinstance(url, str) and url and url not in values:
+                values.append(url)
+        return tuple(values)
 
     @staticmethod
     def _reply_to_message_id(message: object) -> int | None:
@@ -1963,9 +2062,32 @@ class TelethonGateway:
 
         from telethon import functions, types, utils  # noqa: PLC0415
 
+        if isinstance(entity, types.Chat):
+            # Legacy/basic groups use a different RPC.  Do not relax the
+            # administrator requirement merely because they lack
+            # channels.GetParticipant.
+            sender_id = getattr(sender, "id", None)
+            if not isinstance(sender_id, int) or sender_id <= 0:
+                return False
+            try:
+                full = await client(  # type: ignore[operator]
+                    functions.messages.GetFullChatRequest(entity.id)
+                )
+            except Exception:  # noqa: BLE001 - membership actions must fail closed
+                return False
+            participants = getattr(getattr(full, "full_chat", None), "participants", None)
+            return any(
+                getattr(participant, "user_id", None) == sender_id
+                and isinstance(
+                    participant,
+                    (types.ChatParticipantAdmin, types.ChatParticipantCreator),
+                )
+                for participant in tuple(getattr(participants, "participants", None) or ())
+            )
         if not isinstance(entity, types.Channel):
-            # Basic groups do not support channels.GetParticipant; a Telegram
-            # bot sender is still a substantially stronger signal than text.
+            # A non-channel peer cannot expose an administrator roster.  The
+            # bot identity is still required, but the gate remains anchored to
+            # the exact deleted post and its Telegram-only channel links.
             return True
         try:
             result = await client(  # type: ignore[operator]
@@ -2081,8 +2203,19 @@ class TelethonGateway:
             marker in answer_text
             for marker in (
                 "не подпис",
+                "подпиш",
+                "не вступ",
+                "не приєдна",
+                "підпиш",
+                "не выполн",
+                "не викон",
+                "нет доступа",
+                "немає доступу",
+                "access denied",
                 "not subscribed",
+                "not a member",
                 "subscribe first",
+                "must join",
                 "ошиб",
                 "error",
             )
@@ -2182,9 +2315,26 @@ class TelethonGateway:
                 await client(functions.channels.GetParticipantRequest(public_entity, "me"))
                 return public_entity, False
             except errors.UserNotParticipantError:
-                pass
-            except PermanentGatewayError:
-                pass
+                # A public group can be joined directly and does not need an
+                # imported-folder slot.  The previous folder-only request was
+                # the source of CHATLISTS_TOO_MUCH/BAD_REQUEST on real launches.
+                if not allow_join:
+                    raise PermanentGatewayError(
+                        "аккаунт не состоит в этой публичной группе",
+                        code="target_not_joined",
+                    ) from None
+                await self._enforce_join_limit(account_id)
+                try:
+                    await client(functions.channels.JoinChannelRequest(public_entity))
+                except errors.UserAlreadyParticipantError:
+                    return public_entity, False
+                return public_entity, True
+            except PermanentGatewayError as exc:
+                # A folder may be the only route when the public address cannot
+                # be resolved by this account.  Do not hide a real permission
+                # problem in an already resolved destination.
+                if getattr(exc, "code", None) != "target_unavailable":
+                    raise
 
         try:
             invite = await client(functions.chatlists.CheckChatlistInviteRequest(slug=slug))
@@ -2369,9 +2519,27 @@ class TelethonGateway:
             )
             if state is not None and state.send_blocked:
                 reason = state.blocked_reason or "account_banned_in_chat"
+                # Keep the exact durable reason. Only USER_BANNED_IN_CHANNEL
+                # is a confirmed ban; rights and write restrictions must not
+                # turn into a false "banned in chat" report on later retries.
+                code = (
+                    reason
+                    if reason
+                    in {
+                        "account_banned_in_chat",
+                        "account_chat_access_forbidden",
+                        "account_chat_access_lost",
+                        "account_missing_post_rights",
+                        "account_missing_admin_rights",
+                        "account_send_forbidden",
+                        "account_join_limit",
+                        "target_unavailable",
+                    }
+                    else "account_chat_access_forbidden"
+                )
                 raise PermanentGatewayError(
                     f"эта пара аккаунт–чат заблокирована: {reason}",
-                    code="account_banned_in_chat",
+                    code=code,
                 )
             known_next_send = (
                 self._as_utc(state.next_send_at)
@@ -2494,12 +2662,20 @@ class TelethonGateway:
             state.last_checked_at = now
             await session.commit()
 
-    async def _show_typing_before_send(self, client: object, entity: object) -> None:
-        """Show Telegram's native typing status during a short composition pause.
+    async def _show_typing_before_send(
+        self,
+        client: object,
+        entity: object,
+        *,
+        text: str = "",
+    ) -> None:
+        """Show Telegram's native typing status for a bounded text-length pause.
 
         Telegram exposes a typing event, not UI-click events.  The pause is kept
         inside the account lock so a later send from the same account cannot
-        overtake the message that is currently being prepared.
+        overtake the message that is currently being prepared.  It is based on
+        the final visible text, not its markup, and awaits normally so worker
+        cancellation interrupts it immediately.
         """
         if not self._settings.account_typing_enabled:
             return
@@ -2507,7 +2683,12 @@ class TelethonGateway:
         maximum = self._settings.account_typing_max_seconds
         if maximum <= 0:
             return
-        duration = random.uniform(minimum, maximum)
+        characters_per_second = self._settings.account_typing_characters_per_second
+        visible_characters = len(text.strip())
+        duration = min(
+            maximum,
+            max(minimum, visible_characters / characters_per_second),
+        )
         if duration <= 0:
             return
 
@@ -2813,16 +2994,15 @@ class TelethonGateway:
         except Exception as exc:  # noqa: BLE001
             mapped = self._map_rpc_error(exc, context="send_album")
             if getattr(mapped, "code", None) == "delivery_unconfirmed":
-                recovered_id = await self._recover_duplicate_delivery(
-                    client,
-                    entity,
-                    caption,
-                    reply_to_message_id,
-                    sent_after=sent_after,
-                )
-                if recovered_id is not None:
-                    await self._remember_delivery_message_id(idempotency_key, recovered_id)
-                    return SentMessage(message_id=recovered_id)
+                # A history entry cannot prove ownership of an album: captions
+                # are not unique and a grouped message does not expose this
+                # request's random IDs.  Associating a lookalike album would
+                # silently attach reactions and reports to another post.
+                # Preserve the uncertain outcome rather than guessing.
+                raise PermanentGatewayError(
+                    "Telegram мог принять альбом, но его состав нельзя безопасно подтвердить",
+                    code="delivery_unconfirmed",
+                ) from exc
             raise mapped from exc
         message_ids = self._sent_message_ids(result, set(random_ids))
         if not message_ids:
@@ -3034,7 +3214,7 @@ class TelethonGateway:
         ):
             raise PermanentGatewayError(
                 "аккаунт не может публиковать сообщения в этом канале",
-                code="account_banned_in_chat",
+                code="account_missing_post_rights",
             )
         if creator or admin_rights is not None:
             return
@@ -3047,7 +3227,7 @@ class TelethonGateway:
         ):
             raise PermanentGatewayError(
                 "этому аккаунту запрещена отправка сообщений в чате",
-                code="account_banned_in_chat",
+                code="account_send_forbidden",
             )
         if default_banned is not None and (
             getattr(default_banned, "send_messages", False)
@@ -3117,6 +3297,85 @@ class TelethonGateway:
             notice = None
         raise self._deleted_post_error(message_id, notice=notice)
 
+    async def _send_reaction_with_fallback(
+        self,
+        client,
+        entity,
+        message_id: int,
+        preferred_emoji: str,
+    ) -> str:
+        """Try the configured emoji, then ordinary fallbacks rejected only by Telegram.
+
+        A fallback is deliberately limited to the four emoji exposed in the
+        control panel. Network failures, flood waits, missing access and an
+        unconfirmed delivery are never masked by switching emoji.
+        """
+        last_unavailable: GatewayError | None = None
+        for emoji in reaction_candidates(preferred_emoji):
+            try:
+                await self._send_and_verify_reaction(client, entity, message_id, emoji)
+                return emoji
+            except Exception as exc:  # noqa: BLE001 - normalize only this reaction attempt
+                mapped = (
+                    exc
+                    if isinstance(exc, GatewayError)
+                    else self._map_rpc_error(
+                        exc,
+                        context="reaction",
+                    )
+                )
+                if getattr(mapped, "code", None) != "reaction_unavailable":
+                    if mapped is exc:
+                        raise
+                    raise mapped from exc
+                last_unavailable = mapped
+        if last_unavailable is not None:
+            raise last_unavailable
+        raise PermanentGatewayError("reaction is invalid", code="reaction_invalid")
+
+    async def _send_and_verify_reaction(self, client, entity, message_id: int, emoji: str) -> None:
+        """Set a reaction and require Telegram to show it for the reacting account.
+
+        ``SendReactionRequest`` returning ``Updates`` only means that Telegram
+        accepted the RPC. It did not previously prove that the selected reaction
+        became visible on the message, which let a task be marked successful
+        without an operator-observable result. Repeating an identical reaction
+        is idempotent for one account, so an unconfirmed result can safely be
+        retried by the durable reaction worker.
+        """
+        from telethon import functions, types, utils  # noqa: PLC0415
+
+        await client(
+            functions.messages.SendReactionRequest(
+                peer=utils.get_input_peer(entity),
+                msg_id=message_id,
+                reaction=[types.ReactionEmoji(emoticon=emoji)],
+                big=False,
+                add_to_recent=False,
+            )
+        )
+        await self._verify_reaction_delivery(client, entity, message_id, emoji)
+
+    async def _verify_reaction_delivery(self, client, entity, message_id: int, emoji: str) -> None:
+        """Confirm that this account's requested reaction is visible in Telegram."""
+        if not self._settings.account_delivery_verify_enabled:
+            return
+        delays = (
+            float(self._settings.account_delivery_verify_delay_seconds),
+            float(self._settings.account_delivery_verify_confirm_delay_seconds),
+        )
+        for delay in delays:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            fetched = await self._fetch_message_for_verification(client, entity, message_id)
+            if self._reaction_is_selected(fetched, message_id, emoji):
+                return
+        raise TemporaryGatewayError(
+            "Telegram принял реакцию, но не подтвердил её отображение на сообщении",
+            retry_after=max(10, int(self._settings.worker_retry_base_seconds)),
+            code="reaction_delivery_unconfirmed",
+        )
+
     async def _fetch_message_for_verification(self, client, entity, message_id: int):
         try:
             return await asyncio.wait_for(
@@ -3136,6 +3395,21 @@ class TelethonGateway:
             and getattr(message, "id", None) == message_id
             and type(message).__name__ != "MessageEmpty"
         )
+
+    @classmethod
+    def _reaction_is_selected(cls, message: object | None, message_id: int, emoji: str) -> bool:
+        """Return whether the current account selected ``emoji`` on this message."""
+        if not cls._message_is_present(message, message_id):
+            return False
+        reactions = getattr(message, "reactions", None)
+        for result in getattr(reactions, "results", None) or ():
+            reaction = getattr(result, "reaction", None)
+            if (
+                getattr(reaction, "emoticon", None) == emoji
+                and getattr(result, "chosen_order", None) is not None
+            ):
+                return True
+        return False
 
     @staticmethod
     def _moderation_notice(messages: list[object], *, after_message_id: int) -> str | None:
@@ -3261,6 +3535,17 @@ class TelethonGateway:
             return PermanentGatewayError(
                 "Telegram уже принял сообщение с ключом этой задачи",
                 code="delivery_unconfirmed",
+            )
+        if context == "join" and rpc_message == "CHATLISTS_TOO_MUCH":
+            return PermanentGatewayError(
+                "аккаунт достиг лимита папок Telegram; "
+                "для публичных чатов используйте прямую ссылку",
+                code="account_chatlist_limit",
+            )
+        if context == "join" and rpc_message == "FILTER_INCLUDE_EMPTY":
+            return PermanentGatewayError(
+                "папка Telegram больше не содержит выбранный чат",
+                code="target_unavailable",
             )
         reaction_unavailable = (
             errors.BroadcastForbiddenError,
@@ -3425,7 +3710,7 @@ class TelethonGateway:
         if context == "verify" and isinstance(exc, errors.ChannelPrivateError):
             return PermanentGatewayError(
                 "аккаунт потерял доступ к чату после отправки",
-                code="account_banned_in_chat",
+                code="account_chat_access_lost",
             )
         # Account-level restrictions surface across many chats at once (usually a
         # @SpamBot restriction). Treat them as recoverable but cool the account down.
@@ -3444,9 +3729,17 @@ class TelethonGateway:
                 retry_after=restriction_wait,
                 code="account_restricted",
             )
-        if isinstance(exc, errors.UserBannedInChannelError):
+        if (
+            isinstance(exc, errors.UserBannedInChannelError)
+            or rpc_message == "USER_BANNED_IN_CHANNEL"
+        ):
             return PermanentGatewayError(
                 f"{context}: {type(exc).__name__}", code="account_banned_in_chat"
+            )
+        if isinstance(exc, errors.UserNotParticipantError) or rpc_message == "USER_NOT_PARTICIPANT":
+            return PermanentGatewayError(
+                "аккаунт ещё не состоит в этом чате",
+                code="target_not_joined",
             )
         if isinstance(exc, errors.InviteRequestSentError):
             return PermanentGatewayError(
@@ -3507,6 +3800,15 @@ class TelethonGateway:
                 retry_after=restriction_wait,
                 code="account_restricted",
             )
+        premium_emoji_errors = (errors.EmojiInvalidError, errors.EmoticonInvalidError)
+        if isinstance(exc, premium_emoji_errors) or rpc_message in {
+            "EMOJI_INVALID",
+            "EMOTICON_INVALID",
+        }:
+            return PermanentGatewayError(
+                f"{context}: Telegram не принял Premium Emoji",
+                code="premium_emoji_unavailable",
+            )
         content_forbidden = (
             errors.ChatSendGameForbiddenError,
             errors.ChatSendGifsForbiddenError,
@@ -3542,34 +3844,44 @@ class TelethonGateway:
                 f"{context}: выбранный тип медиа запрещён в чате",
                 code="content_forbidden",
             )
-        # Account-specific chat failures should switch to another selected sender.
-        account_target_blocked = (
+        # Telegram emits several access denials that historically all appeared
+        # as ``account_banned_in_chat``. They should fail over to another
+        # sender, but none of them proves a moderator ban.
+        account_send_forbidden = (
             errors.ChatWriteForbiddenError,
             errors.ChatGuestSendForbiddenError,
             errors.ChatSendPlainForbiddenError,
-            errors.ChatForbiddenError,
             errors.ChatRestrictedError,
-            errors.ChannelPrivateError,
-            errors.UserNotParticipantError,
-            errors.UserBlockedError,
-            errors.UserIsBlockedError,
-            errors.YouBlockedUserError,
         )
-        account_target_blocked_names = {
-            "CHANNEL_PRIVATE",
-            "CHAT_FORBIDDEN",
+        account_send_forbidden_names = {
             "CHAT_GUEST_SEND_FORBIDDEN",
             "CHAT_RESTRICTED",
             "CHAT_SEND_PLAIN_FORBIDDEN",
             "CHAT_WRITE_FORBIDDEN",
-            "USER_BANNED_IN_CHANNEL",
+        }
+        if isinstance(exc, account_send_forbidden) or rpc_message in account_send_forbidden_names:
+            return PermanentGatewayError(
+                f"{context}: {type(exc).__name__}", code="account_send_forbidden"
+            )
+        account_access_forbidden = (
+            errors.ChatForbiddenError,
+            errors.ChannelPrivateError,
+            errors.UserBlockedError,
+            errors.UserIsBlockedError,
+            errors.YouBlockedUserError,
+        )
+        account_access_forbidden_names = {
+            "CHANNEL_PRIVATE",
+            "CHAT_FORBIDDEN",
             "USER_IS_BLOCKED",
-            "USER_NOT_PARTICIPANT",
             "YOU_BLOCKED_USER",
         }
-        if isinstance(exc, account_target_blocked) or rpc_message in account_target_blocked_names:
+        if (
+            isinstance(exc, account_access_forbidden)
+            or rpc_message in account_access_forbidden_names
+        ):
             return PermanentGatewayError(
-                f"{context}: {type(exc).__name__}", code="account_banned_in_chat"
+                f"{context}: {type(exc).__name__}", code="account_chat_access_forbidden"
             )
         if isinstance(exc, errors.ChatAdminRequiredError) or rpc_message == "CHAT_ADMIN_REQUIRED":
             return PermanentGatewayError(
@@ -3619,10 +3931,11 @@ class TelethonGateway:
             return PermanentGatewayError(f"{context}: {rpc_message}", code="target_unavailable")
         if isinstance(exc, errors.ForbiddenError):
             # An unknown 403 is safer to scope to this account-chat pair. A
-            # replacement account may still have access; two blocked routes will
-            # quarantine the chat through the normal quality score.
+            # replacement account may still have access. Telegram did not
+            # confirm a moderator ban, so preserve that fact in reports and
+            # target-quality scoring.
             return PermanentGatewayError(
-                f"{context}: {type(exc).__name__}", code="account_banned_in_chat"
+                f"{context}: {type(exc).__name__}", code="account_chat_access_forbidden"
             )
         if isinstance(exc, errors.RPCError):
             if rpc_code in {400, 404}:

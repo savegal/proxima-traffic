@@ -34,8 +34,15 @@ ACCOUNT_WIDE_CODES = ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES
 
 ACCOUNT_CHAT_BLOCK_CODES = frozenset(
     {
+        # ``USER_BANNED_IN_CHANNEL`` is the only Telegram signal in this group
+        # that confirms an actual ban.  The remaining codes mean a route is
+        # unusable for now, but must not be presented to an operator as a ban.
         "account_banned_in_chat",
+        "account_chat_access_forbidden",
+        "account_chat_access_lost",
+        "account_missing_post_rights",
         "account_missing_admin_rights",
+        "account_send_forbidden",
     }
 )
 
@@ -44,6 +51,7 @@ ACCOUNT_CHAT_BLOCK_CODES = frozenset(
 ACCOUNT_TARGET_BLOCK_CODES = ACCOUNT_CHAT_BLOCK_CODES | frozenset(
     {
         "account_join_limit",
+        "account_chatlist_limit",
         "join_request_pending",
         "target_not_joined",
     }
@@ -63,6 +71,7 @@ CONTENT_FAILURE_CODES = frozenset(
     {
         "comment_invalid",
         "content_forbidden",
+        "premium_emoji_unavailable",
         "reaction_invalid",
         "reaction_unavailable",
         "request_invalid",
@@ -78,6 +87,7 @@ TRANSIENT_CODES = frozenset(
         "join_throttled",
         "network_error",
         "proxy_unavailable",
+        "reaction_delivery_unconfirmed",
         "rpc_error",
         "slow_mode",
     }
@@ -87,19 +97,31 @@ OBSERVED_TARGET_FAILURE_CODES = ACCOUNT_TARGET_BLOCK_CODES | TARGET_FAILURE_CODE
 
 _FAILURE_LABELS = {
     "album_duplicate": "элемент альбома обработан общим комментарием",
-    "account_banned_in_chat": "аккаунт заблокирован или ограничен в этом чате",
+    "account_banned_in_chat": "Telegram подтвердил бан аккаунта в этом чате",
+    "account_chat_access_forbidden": (
+        "Telegram запретил этому аккаунту действие в чате (бан не подтверждён)"
+    ),
+    "account_chat_access_lost": (
+        "после отправки аккаунт потерял доступ к чату (бан не подтверждён)"
+    ),
+    "account_chatlist_limit": "аккаунт достиг лимита папок Telegram для вступления",
     "account_dead": "сессия или API-данные аккаунта недействительны",
     "account_join_limit": "аккаунт достиг лимита групп и каналов Telegram",
     "account_missing_admin_rights": "аккаунту не хватает требуемых прав в чате",
+    "account_missing_post_rights": "аккаунту не выдано право публиковать в канале",
     "account_operation_busy": "аккаунт занят другой операцией",
     "account_pacing": "отправка отложена безопасным лимитом аккаунта",
     "account_paused": "аккаунт поставлен на паузу",
     "account_restricted": "Telegram временно ограничил аккаунт",
+    "account_send_forbidden": (
+        "этому аккаунту сейчас запрещено писать в чате (бан не подтверждён)"
+    ),
     "account_unauthorized": "аккаунт больше не авторизован",
     "cancel_requested": "операция останавливается по запросу",
     "cancelled": "операция отменена",
     "cancelled_before_send": "операция отменена до отправки",
     "cancelled_outcome_unknown": "операция отменена, но результат Telegram неизвестен",
+    "capacity_window_exceeded": "аккаунт не успевает отправить до конца active-окна",
     "channel_has_no_posts": "в канале пока нет доступных публикаций",
     "channel_preflight_timeout": "проверка канала не ответила вовремя",
     "channel_required": "выбранный адрес больше не является каналом",
@@ -147,11 +169,13 @@ _FAILURE_LABELS = {
     "network_error": "временная сетевая ошибка",
     "participant_reaction_timeout": "авто-реакция не завершилась вовремя",
     "peer_flood": "Telegram ограничил активность аккаунта",
+    "premium_emoji_unavailable": "Telegram не принял Premium Emoji в сообщении",
     "post_deleted_by_moderation": "публикация удалена модерацией сразу после отправки",
     "primary_account_auto_replaced": "основной аккаунт автоматически заменён",
     "preflight_dialogue_not_ready": "не все аккаунты диалога готовы к этому чату",
+    "preflight_account_cooldown": "аккаунт временно на защитной паузе Telegram",
     "preflight_failed": "проверка готовности не пройдена",
-    "preflight_independent_not_ready": "не все независимые отправители готовы к этому чату",
+    "preflight_independent_not_ready": "этот аккаунт не готов к отправке в этот чат",
     "preflight_no_ready_sender": "нет готового отправителя для этого чата",
     "primary_account_replaced": "основной аккаунт правила был заменён",
     "proxy_unavailable": "не найден рабочий прокси для аккаунта",
@@ -166,8 +190,13 @@ _FAILURE_LABELS = {
     "recipient_unavailable": "получатель удалён или больше недоступен",
     "recipient_unresolvable": "получателя нельзя безопасно разрешить по сохранённым данным",
     "reaction_invalid": "выбранная реакция некорректна",
+    "reaction_delivery_unconfirmed": (
+        "Telegram принял реакцию, но не подтвердил её отображение"
+    ),
     "reaction_timeout": "реакция не завершилась вовремя",
-    "reaction_unavailable": "реакции для сообщения или аккаунта недоступны",
+    "reaction_unavailable": (
+        "выбранная реакция запрещена в этом сообщении или недоступна аккаунту"
+    ),
     "reactions_disabled": "реакции отключены в настройках",
     "reactor_removed_from_rule": "аккаунт удалён из выбранного пула реакций",
     "reactor_unavailable": "нет доступного аккаунта для реакции",
@@ -192,15 +221,34 @@ _FAILURE_HINTS = {
     "account_banned_in_chat": (
         "Сервис исключит только эту пару аккаунт–чат и попробует другого отправителя."
     ),
+    "account_chat_access_forbidden": (
+        "Сервис исключит только эту пару аккаунт–чат; это не считается подтверждённым баном."
+    ),
+    "account_chat_access_lost": (
+        "Проверьте доступ к чату: Telegram не уточнил причину, поэтому бан не подтверждён."
+    ),
+    "account_chatlist_limit": (
+        "Освободите слот папки Telegram либо используйте прямую ссылку на публичный чат."
+    ),
     "account_dead": "Перепроверьте или заново импортируйте сессию этого аккаунта.",
     "account_join_limit": "Используйте другой аккаунт или освободите место в списке каналов.",
     "account_missing_admin_rights": "Выдайте аккаунту необходимые права или выберите другого.",
+    "account_missing_post_rights": (
+        "Выдайте право публиковать в канале или выберите группу для обычной рассылки."
+    ),
     "account_operation_busy": "Сервис повторит операцию после освобождения аккаунта.",
     "account_pacing": "Ничего делать не нужно: сервис продолжит автоматически.",
     "account_restricted": "Аккаунт поставлен на паузу и будет перепроверен автоматически.",
+    "account_send_forbidden": (
+        "Сервис исключит только эту пару; это может быть режим чата или ограничение прав."
+    ),
     "account_unauthorized": "Заново импортируйте сессию аккаунта.",
     "cancelled_outcome_unknown": (
         "Проверьте сообщение в Telegram перед ручным повтором, чтобы не создать дубль."
+    ),
+    "capacity_window_exceeded": (
+        "Увеличьте срок active-рассылки, уменьшите объём либо дождитесь освобождения "
+        "лимита аккаунта."
     ),
     "channel_preflight_timeout": "Повторите проверку позже; остальные каналы продолжат работу.",
     "channel_scan_timeout": "Сервис повторит проверку; остальные правила не остановятся.",
@@ -243,6 +291,16 @@ _FAILURE_HINTS = {
     ),
     "invite_reservation_lost": "Запись не будет приглашена повторно в этом запуске.",
     "media_unavailable": "Загрузите файл заново или удалите его из варианта публикации.",
+    "premium_emoji_unavailable": (
+        "Проверьте, что Emoji ещё доступен и выбранный аккаунт может его использовать."
+    ),
+    "reaction_delivery_unconfirmed": (
+        "Сервис повторит ту же реакцию: для одного аккаунта это безопасно и не создаст дубль."
+    ),
+    "reaction_unavailable": (
+        "Обычно в чате выключены реакции или выбранный Emoji не разрешён; "
+        "публикация уже отправлена и другие чаты продолжат работу."
+    ),
     "membership_gate_verification_failed": "Проверьте требования бота-модератора вручную.",
     "network_error": "Сервис повторит операцию автоматически.",
     "post_deleted_by_moderation": "Проверьте правила чата и требования его бота-модератора.",
@@ -250,11 +308,18 @@ _FAILURE_HINTS = {
         "Новый аккаунт прошёл проверку канала; будущие первые комментарии пойдут от него."
     ),
     "preflight_dialogue_not_ready": "Повторите проверку аккаунтов и чатов перед запуском.",
+    "preflight_account_cooldown": (
+        "Дождитесь окончания паузы Telegram или выберите другой готовый аккаунт."
+    ),
     "preflight_failed": "Откройте «Проверить чаты и аккаунты» и устраните указанные причины.",
     "preflight_independent_not_ready": (
-        "Отключите недоступных отправителей или восстановите доступ."
+        "Проверьте доступ именно этой пары аккаунт–чат; остальные готовые пары продолжают работу."
     ),
     "preflight_no_ready_sender": "Добавьте рабочий аккаунт или восстановите доступ к чату.",
+    "sender_unavailable": (
+        "Аккаунт отключён или его сессия недействительна; заново импортируйте tdata "
+        "либо исключите его из рассылки."
+    ),
     "proxy_unavailable": (
         "Автозамена проверила все включённые прокси, но рабочего варианта не нашла. "
         "Добавьте или включите рабочий HTTP(S)/SOCKS5-прокси."
@@ -273,7 +338,6 @@ _FAILURE_HINTS = {
     "recipient_reservation_lost": "Запись не будет отправлена повторно.",
     "recipient_unavailable": "Обновите базу; запись останется недоступной для новых запусков.",
     "recipient_unresolvable": "Нужен актуальный username или доступ аккаунта к общему чату.",
-    "reaction_unavailable": "Основная публикация продолжит работу; будет пропущена только реакция.",
     "reactor_removed_from_rule": (
         "Задача отменена до отправки: правило теперь использует другой набор аккаунтов."
     ),
@@ -291,8 +355,11 @@ _FAILURE_HINTS = {
 }
 
 # A channel-comment rule normally has a fixed route and pauses on permanent
-# account/channel failures. Rules that explicitly enable sender replacement may
-# fail over before their first comment, after the replacement passes preflight.
+# account/channel or fixed-content failures. Rules that explicitly enable
+# sender replacement may fail over before their first comment, after the
+# replacement passes preflight. A missing attachment or an unsupported media
+# type would fail identically for every new post, so keeping the rule active
+# would only produce repeated Telegram errors.
 CHANNEL_COMMENT_AUTO_PAUSE_CODES = (
     ACCOUNT_FATAL_CODES
     | ACCOUNT_CHAT_BLOCK_CODES
@@ -301,7 +368,11 @@ CHANNEL_COMMENT_AUTO_PAUSE_CODES = (
             "account_join_limit",
             "account_paused",
             "channel_required",
+            "comment_invalid",
+            "content_forbidden",
             "join_request_pending",
+            "media_unavailable",
+            "premium_emoji_unavailable",
             "sender_unavailable",
             "target_not_joined",
             "target_unavailable",

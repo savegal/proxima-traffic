@@ -31,6 +31,7 @@ from proxima_traffic.models import (
     ProxyProtocol,
     ProxyStatus,
     Subscriber,
+    SubscriberList,
     SubscriberSegment,
     utc_now,
 )
@@ -81,10 +82,12 @@ class CapturingDirectGateway(DryRunGateway):
         super().__init__()
         self.direct_sender_ids: list[int] = []
         self.direct_texts: list[str] = []
+        self.direct_html_texts: list[str | None] = []
 
     async def send_direct_content(self, **kwargs):
         self.direct_sender_ids.append(int(kwargs["account"].id))
         self.direct_texts.append(str(kwargs["text"]))
+        self.direct_html_texts.append(kwargs["html_text"])
         return await super().send_direct_content(**kwargs)
 
 
@@ -145,6 +148,26 @@ def test_jsonl_reader_supports_gzip_and_multipart_zip(tmp_path: Path) -> None:
     assert [item.telegram_user_id for item in iter_subscriber_records(zip_path)] == [2002, 2003]
 
 
+def test_multipart_zip_strips_a_bom_from_each_jsonl_member(tmp_path: Path) -> None:
+    zip_path = tmp_path / "bom-subscribers.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(
+            "part-1.jsonl",
+            b'\xef\xbb\xbf{"telegram_id":"2101","username":"member_one","is_premium":false}\n',
+        )
+        archive.writestr(
+            "part-2.jsonl",
+            b'\xef\xbb\xbf{"telegram_id":"2102","username":"member_two","is_premium":true}\n',
+        )
+    stats = SubscriberParseStats()
+
+    records = list(iter_subscriber_records(zip_path, stats=stats))
+
+    assert [record.telegram_user_id for record in records] == [2101, 2102]
+    assert stats.valid_records == 2
+    assert stats.invalid == 0
+
+
 @pytest.mark.asyncio
 async def test_large_import_is_batched_idempotent_and_segmented(tmp_path: Path) -> None:
     settings = _settings(tmp_path, "large-import.db")
@@ -192,6 +215,59 @@ async def test_large_import_is_batched_idempotent_and_segmented(tmp_path: Path) 
     assert second.subscriber_list.member_count == 2_005
     async with database.session_factory() as session:
         assert int(await session.scalar(select(func.count(Subscriber.id))) or 0) == 2_005
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_subscriber_import_refreshes_segment_counts_in_every_list(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, "shared-list-counts.db")
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = DryRunGateway()
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    service = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct",
+    )
+    first_source = tmp_path / "first.jsonl"
+    first_source.write_text(
+        '{"telegram_id":"330001","username":"shared_member"}\n',
+        encoding="utf-8",
+    )
+    second_source = tmp_path / "second.jsonl"
+    second_source.write_text(
+        '{"telegram_id":"330001","username":"shared_member","is_premium":true}\n',
+        encoding="utf-8",
+    )
+
+    first = await service.import_subscribers(
+        first_source,
+        list_name="Первый список",
+        source_filename=first_source.name,
+    )
+    second = await service.import_subscribers(
+        second_source,
+        list_name="Второй список",
+        source_filename=second_source.name,
+    )
+
+    async with database.session_factory() as session:
+        stored_lists = {
+            item.id: item
+            for item in await session.scalars(
+                select(SubscriberList).where(
+                    SubscriberList.id.in_([first.subscriber_list.id, second.subscriber_list.id])
+                )
+            )
+        }
+    assert stored_lists[first.subscriber_list.id].premium_count == 1
+    assert stored_lists[first.subscriber_list.id].non_premium_count == 0
+    assert stored_lists[second.subscriber_list.id].premium_count == 1
     await database.dispose()
 
 
@@ -393,8 +469,8 @@ async def test_direct_sender_selection_avoids_an_account_reserved_by_another_wor
         recipient_limit=1,
         contact_cooldown_days=30,
         account_ids=[reserved.id, available.id],
-        text="{Prepared|Ready} post",
-        html_text=None,
+        text="{Prepared|Ready} ⭐",
+        html_text='{Prepared|Ready} <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>',
         media_path=None,
         media_kind=None,
         media_name=None,
@@ -409,7 +485,13 @@ async def test_direct_sender_selection_avoids_an_account_reserved_by_another_wor
     assert task.sender_account_id == available.id
     assert gateway.direct_sender_ids == [available.id]
     assert gateway.direct_texts == [
-        render_spintax("{Prepared|Ready} post", seed=f"direct-message:{task.id}")
+        render_spintax("{Prepared|Ready} ⭐", seed=f"direct-message:{task.id}")
+    ]
+    assert gateway.direct_html_texts == [
+        render_spintax(
+            '{Prepared|Ready} <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>',
+            seed=f"direct-message:{task.id}",
+        )
     ]
     await database.dispose()
 

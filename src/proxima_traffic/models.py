@@ -16,11 +16,14 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    case,
+    func,
+    select,
 )
 from sqlalchemy import (
     text as sql_text,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
 
 def utc_now() -> datetime:
@@ -470,6 +473,28 @@ class Campaign(Base):
     reply_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id"), nullable=True)
     target_list_id: Mapped[int | None] = mapped_column(ForeignKey("target_lists.id"), nullable=True)
+    audience_label: Mapped[str | None] = column_property(
+        case(
+            (
+                target_id.is_not(None),
+                select(Target.title).where(Target.id == target_id).scalar_subquery(),
+            ),
+            else_=select(TargetList.name).where(TargetList.id == target_list_id).scalar_subquery(),
+        )
+    )
+    audience_target_count: Mapped[int] = column_property(
+        case(
+            (target_id.is_not(None), 1),
+            else_=select(func.count(TargetListItem.id))
+            .join(Target, Target.id == TargetListItem.target_id)
+            .where(
+                TargetListItem.target_list_id == target_list_id,
+                TargetListItem.enabled.is_(True),
+                Target.quality_status != "bad",
+            )
+            .scalar_subquery(),
+        )
+    )
     primary_text: Mapped[str] = mapped_column(Text)
     primary_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     primary_media_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -483,6 +508,7 @@ class Campaign(Base):
     repeat_count: Mapped[int] = mapped_column(Integer, default=1)
     repeat_interval_seconds: Mapped[int] = mapped_column(Integer, default=0)
     smart_timer_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    repeat_forever: Mapped[bool] = mapped_column(Boolean, default=False)
     smart_duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
     smart_no_timer_interval_seconds: Mapped[int] = mapped_column(Integer, default=900)
     auto_sender_failover: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -531,6 +557,8 @@ class CampaignRun(Base):
             "notification_next_attempt_at",
         ),
         Index("ix_campaign_runs_lease_fence", "status", "lease_owner", "lease_token"),
+        Index("ix_campaign_runs_due", "status", "scheduled_for", "id"),
+        Index("ix_campaign_runs_expired_lease", "status", "lease_until"),
         Index("ix_campaign_runs_archive", "archived_at", "id"),
     )
 
@@ -540,6 +568,7 @@ class CampaignRun(Base):
     sender_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     cycle_index: Mapped[int] = mapped_column(Integer, default=0)
     repeat_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    repeat_forever_snapshot: Mapped[bool] = mapped_column(Boolean, default=False)
     request_key: Mapped[str] = mapped_column(String(64))
     launch_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[RunStatus] = mapped_column(
@@ -1263,12 +1292,14 @@ class ChannelCommentRule(Base):
     primary_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     auto_replace_primary_account: Mapped[bool] = mapped_column(Boolean, default=False)
     primary_text: Mapped[str] = mapped_column(Text)
+    primary_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     primary_media_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     primary_media_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
     primary_media_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     primary_media_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dialogue_steps_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     message_edit_initial_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    message_edit_initial_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     message_edit_delay_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reactions_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     reaction_count: Mapped[int] = mapped_column(Integer, default=0)

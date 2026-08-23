@@ -80,6 +80,8 @@ def create_app(
         runner,
         allow_auto_join=resolved_settings.account_auto_join,
         require_live_session=not resolved_settings.dry_run,
+        max_pairs=resolved_settings.preflight_max_pairs,
+        account_concurrency=resolved_settings.preflight_account_concurrency,
     )
     delayed_delivery_monitor = DelayedDeliveryMonitor(
         database.session_factory,
@@ -152,7 +154,7 @@ def create_app(
         spambot_task: asyncio.Task[None] | None = None
         background_tasks.clear()
         if resolved_settings.auto_create_schema:
-            await database.create_schema()
+            await database.migrate_to_head_if_needed()
         await AdminRepository(database.session_factory).ensure_system_account_groups(
             actor="api-startup"
         )

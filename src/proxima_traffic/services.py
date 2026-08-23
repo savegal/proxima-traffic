@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, TypeVar
 from uuid import uuid4
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -210,6 +210,28 @@ class GlobalStopSummary:
         return self.direct_launches + self.subscriber_invite_launches
 
 
+@dataclass(frozen=True, slots=True)
+class CampaignDeliveryStopSummary:
+    """Result of stopping only chat-campaign deliveries from the campaigns screen."""
+
+    queued_runs: int = 0
+    running_runs: int = 0
+    queued_reactions: int = 0
+    running_reactions: int = 0
+
+    @property
+    def run_count(self) -> int:
+        return self.queued_runs + self.running_runs
+
+    @property
+    def reaction_count(self) -> int:
+        return self.queued_reactions + self.running_reactions
+
+    @property
+    def task_count(self) -> int:
+        return self.run_count + self.reaction_count
+
+
 def add_audit_event(
     session: AsyncSession,
     *,
@@ -302,6 +324,12 @@ class CampaignRunner:
     def _pace_max_seconds(self) -> float:
         return max(self._pace_min_seconds, float(self._cfg("account_pace_max_seconds", 0.0)))
 
+    @property
+    def _account_auto_join(self) -> bool:
+        """Whether a known not-yet-member route may be retried through auto-join."""
+
+        return bool(self._cfg("account_auto_join", False))
+
     async def process_step(self, run_id: int, lease_token: str) -> CampaignRun:
         run, campaign, target, sender, _ = await self._load_context(run_id, lease_token)
         if run.cancel_requested:
@@ -309,7 +337,7 @@ class CampaignRunner:
 
         try:
             if campaign.mode == CampaignMode.BROADCAST:
-                if run.repeat_until is not None:
+                if self._is_smart_run(run):
                     return await self._run_with_broadcast_locks(
                         int(sender.id),
                         int(target.id),
@@ -319,7 +347,7 @@ class CampaignRunner:
                     int(sender.id),
                     lambda: self._send_broadcast(run, campaign, sender, target),
                 )
-            if run.repeat_until is not None:
+            if self._is_smart_run(run):
                 return await self._run_with_broadcast_locks(
                     int(sender.id),
                     int(target.id),
@@ -501,7 +529,11 @@ class CampaignRunner:
                             + timedelta(seconds=self._send_reservation_seconds)
                         )
                     )
-                await session.commit()
+                    # The renewal must be committed while the session is still
+                    # open.  Committing after the context manager exits rolls
+                    # the update back on normal AsyncSession cleanup, allowing
+                    # another worker to reclaim an active account mid-send.
+                    await session.commit()
                 if renewed.rowcount != 1:
                     self._signal_lost_reservation(lost_event, owner_task)
                     return
@@ -840,6 +872,14 @@ class CampaignRunner:
                 text=primary_text,
             )
         except Exception as exc:
+            refreshed_membership = await self._retry_stale_auto_join_membership(
+                run=run,
+                account_id=sender.id,
+                target=target,
+                exc=exc,
+            )
+            if refreshed_membership is not None:
+                return refreshed_membership
             rerouted = await self._reroute_broadcast_sender(
                 run, campaign, sender.id, target.id, exc
             )
@@ -921,6 +961,12 @@ class CampaignRunner:
         repeat_until = ensure_utc(run.repeat_until)
         return repeat_until is not None and repeat_until <= utc_now()
 
+    @staticmethod
+    def _is_smart_run(run: CampaignRun) -> bool:
+        """Keep an indefinite smart run distinct from an ordinary one-pass task."""
+
+        return bool(run.repeat_forever_snapshot or ensure_utc(run.repeat_until) is not None)
+
     async def _cancel_expired_timer_run(self, run: CampaignRun) -> CampaignRun:
         """Finish a timer-driven run whose launch window has ended before sending."""
         async with self._session_factory() as session:
@@ -959,7 +1005,8 @@ class CampaignRunner:
     ) -> None:
         """Create one next post per chat, scheduled at its first allowed time."""
         repeat_until = ensure_utc(run.repeat_until)
-        if repeat_until is None or run.cancel_requested:
+        repeat_forever = bool(run.repeat_forever_snapshot)
+        if (repeat_until is None and not repeat_forever) or run.cancel_requested:
             return
 
         no_timer_interval = (
@@ -975,6 +1022,7 @@ class CampaignRunner:
                 target_id,
                 completed_at,
                 repeat_until,
+                repeat_forever,
                 no_timer_interval,
             )
             return
@@ -1007,7 +1055,7 @@ class CampaignRunner:
             except ConflictError:
                 continue
             timing = timing_by_account.get(candidate_id)
-            if timing is not None and timing.send_blocked:
+            if not self._broadcast_route_is_eligible(timing):
                 continue
             known_next_send = ensure_utc(timing.next_send_at) if timing is not None else None
             activity_aware = run.activity_aware_snapshot is True or (
@@ -1061,7 +1109,7 @@ class CampaignRunner:
             candidates,
             key=lambda item: (item[0], item[1]),
         )
-        if scheduled_for >= repeat_until:
+        if repeat_until is not None and scheduled_for >= repeat_until:
             return
 
         launch_key = run.launch_key
@@ -1084,6 +1132,7 @@ class CampaignRunner:
             max_attempts=run.max_attempts,
             scheduled_for=scheduled_for,
             repeat_until=repeat_until,
+            repeat_forever_snapshot=repeat_forever,
             primary_text_snapshot=next_variant.text,
             primary_html_snapshot=next_variant.html_text,
             hidden_mentions_enabled_snapshot=run.hidden_mentions_enabled_snapshot,
@@ -1119,7 +1168,8 @@ class CampaignRunner:
             details={
                 "next_cycle": next_run.cycle_index,
                 "scheduled_for": scheduled_for.isoformat(),
-                "repeat_until": repeat_until.isoformat(),
+                "repeat_until": repeat_until.isoformat() if repeat_until is not None else None,
+                "repeat_forever": repeat_forever,
                 "sender_account_id": next_account_id,
                 "content_variant_id": next_variant.variant_id,
                 "content_variant_name": next_variant.name,
@@ -1134,7 +1184,8 @@ class CampaignRunner:
         campaign: Campaign,
         target_id: int,
         completed_at: datetime,
-        repeat_until: datetime,
+        repeat_until: datetime | None,
+        repeat_forever: bool,
         no_timer_interval: int,
     ) -> None:
         """Schedule the next complete dialogue chain for one destination chat."""
@@ -1210,7 +1261,7 @@ class CampaignRunner:
                 required_start = ready_at - timedelta(seconds=cumulative_delay)
                 if required_start > scheduled_for:
                     scheduled_for = required_start
-        if scheduled_for >= repeat_until:
+        if repeat_until is not None and scheduled_for >= repeat_until:
             return
 
         launch_key = run.launch_key or run.request_key
@@ -1227,6 +1278,7 @@ class CampaignRunner:
             max_attempts=run.max_attempts,
             scheduled_for=scheduled_for,
             repeat_until=repeat_until,
+            repeat_forever_snapshot=repeat_forever,
             primary_text_snapshot=run.primary_text_snapshot,
             hidden_mentions_enabled_snapshot=run.hidden_mentions_enabled_snapshot,
             mention_cooldown_days_snapshot=run.mention_cooldown_days_snapshot,
@@ -1254,7 +1306,8 @@ class CampaignRunner:
             details={
                 "next_cycle": next_run.cycle_index,
                 "scheduled_for": scheduled_for.isoformat(),
-                "repeat_until": repeat_until.isoformat(),
+                "repeat_until": repeat_until.isoformat() if repeat_until is not None else None,
+                "repeat_forever": repeat_forever,
                 "dialogue_steps": len(steps),
                 "first_account_id": first_account_id,
             },
@@ -1341,7 +1394,7 @@ class CampaignRunner:
                         TargetAccountState.target_id == target_id,
                     )
                 )
-                if timing is not None and timing.send_blocked:
+                if not self._broadcast_route_is_eligible(timing):
                     continue
                 known_next_send = ensure_utc(timing.next_send_at) if timing is not None else None
                 if known_next_send is not None and known_next_send > scheduled_for:
@@ -1354,8 +1407,48 @@ class CampaignRunner:
 
             scheduled_for, candidate = replacement
             repeat_until = ensure_utc(stored.repeat_until)
-            if repeat_until is not None and scheduled_for > repeat_until:
-                scheduled_for = repeat_until
+            if repeat_until is not None and scheduled_for >= repeat_until:
+                # A replacement that only becomes available after the active
+                # window ends is not a real failover.  Do not requeue it at
+                # ``repeat_until`` just for the worker to claim and cancel it
+                # later: that made active launches look as though they had
+                # silently stalled.
+                stored.status = RunStatus.CANCELLED
+                stored.error = None
+                stored.error_code = "repeat_window_elapsed"
+                stored.finished_at = utc_now()
+                self._release_lease(stored)
+                session.add(
+                    ActionLog(
+                        run_id=stored.id,
+                        account_id=failed_account_id,
+                        target_id=target_id,
+                        kind=ActionKind.PRIMARY_MESSAGE,
+                        status=ActionStatus.FAILED,
+                        text=self._primary_text(run, campaign),
+                        error=safe_error_message(exc),
+                        attempt_number=run.attempt_count,
+                        lease_token=run.lease_token,
+                    )
+                )
+                await self.refresh_target_quality(session, target_id)
+                add_audit_event(
+                    session,
+                    event_type="run.sender_failover_outside_window",
+                    entity_type="campaign_run",
+                    entity_id=stored.id,
+                    details={
+                        "error_code": code,
+                        "failed_account_id": failed_account_id,
+                        "replacement_account_id": candidate.id,
+                        "replacement_available_at": scheduled_for.isoformat(),
+                        "repeat_until": repeat_until.isoformat(),
+                    },
+                    actor="worker",
+                )
+                await session.commit()
+                await session.refresh(stored)
+                return stored
             stored.sender_account_id = candidate.id
             stored.status = RunStatus.QUEUED
             stored.scheduled_for = scheduled_for
@@ -1376,6 +1469,7 @@ class CampaignRunner:
                     lease_token=run.lease_token,
                 )
             )
+            await self.refresh_target_quality(session, target_id)
             add_audit_event(
                 session,
                 event_type="run.sender_failed_over",
@@ -1392,6 +1486,80 @@ class CampaignRunner:
             await session.commit()
             await session.refresh(stored)
             return stored
+
+    async def _retry_stale_auto_join_membership(
+        self,
+        *,
+        run: CampaignRun,
+        account_id: int,
+        target: Target,
+        exc: BaseException,
+    ) -> CampaignRun | None:
+        """Retry one cached-membership miss through the guarded auto-join path.
+
+        A long-running active campaign keeps resolved Telegram peers cached.
+        If Telegram removes an account from a chat after a successful send,
+        the cached peer can surface ``USER_NOT_PARTICIPANT`` on the next
+        publication.  With auto-join enabled this is recoverable once: clear
+        only that cache entry and let the normal, rate-limited join flow run on
+        the retry.  A non-cached miss still follows the normal permanent route
+        policy, so private/basic chats cannot spin forever.
+        """
+
+        if not self._account_auto_join or failure_code(exc, "") != "target_not_joined":
+            return None
+        invalidator = getattr(self._gateway, "invalidate_target_membership", None)
+        if not callable(invalidator):
+            return None
+        try:
+            had_cached_membership = bool(
+                await invalidator(account_id=account_id, target=target)
+            )
+        except Exception:  # noqa: BLE001 - keep the original Telegram error authoritative
+            logger.warning(
+                "Could not invalidate cached membership for account %s target %s",
+                account_id,
+                target.id,
+                exc_info=True,
+            )
+            return None
+        if not had_cached_membership:
+            return None
+        async with self._session_factory() as session:
+            return await self._defer_run(
+                session,
+                run,
+                utc_now() + timedelta(seconds=30),
+                reason="target_not_joined",
+            )
+
+    def _broadcast_route_is_eligible(self, state: TargetAccountState | None) -> bool:
+        """Keep recurring and failover sends on a route preflight proved usable.
+
+        Smart launches can live for days, so this intentionally does not impose
+        the short *fresh preflight* TTL used at initial enqueue. It does however
+        honour any later knowledge that a particular account cannot write to the
+        particular chat, rather than spending a Telegram request on a known-bad
+        pair.
+        """
+
+        if state is None:
+            return True
+        if state.send_blocked:
+            return False
+        # Older launches and timer-only records do not carry a membership
+        # observation. They are not evidence of an unusable route, so retain
+        # the historical behaviour for them. A real preflight result is
+        # always present in LIVE mode and is handled strictly below.
+        if state.membership_checked_at is None:
+            return True
+        if state.membership_status == MembershipStatus.MEMBER and state.can_send is True:
+            return True
+        return bool(
+            self._account_auto_join
+            and state.membership_status == MembershipStatus.NOT_MEMBER
+            and state.membership_error_code == "target_not_joined"
+        )
 
     async def _send_primary(
         self,
@@ -1541,11 +1709,18 @@ class CampaignRunner:
         content_key = f"{run.request_key}:{idempotency_suffix}"
         idempotency_key = self._transport_idempotency_key(run, content_key)
         step_text = self._render_delivery_text(step.text, idempotency_key=content_key)
+        step_html = (
+            self._render_delivery_text(step.html_text, idempotency_key=content_key)
+            if step.html_text is not None
+            else None
+        )
         try:
             content_sender = getattr(self._gateway, "send_content", None)
             if content_sender is None:
-                if step.media_path is not None:
-                    raise ConflictError("настроенный шлюз не поддерживает медиа в цепочках диалога")
+                if step.media_path is not None or step_html is not None:
+                    raise ConflictError(
+                        "настроенный шлюз не поддерживает форматирование или медиа в цепочках"
+                    )
                 sent = await self._gateway.send_message(
                     account=sender,
                     target=target,
@@ -1560,6 +1735,7 @@ class CampaignRunner:
                     text=step_text,
                     idempotency_key=idempotency_key,
                     reply_to_message_id=reply_to_message_id,
+                    html_text=step_html,
                     media_path=step.media_path,
                     media_kind=step.media_kind,
                     media_name=step.media_name,
@@ -2124,6 +2300,16 @@ class CampaignRunner:
         state.last_success_at = now
         state.last_message_id = message_id
         state.last_error = None
+        # A successful delivery is stronger and newer evidence than the
+        # read-only preflight.  In particular, turn a previously joinable
+        # route into a confirmed member route after the live auto-join.
+        state.membership_status = MembershipStatus.MEMBER
+        state.can_send = True
+        state.membership_checked_at = now
+        state.membership_error_code = None
+        state.send_blocked = False
+        state.blocked_reason = None
+        state.blocked_at = None
 
     async def _record_target_failure(
         self,
@@ -3102,7 +3288,7 @@ class CampaignRunner:
         message_id: int,
         *,
         dialogue_step: int,
-    ) -> None:
+    ) -> int:
         """Queue optional ordinary reactions without affecting source delivery."""
         if (
             not campaign.reactions_enabled
@@ -3112,9 +3298,20 @@ class CampaignRunner:
                 and campaign.reaction_dialogue_step != dialogue_step
             )
         ):
-            return
+            return 0
         if campaign.mode == CampaignMode.DIALOGUE:
             candidates = [step.account_id for step in self._dialogue_steps(run, campaign)]
+        elif run.sender_mode_snapshot == BroadcastSenderMode.INDEPENDENT:
+            # An independent run snapshots its one fixed *sender*.  Reusing
+            # that value for reactions leaves no reactor after the source is
+            # excluded, so take the campaign's explicitly configured pool.
+            candidates = list(
+                await session.scalars(
+                    select(CampaignAccount.account_id)
+                    .where(CampaignAccount.campaign_id == campaign.id)
+                    .order_by(CampaignAccount.id)
+                )
+            )
         elif run.sender_pool_snapshot_json:
             try:
                 candidates = [int(value) for value in json.loads(run.sender_pool_snapshot_json)]
@@ -3134,7 +3331,7 @@ class CampaignRunner:
             )
         )
         if not unique_ids:
-            return
+            return 0
         rotation = int.from_bytes(
             hashlib.sha256(f"reaction-pool:{run.id}:{message_id}".encode()).digest()[:4],
             "big",
@@ -3157,6 +3354,14 @@ class CampaignRunner:
                 )
             )
         )
+        now = utc_now()
+        auto_joinable_reactor_ids = {
+            int(state.account_id)
+            for state in route_states
+            if self._account_auto_join
+            and state.membership_status == MembershipStatus.NOT_MEMBER
+            and state.membership_error_code == "target_not_joined"
+        }
         blocked_ids = {
             int(state.account_id)
             for state in route_states
@@ -3167,12 +3372,38 @@ class CampaignRunner:
                 in {
                     MembershipStatus.BANNED,
                     MembershipStatus.JOIN_PENDING,
-                    MembershipStatus.NOT_MEMBER,
                     MembershipStatus.UNAVAILABLE,
                 }
             )
+            or (
+                state.membership_checked_at is not None
+                and state.membership_status == MembershipStatus.NOT_MEMBER
+                and int(state.account_id) not in auto_joinable_reactor_ids
+            )
         }
-        now = utc_now()
+        if not self._settings.dry_run:
+            # Broadcast preflight may validate only the selected sender.  Do
+            # not turn an optional reaction into a live membership probe for
+            # every other account: a reactor needs its own fresh ready route.
+            latest_ready_at = now - timedelta(
+                seconds=max(1, int(self._settings.preflight_max_age_seconds))
+            )
+            ready_reactor_ids = {
+                int(state.account_id)
+                for state in route_states
+                if state.membership_status == MembershipStatus.MEMBER
+                and state.can_send is True
+                and (checked_at := ensure_utc(state.membership_checked_at)) is not None
+                and checked_at >= latest_ready_at
+            }
+            ready_reactor_ids.update(
+                int(state.account_id)
+                for state in route_states
+                if int(state.account_id) in auto_joinable_reactor_ids
+                and (checked_at := ensure_utc(state.membership_checked_at)) is not None
+                and checked_at >= latest_ready_at
+            )
+            blocked_ids.update(set(unique_ids) - ready_reactor_ids)
         ordered_ids = sorted(
             unique_ids,
             key=lambda account_id: (
@@ -3187,11 +3418,20 @@ class CampaignRunner:
                 else (True, unique_ids.index(account_id))
             ),
         )
+        existing_reactor_ids = set(
+            await session.scalars(
+                select(ReactionTask.reactor_account_id).where(
+                    ReactionTask.run_id == run.id,
+                    ReactionTask.message_id == message_id,
+                )
+            )
+        )
         created = 0
         for ordinal, account_id in enumerate(ordered_ids):
             if (
                 account_id not in accounts_by_id
                 or account_id in blocked_ids
+                or account_id in existing_reactor_ids
                 or created >= min(10, campaign.reaction_count)
             ):
                 continue
@@ -3231,6 +3471,62 @@ class CampaignRunner:
                 },
                 actor="worker",
             )
+        return created
+
+    async def reconcile_missing_broadcast_reactions(self, campaign_id: int) -> int:
+        """Restore optional reactions omitted by an older scheduler version.
+
+        Only successful broadcast primaries are eligible.  The regular reaction
+        scheduler is idempotent, so this can be safely used after a process
+        restart and never duplicates an existing reactor/message pair.
+        """
+
+        async with self._session_factory() as session:
+            campaign = await session.get(Campaign, campaign_id)
+            if (
+                campaign is None
+                or campaign.mode != CampaignMode.BROADCAST
+                or not campaign.reactions_enabled
+                or campaign.reaction_count < 1
+            ):
+                return 0
+            runs = list(
+                await session.scalars(
+                    select(CampaignRun)
+                    .where(
+                        CampaignRun.campaign_id == campaign_id,
+                        CampaignRun.status == RunStatus.SUCCEEDED,
+                        CampaignRun.primary_message_id.is_not(None),
+                    )
+                    .order_by(CampaignRun.id)
+                )
+            )
+            created = 0
+            for run in runs:
+                target = await session.get(Target, run.target_id)
+                if target is None or run.primary_message_id is None:
+                    continue
+                source_account_id = int(run.sender_account_id or campaign.primary_account_id)
+                created += await self._schedule_reactions(
+                    session,
+                    run,
+                    campaign,
+                    target,
+                    source_account_id,
+                    int(run.primary_message_id),
+                    dialogue_step=1,
+                )
+            if created:
+                add_audit_event(
+                    session,
+                    event_type="reaction.reconciled",
+                    entity_type="campaign",
+                    entity_id=campaign_id,
+                    details={"created": created},
+                    actor="recovery",
+                )
+                await session.commit()
+            return created
 
     @staticmethod
     def _dialogue_step_index(run: CampaignRun, step_count: int) -> int:
@@ -3297,8 +3593,27 @@ class CampaignRunner:
             if run.min_messages_between_posts_snapshot is not None
             else campaign.min_messages_between_posts
         )
+        maximum_wait = (
+            run.visibility_max_wait_seconds_snapshot
+            if run.visibility_max_wait_seconds_snapshot is not None
+            else campaign.visibility_max_wait_seconds
+        )
+        check_interval = (
+            run.activity_check_interval_seconds_snapshot
+            if run.activity_check_interval_seconds_snapshot is not None
+            else campaign.activity_check_interval_seconds
+        )
+        strict_threshold = enabled and minimum > 0 and maximum_wait == 0
         inspector = getattr(self._gateway, "inspect_activity", None)
         if inspector is None:
+            if strict_threshold:
+                async with self._session_factory() as session:
+                    return await self._defer_run(
+                        session,
+                        run,
+                        utc_now() + timedelta(seconds=max(30, check_interval)),
+                        reason="activity_probe_unavailable",
+                    )
             return None
 
         async with self._session_factory() as session:
@@ -3320,7 +3635,7 @@ class CampaignRunner:
         # This condition is global for the chat, not per account. Independent
         # senders stay independent, but they cannot stack another publication
         # while a post made by this service is still the chat's last message.
-        if run.repeat_until is not None and latest_managed_message_id is not None:
+        if self._is_smart_run(run) and latest_managed_message_id is not None:
             try:
                 _, organic_after_latest = await self._inspect_organic_activity(
                     inspector=inspector,
@@ -3338,13 +3653,16 @@ class CampaignRunner:
                     )
                     raise
                 await self.handle_observed_gateway_failure(account.id, target.id, exc)
+                if strict_threshold:
+                    async with self._session_factory() as session:
+                        return await self._defer_run(
+                            session,
+                            run,
+                            utc_now() + timedelta(seconds=max(30, check_interval)),
+                            reason="activity_probe_unavailable",
+                        )
                 organic_after_latest = 0
             if organic_after_latest <= 0:
-                check_interval = (
-                    run.activity_check_interval_seconds_snapshot
-                    if run.activity_check_interval_seconds_snapshot is not None
-                    else campaign.activity_check_interval_seconds
-                )
                 async with self._session_factory() as session:
                     return await self._defer_run(
                         session,
@@ -3352,17 +3670,20 @@ class CampaignRunner:
                         utc_now() + timedelta(seconds=max(30, min(60, check_interval))),
                         reason="chat_idle_last_managed_post",
                     )
+            if strict_threshold and organic_after_latest < minimum:
+                async with self._session_factory() as session:
+                    return await self._defer_run(
+                        session,
+                        run,
+                        utc_now() + timedelta(seconds=max(30, check_interval)),
+                        reason="visibility_wait",
+                    )
 
         if not enabled or minimum <= 0 or state is None or state.last_message_id is None:
             return None
         last_message_id = int(state.last_message_id)
         last_success_at = ensure_utc(state.last_success_at)
 
-        maximum_wait = (
-            run.visibility_max_wait_seconds_snapshot
-            if run.visibility_max_wait_seconds_snapshot is not None
-            else campaign.visibility_max_wait_seconds
-        )
         now = utc_now()
         if (
             maximum_wait > 0
@@ -3395,6 +3716,14 @@ class CampaignRunner:
                 )
                 raise
             await self.handle_observed_gateway_failure(account.id, target.id, exc)
+            if strict_threshold:
+                async with self._session_factory() as session:
+                    return await self._defer_run(
+                        session,
+                        run,
+                        utc_now() + timedelta(seconds=max(30, check_interval)),
+                        reason="activity_probe_unavailable",
+                    )
             # The hard Telegram and operator timers remain authoritative. An
             # unavailable activity probe must not turn a valid launch into a failure.
             return None
@@ -3424,11 +3753,6 @@ class CampaignRunner:
         if messages_after >= minimum:
             return None
 
-        check_interval = (
-            run.activity_check_interval_seconds_snapshot
-            if run.activity_check_interval_seconds_snapshot is not None
-            else campaign.activity_check_interval_seconds
-        )
         resume_at = now + timedelta(seconds=max(30, check_interval))
         if maximum_wait > 0 and last_success_at is not None:
             resume_at = min(
@@ -3580,13 +3904,41 @@ class CampaignRunner:
         stored = await self._require_running_run(session, run.id, run.lease_token)
         if stored.cancel_requested:
             return None
-        stored.status = RunStatus.QUEUED
-        stored.error_code = reason
-        stored.error = None
         repeat_until = ensure_utc(stored.repeat_until)
         dialogue_in_progress = bool(
             stored.dialogue_steps_snapshot_json is not None and stored.dialogue_step_index > 0
         )
+        if (
+            repeat_until is not None
+            and not dialogue_in_progress
+            and resume_at >= repeat_until
+        ):
+            # Do not schedule a task at the exact expiry boundary.  It cannot
+            # send by definition and would only be claimed later to become an
+            # opaque ``repeat_window_elapsed`` cancellation.
+            stored.status = RunStatus.CANCELLED
+            stored.error = None
+            stored.error_code = "repeat_window_elapsed"
+            stored.finished_at = utc_now()
+            self._release_lease(stored)
+            add_audit_event(
+                session,
+                event_type="run.defer_outside_timer_window",
+                entity_type="campaign_run",
+                entity_id=stored.id,
+                details={
+                    "reason": reason,
+                    "resume_at": resume_at.isoformat(),
+                    "repeat_until": repeat_until.isoformat(),
+                },
+                actor="worker",
+            )
+            await session.commit()
+            await session.refresh(stored)
+            return stored
+        stored.status = RunStatus.QUEUED
+        stored.error_code = reason
+        stored.error = None
         stored.scheduled_for = (
             resume_at
             if dialogue_in_progress
@@ -3784,7 +4136,11 @@ class CampaignRunner:
             ):
                 raise ConflictError("для диалога доступен один проход или умный режим")
             if campaign.smart_timer_mode:
-                if not 60 <= campaign.smart_duration_seconds <= 7 * 24 * 3600:
+                if campaign.repeat_forever and campaign.smart_duration_seconds != 0:
+                    raise ConflictError("repeat_forever requires zero smart duration")
+                if not campaign.repeat_forever and not (
+                    60 <= campaign.smart_duration_seconds <= 7 * 24 * 3600
+                ):
                     raise ConflictError("smart duration must be between 1 minute and 7 days")
                 if not 60 <= campaign.smart_no_timer_interval_seconds <= 7 * 24 * 3600:
                     raise ConflictError("no-timer interval must be between 1 minute and 7 days")
@@ -3797,11 +4153,11 @@ class CampaignRunner:
                         raise ConflictError(
                             "activity check interval must be between 30 and 3600 seconds"
                         )
-                    if not 60 <= campaign.visibility_max_wait_seconds <= 7 * 24 * 3600:
+                    if not 0 <= campaign.visibility_max_wait_seconds <= 7 * 24 * 3600:
                         raise ConflictError(
-                            "visibility maximum wait must be between 1 minute and 7 days"
+                            "visibility maximum wait must be between 0 minutes and 7 days"
                         )
-            elif campaign.smart_duration_seconds != 0:
+            elif campaign.smart_duration_seconds != 0 or campaign.repeat_forever:
                 raise ConflictError("smart duration requires timer-driven mode")
             elif campaign.activity_aware:
                 raise ConflictError("адаптивность диалога доступна только в умном режиме")
@@ -3831,7 +4187,11 @@ class CampaignRunner:
                     raise ConflictError("timer-driven broadcasts must have repeat_count equal to 1")
                 if campaign.repeat_interval_seconds != 0 or campaign.spread_seconds != 0:
                     raise ConflictError("timer-driven broadcasts use dedicated timing fields")
-                if not 60 <= campaign.smart_duration_seconds <= 7 * 24 * 3600:
+                if campaign.repeat_forever and campaign.smart_duration_seconds != 0:
+                    raise ConflictError("repeat_forever requires zero smart duration")
+                if not campaign.repeat_forever and not (
+                    60 <= campaign.smart_duration_seconds <= 7 * 24 * 3600
+                ):
                     raise ConflictError("smart duration must be between 1 minute and 7 days")
                 if not 60 <= campaign.smart_no_timer_interval_seconds <= 7 * 24 * 3600:
                     raise ConflictError("no-timer interval must be between 1 minute and 7 days")
@@ -3844,9 +4204,9 @@ class CampaignRunner:
                         raise ConflictError(
                             "activity check interval must be between 30 and 3600 seconds"
                         )
-                    if not 60 <= campaign.visibility_max_wait_seconds <= 7 * 24 * 3600:
+                    if not 0 <= campaign.visibility_max_wait_seconds <= 7 * 24 * 3600:
                         raise ConflictError(
-                            "visibility maximum wait must be between 1 minute and 7 days"
+                            "visibility maximum wait must be between 0 minutes and 7 days"
                         )
             elif campaign.repeat_count == 1 and campaign.repeat_interval_seconds != 0:
                 raise ConflictError("one-pass broadcast must have a zero repeat interval")
@@ -3854,7 +4214,9 @@ class CampaignRunner:
                 60 <= campaign.repeat_interval_seconds <= 7 * 24 * 3600
             ):
                 raise ConflictError("repeat interval must be between 1 minute and 7 days")
-            if not campaign.smart_timer_mode and campaign.smart_duration_seconds != 0:
+            if not campaign.smart_timer_mode and (
+                campaign.smart_duration_seconds != 0 or campaign.repeat_forever
+            ):
                 raise ConflictError("smart duration requires timer-driven mode")
             if campaign.activity_aware and not campaign.smart_timer_mode:
                 raise ConflictError("activity-aware mode requires timer-driven broadcast")
@@ -3879,7 +4241,9 @@ class CampaignRunner:
         if not account.ownership_confirmed:
             raise ConflictError("account ownership must be confirmed")
         if account.status != AccountStatus.ACTIVE:
-            raise ConflictError("both accounts must be active")
+            raise ConflictError(
+                "аккаунт отправителя выключен или его сессия больше не действительна"
+            )
         if require_live_session:
             if not account.authorized:
                 raise ConflictError(
@@ -3933,6 +4297,7 @@ class RunQueue:
         preflight_required: bool = False,
         preflight_max_age_seconds: int = 3600,
         proxy_service: ProxyService | None = None,
+        campaign_id_scope: frozenset[int] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._lease_seconds = lease_seconds
@@ -3950,6 +4315,9 @@ class RunQueue:
         self._preflight_required = preflight_required
         self._preflight_max_age_seconds = max(60, preflight_max_age_seconds)
         self._proxy_service = proxy_service
+        self._campaign_id_scope = (
+            frozenset(campaign_id_scope) if campaign_id_scope is not None else None
+        )
         self._claim_lock = asyncio.Lock()
 
     async def enqueue(self, campaign_id: int, request_key: str) -> CampaignRun:
@@ -3960,6 +4328,8 @@ class RunQueue:
         self,
         campaign_id: int,
         request_key: str,
+        *,
+        allow_deferred_start: bool = False,
     ) -> list[CampaignRun]:
         request_key = request_key.strip()
         if not 8 <= len(request_key) <= 64:
@@ -4108,10 +4478,25 @@ class RunQueue:
                 )
                 for account_id, account in sender_accounts.items()
             }
+            ready_now_account_ids = frozenset(
+                account_id
+                for account_id, slot in capacity_slots.items()
+                if slot.candidate_at(now, daily_limit=self._account_daily_limit) <= now
+            )
+            planning_now = now
+            if allow_deferred_start:
+                deferred_start_times = [
+                    slot.candidate_at(now, daily_limit=self._account_daily_limit)
+                    for account_id, slot in capacity_slots.items()
+                    if account_id not in ready_now_account_ids
+                ]
+                if deferred_start_times:
+                    planning_now = min(deferred_start_times)
             target_assignments: dict[int, int] = {}
+            repeat_forever = bool(campaign.smart_timer_mode and campaign.repeat_forever)
             repeat_until = (
-                now + timedelta(seconds=campaign.smart_duration_seconds)
-                if campaign.smart_timer_mode
+                planning_now + timedelta(seconds=campaign.smart_duration_seconds)
+                if campaign.smart_timer_mode and not repeat_forever
                 else None
             )
             timing_states = list(
@@ -4134,14 +4519,21 @@ class RunQueue:
             state_by_pair = {(state.target_id, state.account_id): state for state in timing_states}
             preflight_skips: dict[int, str] = {}
             preflight_ready_accounts: dict[int, frozenset[int]] = {}
+            preflight_deferred_accounts: dict[int, frozenset[int]] = {}
             if self._preflight_required:
-                preflight_skips, preflight_ready_accounts = self._preflight_routing(
+                (
+                    preflight_skips,
+                    preflight_ready_accounts,
+                    preflight_deferred_accounts,
+                ) = self._preflight_routing(
                     campaign,
                     targets,
                     sender_pool,
                     dialogue_steps,
                     state_by_pair,
                     now,
+                    ready_now_account_ids,
+                    allow_deferred_start=allow_deferred_start,
                 )
                 if len(preflight_skips) == len(targets):
                     preview = ", ".join(f"#{target_id}" for target_id in list(preflight_skips)[:8])
@@ -4149,12 +4541,15 @@ class RunQueue:
                         f" и ещё {len(preflight_skips) - 8}" if len(preflight_skips) > 8 else ""
                     )
                     raise ConflictError(
-                        "перед LIVE-запуском выполните «Проверить чаты и аккаунты»: "
-                        "нет ни одного чата со свежим готовым маршрутом: "
+                        "Проверить чаты и аккаунты перед запуском: отправка сейчас "
+                        "недоступна — нет ни одного чата с готовой "
+                        "парой аккаунт–чат без защитной паузы Telegram: "
                         f"{preview}{suffix}; проверка действует "
                         f"{self._preflight_max_age_seconds // 60} мин."
                     )
             runs: list[CampaignRun] = []
+            capacity_window_exceeded_count = 0
+            capacity_window_target_ids: set[int] = set()
             target_indexes = {target.id: index for index, target in enumerate(targets)}
             account_indexes = {account_id: index for index, account_id in enumerate(sender_pool)}
             for target, cycle_index, forced_account_id in task_specs:
@@ -4163,6 +4558,25 @@ class RunQueue:
                 run = existing_by_key.get(key)
                 if run is None:
                     preflight_skip_code = preflight_skips.get(target.id)
+                    # Independent broadcasting is a matrix of account/chat
+                    # streams.  A failed check for one account must cancel only
+                    # its own stream, not discard every other verified account
+                    # for the same chat.
+                    if (
+                        preflight_skip_code is None
+                        and independent
+                        and self._preflight_required
+                        and forced_account_id not in preflight_ready_accounts.get(
+                            target.id,
+                            frozenset(),
+                        )
+                    ):
+                        preflight_skip_code = (
+                            "preflight_account_cooldown"
+                            if forced_account_id
+                            in preflight_deferred_accounts.get(target.id, frozenset())
+                            else "preflight_independent_not_ready"
+                        )
                     content_variant_index = (
                         (target_index + cycle_index + account_indexes.get(forced_account_id, 0))
                         % len(content_variants)
@@ -4287,7 +4701,17 @@ class RunQueue:
                         )
                         candidates.append((candidate_time, membership_rank, order, account_id))
                     candidates.sort(key=lambda item: (item[1], item[0], item[2]))
-                    sender_account_id = candidates[0][3] if candidates else None
+                    # Keep the selected lane on a cancelled independent stream
+                    # as well.  Without this, reports lost which account/chat
+                    # pair failed preflight and appeared to have a mysterious
+                    # "pair" error with no account attached.
+                    sender_account_id = (
+                        candidates[0][3]
+                        if candidates
+                        else forced_account_id
+                        if independent
+                        else None
+                    )
                     scheduled_for = candidates[0][0] if candidates else base_scheduled_for
                     if sender_account_id is not None:
                         if not independent:
@@ -4321,6 +4745,8 @@ class RunQueue:
                     )
                     if capacity_window_exceeded and repeat_until is not None:
                         scheduled_for = repeat_until
+                        capacity_window_exceeded_count += 1
+                        capacity_window_target_ids.add(int(target.id))
                     run = CampaignRun(
                         campaign_id=campaign_id,
                         target_id=target.id,
@@ -4339,6 +4765,7 @@ class RunQueue:
                         sender_account_id=sender_account_id,
                         cycle_index=cycle_index,
                         repeat_until=repeat_until,
+                        repeat_forever_snapshot=repeat_forever,
                         primary_text_snapshot=(
                             content_variant.text if content_variant else campaign.primary_text
                         ),
@@ -4430,6 +4857,34 @@ class RunQueue:
                     )
                     session.add(run)
                 runs.append(run)
+            executable_active_runs = [
+                run
+                for run in runs
+                if run.status == RunStatus.QUEUED
+                and (
+                    run.repeat_forever_snapshot
+                    or run.repeat_until is None
+                    or ensure_utc(run.scheduled_for) < ensure_utc(run.repeat_until)
+                )
+            ]
+            if campaign.smart_timer_mode and not executable_active_runs:
+                # The planner is the only component that sees the whole
+                # account × chat matrix and its virtual account reservations.
+                # Never return a seemingly successful active launch with zero
+                # tasks that can actually run before the deadline.  Individual
+                # route failures remain visible in the preflight review; this
+                # guard stops the empty launch itself.
+                if capacity_window_exceeded_count > 0:
+                    reason = (
+                        "все готовые маршруты освободятся только после окончания её окна; "
+                        "увеличьте срок, уменьшите объём или дождитесь сброса лимита аккаунта"
+                    )
+                else:
+                    reason = (
+                        "после проверки не осталось ни одной готовой пары аккаунт–чат; "
+                        "проверьте доступ, вступления и ограничения Telegram"
+                    )
+                raise ConflictError(f"активная рассылка не может стартовать: {reason}")
             try:
                 await session.flush()
             except IntegrityError as exc:
@@ -4461,6 +4916,8 @@ class RunQueue:
                     "ready_target_count": len(targets) - len(preflight_skips),
                     "skipped_target_count": len(preflight_skips),
                     "skipped_target_ids": sorted(preflight_skips),
+                    "capacity_window_exceeded_count": capacity_window_exceeded_count,
+                    "capacity_window_target_ids": sorted(capacity_window_target_ids),
                     "eligible_sender_ids": sender_pool,
                     "repeat_count": campaign.repeat_count,
                     "repeat_interval_seconds": campaign.repeat_interval_seconds,
@@ -4471,6 +4928,7 @@ class RunQueue:
                     "activity_aware": campaign.activity_aware,
                     "min_messages_between_posts": campaign.min_messages_between_posts,
                     "repeat_until": repeat_until.isoformat() if repeat_until else None,
+                    "repeat_forever": repeat_forever,
                 },
             )
             await session.commit()
@@ -4486,7 +4944,14 @@ class RunQueue:
         dialogue_steps: list[DialogueStep],
         state_by_pair: dict[tuple[int, int], TargetAccountState],
         now: datetime,
-    ) -> tuple[dict[int, str], dict[int, frozenset[int]]]:
+        ready_now_account_ids: frozenset[int],
+        *,
+        allow_deferred_start: bool = False,
+    ) -> tuple[
+        dict[int, str],
+        dict[int, frozenset[int]],
+        dict[int, frozenset[int]],
+    ]:
         fresh_after = now - timedelta(seconds=self._preflight_max_age_seconds)
         required_media_kinds = frozenset()
         required_media_kinds_by_account: dict[int, frozenset[str]] = {}
@@ -4510,7 +4975,7 @@ class RunQueue:
                 )
             )
 
-        def ready(target_id: int, account_id: int) -> bool:
+        def route_is_ready(target_id: int, account_id: int) -> bool:
             state = state_by_pair.get((target_id, account_id))
             checked_at = ensure_utc(state.membership_checked_at) if state is not None else None
             checked_media_kinds = frozenset(
@@ -4545,27 +5010,46 @@ class RunQueue:
 
         skipped: dict[int, str] = {}
         ready_accounts_by_target: dict[int, frozenset[int]] = {}
+        deferred_accounts_by_target: dict[int, frozenset[int]] = {}
         dialogue_accounts = list(dict.fromkeys(step.account_id for step in dialogue_steps))
         for target in targets:
             relevant_accounts = (
                 dialogue_accounts if campaign.mode == CampaignMode.DIALOGUE else sender_pool
             )
-            ready_accounts = frozenset(
-                account_id for account_id in relevant_accounts if ready(target.id, account_id)
+            accessible_accounts = frozenset(
+                account_id
+                for account_id in relevant_accounts
+                if route_is_ready(target.id, account_id)
             )
+            ready_accounts = (
+                accessible_accounts
+                if allow_deferred_start
+                else frozenset(
+                    account_id
+                    for account_id in accessible_accounts
+                    if account_id in ready_now_account_ids
+                )
+            )
+            deferred_accounts = accessible_accounts - ready_accounts
             ready_accounts_by_target[target.id] = ready_accounts
+            deferred_accounts_by_target[target.id] = deferred_accounts
             if campaign.mode == CampaignMode.DIALOGUE:
                 covered = len(ready_accounts) == len(dialogue_accounts)
                 error_code = "preflight_dialogue_not_ready"
             elif campaign.sender_mode == BroadcastSenderMode.INDEPENDENT:
-                covered = len(ready_accounts) == len(sender_pool)
-                error_code = "preflight_independent_not_ready"
+                # A partial independent matrix remains useful: each ready
+                # account/chat pair is queued, while the unavailable pair is
+                # recorded as a transparent skipped stream below.
+                covered = bool(ready_accounts)
+                error_code = "preflight_no_ready_sender"
             else:
                 covered = bool(ready_accounts)
                 error_code = "preflight_no_ready_sender"
             if not covered:
-                skipped[target.id] = error_code
-        return skipped, ready_accounts_by_target
+                skipped[target.id] = (
+                    "preflight_account_cooldown" if deferred_accounts else error_code
+                )
+        return skipped, ready_accounts_by_target, deferred_accounts_by_target
 
     async def _validate_account_proxy_routes(
         self,
@@ -4705,6 +5189,13 @@ class RunQueue:
                     ~select(active_sender_run.id)
                     .where(
                         active_sender_run.status == RunStatus.RUNNING,
+                        # A scoped recovery worker intentionally does not
+                        # mutate runs outside its campaign scope.  Those
+                        # expired leases must nevertheless stop blocking the
+                        # same sender forever: a genuine running task always
+                        # owns a future lease because claiming writes both
+                        # fields atomically.
+                        active_sender_run.lease_until > now,
                         sender_matches,
                     )
                     .correlate(CampaignRun)
@@ -4719,16 +5210,41 @@ class RunQueue:
                     .correlate(CampaignRun)
                     .exists()
                 )
+                active_campaign_run = aliased(CampaignRun)
+                campaign_is_already_served = (
+                    select(active_campaign_run.id)
+                    .where(
+                        active_campaign_run.status == RunStatus.RUNNING,
+                        active_campaign_run.lease_until > now,
+                        active_campaign_run.campaign_id == CampaignRun.campaign_id,
+                    )
+                    .correlate(CampaignRun)
+                    .exists()
+                )
+                candidate_filters = [
+                    CampaignRun.status == RunStatus.QUEUED,
+                    CampaignRun.scheduled_for <= now,
+                    CampaignRun.cancel_requested.is_(False),
+                    campaign_is_enabled,
+                    sender_is_idle,
+                ]
+                if self._campaign_id_scope is not None:
+                    candidate_filters.append(
+                        CampaignRun.campaign_id.in_(self._campaign_id_scope)
+                    )
                 candidate_id = await session.scalar(
                     select(CampaignRun.id)
-                    .where(
-                        CampaignRun.status == RunStatus.QUEUED,
-                        CampaignRun.scheduled_for <= now,
-                        CampaignRun.cancel_requested.is_(False),
-                        campaign_is_enabled,
-                        sender_is_idle,
+                    .where(*candidate_filters)
+                    # A large older batch must not make every newer enabled
+                    # campaign look stalled.  Prefer a due campaign that has
+                    # no currently leased run; within each group retain the
+                    # durable schedule order.  Sender idleness above still
+                    # prevents parallel use of the same Telegram account.
+                    .order_by(
+                        case((campaign_is_already_served, 1), else_=0),
+                        CampaignRun.scheduled_for,
+                        CampaignRun.id,
                     )
-                    .order_by(CampaignRun.scheduled_for, CampaignRun.id)
                     .limit(1)
                 )
                 if candidate_id is None:
@@ -4741,6 +5257,11 @@ class RunQueue:
                         CampaignRun.status == RunStatus.QUEUED,
                         campaign_is_enabled,
                         sender_is_idle,
+                        *(
+                            [CampaignRun.campaign_id.in_(self._campaign_id_scope)]
+                            if self._campaign_id_scope is not None
+                            else []
+                        ),
                     )
                     .values(
                         status=RunStatus.RUNNING,
@@ -4978,6 +5499,8 @@ class RunQueue:
         *,
         primary_text: str | None = None,
         no_timer_interval_seconds: int | None = None,
+        min_messages_between_posts: int | None = None,
+        visibility_max_wait_seconds: int | None = None,
         remaining_duration_seconds: int | None = None,
     ) -> int:
         """Update only pending work from one launch, preserving sent history."""
@@ -4993,13 +5516,23 @@ class RunQueue:
             60 <= no_timer_interval_seconds <= 7 * 24 * 3600
         ):
             raise ConflictError("no-timer interval must be between 1 minute and 7 days")
-        if remaining_duration_seconds is not None and not (
-            60 <= remaining_duration_seconds <= 7 * 24 * 3600
+        if min_messages_between_posts is not None and not (
+            1 <= min_messages_between_posts <= 100_000
         ):
-            raise ConflictError("remaining duration must be between 1 minute and 7 days")
+            raise ConflictError("message depth must be between 1 and 100000")
+        if visibility_max_wait_seconds is not None and not (
+            0 <= visibility_max_wait_seconds <= 7 * 24 * 3600
+        ):
+            raise ConflictError("visibility wait must be between 0 minutes and 7 days")
+        if remaining_duration_seconds is not None and not (
+            remaining_duration_seconds == 0 or 60 <= remaining_duration_seconds <= 7 * 24 * 3600
+        ):
+            raise ConflictError("remaining duration must be zero or between 1 minute and 7 days")
         if (
             primary_text is None
             and no_timer_interval_seconds is None
+            and min_messages_between_posts is None
+            and visibility_max_wait_seconds is None
             and remaining_duration_seconds is None
         ):
             raise ConflictError("choose at least one launch setting to update")
@@ -5048,18 +5581,22 @@ class RunQueue:
                 )
                 if has_media:
                     raise ConflictError("media caption must contain at most 1024 characters")
-            smart = any(run.repeat_until is not None for run in runs)
+            smart = any(CampaignRunner._is_smart_run(run) for run in runs)
             if (
-                no_timer_interval_seconds is not None or remaining_duration_seconds is not None
+                no_timer_interval_seconds is not None
+                or min_messages_between_posts is not None
+                or visibility_max_wait_seconds is not None
+                or remaining_duration_seconds is not None
             ) and not smart:
                 raise ConflictError(
                     "frequency and active duration can only be changed for a smart launch"
                 )
 
             now = utc_now()
+            new_repeat_forever = remaining_duration_seconds == 0
             new_repeat_until = (
                 now + timedelta(seconds=remaining_duration_seconds)
-                if remaining_duration_seconds is not None
+                if remaining_duration_seconds is not None and remaining_duration_seconds > 0
                 else None
             )
             latest_success_by_target: dict[int, datetime] = {}
@@ -5113,10 +5650,15 @@ class RunQueue:
                         )
                 if no_timer_interval_seconds is not None:
                     run.no_timer_interval_seconds_snapshot = no_timer_interval_seconds
-                if new_repeat_until is not None:
+                if min_messages_between_posts is not None:
+                    run.min_messages_between_posts_snapshot = min_messages_between_posts
+                if visibility_max_wait_seconds is not None:
+                    run.visibility_max_wait_seconds_snapshot = visibility_max_wait_seconds
+                if remaining_duration_seconds is not None:
                     run.repeat_until = new_repeat_until
+                    run.repeat_forever_snapshot = new_repeat_forever
 
-                if run.status != RunStatus.QUEUED or run.repeat_until is None:
+                if run.status != RunStatus.QUEUED or not CampaignRunner._is_smart_run(run):
                     continue
                 deadline = ensure_utc(run.repeat_until)
                 if no_timer_interval_seconds is not None and run.cycle_index > 0:
@@ -5146,9 +5688,14 @@ class RunQueue:
                         len(primary_text) if primary_text is not None else None
                     ),
                     "no_timer_interval_seconds": no_timer_interval_seconds,
+                    "min_messages_between_posts": min_messages_between_posts,
+                    "visibility_max_wait_seconds": visibility_max_wait_seconds,
                     "remaining_duration_seconds": remaining_duration_seconds,
                     "repeat_until": (
                         new_repeat_until.isoformat() if new_repeat_until is not None else None
+                    ),
+                    "repeat_forever": (
+                        new_repeat_forever if remaining_duration_seconds is not None else None
                     ),
                 },
                 actor="control-bot",
@@ -5217,6 +5764,89 @@ class RunQueue:
         """
 
         return (await self.cancel_all_with_summary()).task_count
+
+    async def cancel_all_campaign_deliveries(self) -> CampaignDeliveryStopSummary:
+        """Stop current chat publications and their campaign reactions only.
+
+        This is deliberately narrower than the emergency global stop: it does
+        not pause comment rules, participant reactions, direct messages, or
+        subscriber invites.  Saved campaign scenarios remain enabled, so an
+        operator can review and launch them again explicitly later.
+        """
+
+        async with self._session_factory() as session:
+            runs = list(
+                await session.scalars(
+                    select(CampaignRun).where(
+                        CampaignRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])
+                    )
+                )
+            )
+            now = utc_now()
+            queued_run_ids: list[int] = []
+            queued_runs = 0
+            running_runs = 0
+            for run in runs:
+                run.cancel_requested = True
+                if run.status == RunStatus.QUEUED:
+                    queued_runs += 1
+                    queued_run_ids.append(run.id)
+                    run.status = RunStatus.CANCELLED
+                    run.finished_at = now
+                    run.lease_owner = None
+                    run.lease_token = None
+                    run.lease_until = None
+                    run.heartbeat_at = None
+                else:
+                    running_runs += 1
+            await release_campaign_mention_reservations(session, run_ids=queued_run_ids)
+
+            cancelled_reactions = await session.execute(
+                update(ReactionTask)
+                .where(ReactionTask.status == ReactionTaskStatus.QUEUED)
+                .values(
+                    status=ReactionTaskStatus.CANCELLED,
+                    cancel_requested=True,
+                    finished_at=now,
+                    error="campaign delivery stop requested",
+                    error_code="campaign_stop",
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_until=None,
+                )
+            )
+            cancelled_reaction_count = int(cancelled_reactions.rowcount or 0)
+            running_reactions = await session.execute(
+                update(ReactionTask)
+                .where(ReactionTask.status == ReactionTaskStatus.RUNNING)
+                .values(
+                    cancel_requested=True,
+                    error="campaign delivery stop requested while reaction is running",
+                    error_code="cancel_requested",
+                )
+            )
+            running_reaction_count = int(running_reactions.rowcount or 0)
+            summary = CampaignDeliveryStopSummary(
+                queued_runs=queued_runs,
+                running_runs=running_runs,
+                queued_reactions=cancelled_reaction_count,
+                running_reactions=running_reaction_count,
+            )
+            if summary.task_count:
+                add_audit_event(
+                    session,
+                    event_type="campaign_delivery.cancel_all_requested",
+                    entity_type="campaign_run",
+                    entity_id=None,
+                    details={
+                        "queued_runs": summary.queued_runs,
+                        "running_runs": summary.running_runs,
+                        "queued_reactions": summary.queued_reactions,
+                        "running_reactions": summary.running_reactions,
+                    },
+                )
+                await session.commit()
+            return summary
 
     async def cancel_all_with_summary(self) -> GlobalStopSummary:
         """Atomically stop every delivery queue owned by this installation.
@@ -5514,14 +6144,15 @@ class RunQueue:
     async def recover_expired_leases(self) -> int:
         async with self._session_factory() as session:
             now = utc_now()
+            expired_filters = [
+                CampaignRun.status == RunStatus.RUNNING,
+                CampaignRun.lease_until.is_not(None),
+                CampaignRun.lease_until < now,
+            ]
+            if self._campaign_id_scope is not None:
+                expired_filters.append(CampaignRun.campaign_id.in_(self._campaign_id_scope))
             expired = list(
-                await session.scalars(
-                    select(CampaignRun).where(
-                        CampaignRun.status == RunStatus.RUNNING,
-                        CampaignRun.lease_until.is_not(None),
-                        CampaignRun.lease_until < now,
-                    )
-                )
+                await session.scalars(select(CampaignRun).where(*expired_filters))
             )
             recovered = 0
             for run in expired:
@@ -5661,6 +6292,9 @@ class QueueWorker:
                 raise
             await stop_heartbeat()
             if lease_lost.is_set():
+                terminal = await self._terminal_result_after_lease_signal(run.id)
+                if terminal is not None:
+                    return terminal
                 raise LeaseLostError("campaign run lease was lost")
             self._processed_steps += 1
             self._last_error = None
@@ -5684,9 +6318,15 @@ class QueueWorker:
         except asyncio.CancelledError:
             if not lease_lost.is_set():
                 raise
+            terminal = await self._terminal_result_after_lease_signal(run.id)
+            if terminal is not None:
+                return terminal
             logger.warning("Campaign run %s lost its lease during execution", run.id)
             return await self._queue.get_run(run.id)
         except LeaseLostError:
+            terminal = await self._terminal_result_after_lease_signal(run.id)
+            if terminal is not None:
+                return terminal
             logger.warning("Campaign run %s lost its lease fencing token", run.id)
             return await self._queue.get_run(run.id)
         except GatewayError as exc:
@@ -5710,7 +6350,7 @@ class QueueWorker:
                 lease_token,
                 safe_error_message(exc),
                 permanent=True,
-                error_code="preflight_failed",
+                error_code=str(getattr(exc, "code", None) or "preflight_failed"),
             )
         except Exception as exc:
             logger.exception("Campaign run %s step failed", run.id)
@@ -5787,6 +6427,28 @@ class QueueWorker:
                     logger.warning("Heartbeat lost for campaign run %s", run_id)
                     self._signal_lost_lease(lost_event, owner_task)
                     return
+
+    async def _terminal_result_after_lease_signal(self, run_id: int) -> CampaignRun | None:
+        """Accept an outcome already durably finalized by this worker step.
+
+        CampaignRunner writes and clears its lease together with a terminal
+        Telegram outcome.  A heartbeat scheduled in that tiny interval sees a
+        missing lease and used to cancel the owner task, producing a misleading
+        ``lost lease`` warning after a successful send.  A terminal durable
+        result is authoritative; a still-running result remains fenced.
+        """
+
+        current = await self._queue.get_run(run_id)
+        if current.status not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}:
+            return None
+        self._processed_steps += 1
+        self._last_error = None
+        self._last_processed_at = utc_now().isoformat()
+        logger.debug(
+            "Campaign run %s finalized before its heartbeat observed lease release",
+            run_id,
+        )
+        return current
 
     @staticmethod
     def _signal_lost_lease(

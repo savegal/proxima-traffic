@@ -6,9 +6,10 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
@@ -73,6 +74,10 @@ logger = logging.getLogger(__name__)
 IMPORT_BATCH_SIZE = 500
 # Keep imports responsive on SQLite while still amortising commits for large bases.
 IMPORT_COMMIT_EVERY_BATCHES = 20
+# SQLite builds may allow a different maximum number of bound variables. Keep every
+# ``IN (...)`` query below the most conservative common limit instead of relying on
+# the local SQLite build used during development.
+SQLITE_PARAMETER_BATCH_SIZE = 500
 DIRECT_MESSAGE_MAX_RECIPIENTS = 1_000_000
 DIRECT_MESSAGE_TERMINAL_STATUSES = frozenset(
     {
@@ -89,6 +94,14 @@ DIRECT_RECIPIENT_GLOBAL_SKIP_CODES = frozenset(
         "recipient_unavailable",
     }
 )
+
+
+def _parameter_batches(values: Iterable[int]) -> Iterator[tuple[int, ...]]:
+    """Yield SQL-safe batches without materialising another copy of a large ID set."""
+
+    iterator = iter(values)
+    while batch := tuple(islice(iterator, SQLITE_PARAMETER_BATCH_SIZE)):
+        yield batch
 DIRECT_RECIPIENT_ROUTE_CODES = frozenset(
     {
         "recipient_privacy_restricted",
@@ -258,13 +271,13 @@ class DirectMessageService:
                 list_id = int(subscriber_list.id)
 
                 batch: list[SubscriberRecord] = []
-                touched_subscriber_ids: set[int] = set()
+                affected_list_ids: set[int] = {list_id}
                 imported_batches = 0
                 for record in iter_subscriber_records(path, stats=stats):
                     batch.append(record)
                     if len(batch) < IMPORT_BATCH_SIZE:
                         continue
-                    inserted, updated, members, touched_ids = await self._import_batch(
+                    inserted, updated, members, affected_ids = await self._import_batch(
                         session,
                         list_id=list_id,
                         records=batch,
@@ -273,14 +286,14 @@ class DirectMessageService:
                     inserted_profiles += inserted
                     updated_profiles += updated
                     added_members += members
-                    touched_subscriber_ids.update(touched_ids)
+                    affected_list_ids.update(affected_ids)
                     batch.clear()
                     imported_batches += 1
                     if imported_batches % IMPORT_COMMIT_EVERY_BATCHES == 0:
                         await session.commit()
                     await asyncio.sleep(0)
                 if batch:
-                    inserted, updated, members, touched_ids = await self._import_batch(
+                    inserted, updated, members, affected_ids = await self._import_batch(
                         session,
                         list_id=list_id,
                         records=batch,
@@ -289,16 +302,16 @@ class DirectMessageService:
                     inserted_profiles += inserted
                     updated_profiles += updated
                     added_members += members
-                    touched_subscriber_ids.update(touched_ids)
+                    affected_list_ids.update(affected_ids)
                     imported_batches += 1
                     if imported_batches % IMPORT_COMMIT_EVERY_BATCHES == 0:
                         await session.commit()
                 if stats.valid_records == 0:
                     raise SubscriberImportError("в файле нет ни одной корректной записи")
 
-                counts_by_list = await self._refresh_list_counts_for_subscribers(
+                counts_by_list = await self._refresh_list_counts(
                     session,
-                    touched_subscriber_ids,
+                    affected_list_ids,
                 )
                 counts = counts_by_list.get(list_id, (0, 0, 0, 0))
                 subscriber_list.status = SubscriberListStatus.READY
@@ -405,14 +418,27 @@ class DirectMessageService:
                     updated_at=imported_at,
                 )
             )
-        existing_members = set(
-            await session.scalars(
-                select(SubscriberListMember.subscriber_id).where(
-                    SubscriberListMember.subscriber_list_id == list_id,
-                    SubscriberListMember.subscriber_id.in_(subscriber_ids),
+        # This query is bounded by ``IMPORT_BATCH_SIZE``. Besides finding
+        # existing entries in the imported list it captures other lists whose
+        # Premium/username counters may change after a profile refresh.
+        membership_rows = list(
+            (
+                await session.execute(
+                    select(
+                        SubscriberListMember.subscriber_id,
+                        SubscriberListMember.subscriber_list_id,
+                    ).where(SubscriberListMember.subscriber_id.in_(subscriber_ids))
                 )
-            )
+            ).all()
         )
+        existing_members = {
+            int(row.subscriber_id)
+            for row in membership_rows
+            if int(row.subscriber_list_id) == list_id
+        }
+        affected_list_ids = {list_id} | {
+            int(row.subscriber_list_id) for row in membership_rows
+        }
         new_member_ids = [item for item in subscriber_ids if item not in existing_members]
         if new_member_ids:
             await session.execute(
@@ -435,7 +461,7 @@ class DirectMessageService:
                 )
             )
         updated = len(existing_ids)
-        return len(records) - updated, updated, len(new_member_ids), set(subscriber_ids)
+        return len(records) - updated, updated, len(new_member_ids), affected_list_ids
 
     @staticmethod
     async def _refresh_list_counts_for_subscribers(
@@ -444,48 +470,64 @@ class DirectMessageService:
     ) -> dict[int, tuple[int, int, int, int]]:
         """Refresh denormalized counters for every list sharing changed profiles."""
 
-        if not subscriber_ids:
-            return {}
-        list_ids = list(
-            await session.scalars(
-                select(SubscriberListMember.subscriber_list_id)
-                .where(SubscriberListMember.subscriber_id.in_(subscriber_ids))
-                .distinct()
+        list_ids: set[int] = set()
+        for subscriber_id_batch in _parameter_batches(subscriber_ids):
+            list_ids.update(
+                int(value)
+                for value in await session.scalars(
+                    select(SubscriberListMember.subscriber_list_id)
+                    .where(SubscriberListMember.subscriber_id.in_(subscriber_id_batch))
+                    .distinct()
+                )
             )
-        )
+        return await DirectMessageService._refresh_list_counts(session, list_ids)
+
+    @staticmethod
+    async def _refresh_list_counts(
+        session: AsyncSession,
+        list_ids: set[int],
+    ) -> dict[int, tuple[int, int, int, int]]:
+        """Refresh list counters while respecting SQLite's parameter limit."""
+
         if not list_ids:
             return {}
-        rows = list(
-            (
-                await session.execute(
-                    select(
-                        SubscriberListMember.subscriber_list_id,
-                        func.count(Subscriber.id),
-                        func.sum(case((Subscriber.is_premium.is_(True), 1), else_=0)),
-                        func.sum(case((Subscriber.is_premium.is_(False), 1), else_=0)),
-                        func.sum(case((Subscriber.username.is_not(None), 1), else_=0)),
+        counts_by_list: dict[int, tuple[int, int, int, int]] = {}
+        for list_id_batch in _parameter_batches(list_ids):
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            SubscriberListMember.subscriber_list_id,
+                            func.count(Subscriber.id),
+                            func.sum(case((Subscriber.is_premium.is_(True), 1), else_=0)),
+                            func.sum(case((Subscriber.is_premium.is_(False), 1), else_=0)),
+                            func.sum(case((Subscriber.username.is_not(None), 1), else_=0)),
+                        )
+                        .join(Subscriber, Subscriber.id == SubscriberListMember.subscriber_id)
+                        .where(SubscriberListMember.subscriber_list_id.in_(list_id_batch))
+                        .group_by(SubscriberListMember.subscriber_list_id)
                     )
-                    .join(Subscriber, Subscriber.id == SubscriberListMember.subscriber_id)
-                    .where(SubscriberListMember.subscriber_list_id.in_(list_ids))
-                    .group_by(SubscriberListMember.subscriber_list_id)
+                ).all()
+            )
+            counts_by_list.update(
+                {
+                    int(row[0]): tuple(int(value or 0) for value in row[1:])
+                    for row in rows
+                }
+            )
+            lists = list(
+                await session.scalars(
+                    select(SubscriberList).where(SubscriberList.id.in_(list_id_batch))
                 )
-            ).all()
-        )
-        counts_by_list = {
-            int(row[0]): tuple(int(value or 0) for value in row[1:])
-            for row in rows
-        }
-        lists = list(
-            await session.scalars(select(SubscriberList).where(SubscriberList.id.in_(list_ids)))
-        )
-        for subscriber_list in lists:
-            counts = counts_by_list.get(int(subscriber_list.id), (0, 0, 0, 0))
-            (
-                subscriber_list.member_count,
-                subscriber_list.premium_count,
-                subscriber_list.non_premium_count,
-                subscriber_list.username_count,
-            ) = counts
+            )
+            for subscriber_list in lists:
+                counts = counts_by_list.get(int(subscriber_list.id), (0, 0, 0, 0))
+                (
+                    subscriber_list.member_count,
+                    subscriber_list.premium_count,
+                    subscriber_list.non_premium_count,
+                    subscriber_list.username_count,
+                ) = counts
         return counts_by_list
 
     async def _mark_import_failed(self, list_id: int, exc: BaseException) -> None:

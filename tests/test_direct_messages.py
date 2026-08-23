@@ -32,6 +32,7 @@ from proxima_traffic.models import (
     ProxyStatus,
     Subscriber,
     SubscriberList,
+    SubscriberListMember,
     SubscriberSegment,
     utc_now,
 )
@@ -215,6 +216,50 @@ async def test_large_import_is_batched_idempotent_and_segmented(tmp_path: Path) 
     assert second.subscriber_list.member_count == 2_005
     async with database.session_factory() as session:
         assert int(await session.scalar(select(func.count(Subscriber.id))) or 0) == 2_005
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subscriber_counter_refresh_chunks_ids_above_sqlite_parameter_limit(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, "counter-refresh.db")
+    database = Database(settings.database_url)
+    await database.create_schema()
+    gateway = DryRunGateway()
+    runner = CampaignRunner(database.session_factory, gateway, settings=settings)
+    service = DirectMessageService(
+        database.session_factory,
+        gateway,
+        runner,
+        settings,
+        worker_id="test-direct",
+    )
+    async with database.session_factory() as session:
+        subscriber = Subscriber(
+            telegram_user_id=987_654,
+            username="premium_member",
+            is_premium=True,
+        )
+        subscriber_list = SubscriberList(name="Counter refresh")
+        session.add_all([subscriber, subscriber_list])
+        await session.flush()
+        session.add(
+            SubscriberListMember(
+                subscriber_list_id=int(subscriber_list.id),
+                subscriber_id=int(subscriber.id),
+            )
+        )
+        await session.flush()
+
+        counts = await service._refresh_list_counts_for_subscribers(
+            session,
+            set(range(1, 40_001)) | {int(subscriber.id)},
+        )
+
+        assert counts[int(subscriber_list.id)] == (1, 1, 0, 1)
+        assert subscriber_list.member_count == 1
+        assert subscriber_list.premium_count == 1
     await database.dispose()
 
 

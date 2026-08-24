@@ -785,7 +785,12 @@ class ChannelCommentService:
         account_ids: list[int] | None = None,
         actor: str = "control-bot",
     ) -> ChannelCommentRule:
-        """Update future comment reactions and validate an enabled reactor pool."""
+        """Update future comment reactions without probing the comment channel.
+
+        A reaction is attempted only after its source comment was delivered.
+        Requiring a live channel preflight here made a harmless settings change
+        fail for an old, private or temporarily unavailable channel.
+        """
 
         if count is not None and not 0 <= count <= 10:
             raise ConflictError("количество реакций должно быть от 0 до 10")
@@ -827,20 +832,9 @@ class ChannelCommentService:
                 raise ConflictError(
                     "для реакций выберите хотя бы один аккаунт, отличный от автора комментария"
                 )
-            accounts: list[Account] = []
             for account_id in effective_ids:
                 account = await session.get(Account, account_id)
                 self._validate_account(account)
-                accounts.append(account)
-            channel_ref = rule.channel_ref
-            needs_preflight = effective_enabled and (
-                not rule.reactions_enabled or normalized_ids is not None
-            )
-        if needs_preflight:
-            await self._preflight_accounts(
-                [account for account in accounts if int(account.id) != source_account_id],
-                channel_ref,
-            )
         async with self._session_factory() as session:
             rule = await self._active_rule(session, rule_id)
             if rule is None:
@@ -852,7 +846,7 @@ class ChannelCommentService:
                 rule.reaction_emoji = emoji
             if normalized_ids is not None:
                 rule.reaction_account_ids_json = json.dumps(normalized_ids)
-            if needs_preflight and effective_ids:
+            if effective_ids:
                 await session.execute(
                     ChannelCommentReactionAccountState.__table__.delete().where(
                         ChannelCommentReactionAccountState.rule_id == rule.id,

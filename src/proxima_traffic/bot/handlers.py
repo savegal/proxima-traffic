@@ -14787,6 +14787,7 @@ async def toggle_channel_comment_reactions(
     settings: Settings,
 ) -> None:
     _, _, _, rule_id, page = (callback.data or "").split(":")
+    await callback.answer("Обновляем реакции…")
     try:
         view = await channel_comments.get_rule_view(int(rule_id))
         await channel_comments.update_rule_reactions(
@@ -14794,7 +14795,8 @@ async def toggle_channel_comment_reactions(
             enabled=not view.rule.reactions_enabled,
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        if callback.message is not None:
+            await callback.message.answer(f"⚠️ {escape(callback_error_message(exc))}")
         return
     await _show_channel_comment_reactions(
         callback,

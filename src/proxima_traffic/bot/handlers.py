@@ -1258,10 +1258,11 @@ async def channel_comment_name(message: Message, state: FSMContext) -> None:
     await state.set_state(ChannelCommentCreateState.channel)
     await message.answer(
         "<b>2 / 5 · Каналы</b>\n\n"
-        "Пришлите UTF-8 <code>.txt</code> или публичные ссылки / @username каналов "
-        "по одному в строке.\n"
+        "Пришлите UTF-8 <code>.txt</code> или ссылки / @username каналов "
+        "по одному в строке. Поддерживаются приватные invite-ссылки <code>t.me/+…</code>.\n"
         "Одинаковая настройка будет создана для каждого канала; сервис будет "
-        "отслеживать только новые посты после включения.",
+        "отслеживать только новые посты после включения. Для приватного канала "
+        "с заявкой сервис покажет ожидание одобрения и начнёт сам после принятия.",
         reply_markup=cancel_menu(),
     )
 
@@ -1295,8 +1296,8 @@ async def channel_comment_channel(
     values = _parse_channel_comment_refs(content)
     if not values:
         await message.answer(
-            "Нужна хотя бы одна публичная ссылка на канал или @username. "
-            "Приватные invite-ссылки для автокомментариев не подходят."
+            "Нужна хотя бы одна ссылка на канал: @username, публичная ссылка "
+            "или приватная invite-ссылка t.me/+…"
         )
         return
     if len(values) > 25:

@@ -419,7 +419,12 @@ class TelethonGateway:
         async with self._account_operation(account.id):
             try:
                 client = await self._ensure_client(account.id)
-                channel = await self._resolve_entity(client, account.id, channel_ref)
+                channel = await self._resolve_channel_comment_channel(
+                    client,
+                    account.id,
+                    channel_ref,
+                    request_join=True,
+                )
                 if not bool(getattr(channel, "broadcast", False)):
                     raise PermanentGatewayError(
                         "comments can only be attached to channel posts",
@@ -462,7 +467,15 @@ class TelethonGateway:
         async with self._account_operation(account.id):
             client = await self._ensure_client(account.id)
             try:
-                channel = await self._resolve_entity(client, account.id, channel_ref)
+                # Setup is the only comment operation allowed to submit a
+                # private-channel join request.  Polling merely observes its
+                # approval, preventing a repeated request every scan interval.
+                channel = await self._resolve_channel_comment_channel(
+                    client,
+                    account.id,
+                    channel_ref,
+                    request_join=False,
+                )
                 if not bool(getattr(channel, "broadcast", False)):
                     raise PermanentGatewayError(
                         "нужен канал с постами, а не группа",
@@ -545,7 +558,12 @@ class TelethonGateway:
         async with self._account_operation(account.id):
             client = await self._ensure_client(account.id)
             try:
-                channel = await self._resolve_entity(client, account.id, channel_ref)
+                channel = await self._resolve_channel_comment_channel(
+                    client,
+                    account.id,
+                    channel_ref,
+                    request_join=True,
+                )
                 if not bool(getattr(channel, "broadcast", False)):
                     raise PermanentGatewayError(
                         "нужен канал с постами, а не группа",
@@ -2440,6 +2458,40 @@ class TelethonGateway:
             raise TemporaryGatewayError("Telegram не вернул чат после вступления")
         return chats[0], True
 
+    async def _resolve_channel_comment_channel(
+        self,
+        client: object,
+        account_id: int,
+        channel_ref: str,
+        *,
+        request_join: bool,
+    ) -> object:
+        """Resolve a configured comment channel without hidden join side effects.
+
+        A private link is operator-provided configuration.  We may submit its
+        join request during setup, but after Telegram responds with a pending
+        request the monitor only checks for approval.  Once approved Telegram
+        returns ``ChatInviteAlready`` and normal scanning resumes.
+        """
+        if not channel_ref.startswith("https://t.me/+"):
+            return await self._resolve_entity(client, account_id, channel_ref)
+        from telethon import functions, types  # noqa: PLC0415
+
+        invite_hash = channel_ref.removeprefix("https://t.me/+")
+        info = await client(functions.messages.CheckChatInviteRequest(invite_hash))  # type: ignore[operator]
+        if isinstance(info, types.ChatInviteAlready):
+            channel = getattr(info, "chat", None)
+            if channel is None:
+                raise PermanentGatewayError("приватный канал недоступен", code="target_unavailable")
+            return channel
+        if not request_join:
+            raise PermanentGatewayError(
+                "заявка на вступление отправлена и ожидает одобрения",
+                code="join_request_pending",
+            )
+        channel, _ = await self._join_private_invite(client, account_id, channel_ref)
+        return channel
+
     async def _enforce_join_limit(self, account_id: int) -> None:
         import math  # noqa: PLC0415
 
@@ -3742,8 +3794,14 @@ class TelethonGateway:
                 code="target_not_joined",
             )
         if isinstance(exc, errors.InviteRequestSentError):
-            return PermanentGatewayError(
+            # A request-to-join is not a rejected destination.  Telegram has
+            # accepted the request, but the administrator still has to admit
+            # the account.  Keep the campaign task alive and let its next
+            # guarded attempt re-check the invite instead of turning this
+            # into a permanent account/chat block.
+            return TemporaryGatewayError(
                 "заявка на вступление отправлена и ожидает одобрения",
+                retry_after=int(self._settings.membership_gate_retry_delay_seconds),
                 code="join_request_pending",
             )
         if isinstance(exc, (errors.ChannelsTooMuchError, errors.UserChannelsTooMuchError)):

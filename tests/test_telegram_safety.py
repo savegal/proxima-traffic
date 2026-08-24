@@ -248,8 +248,9 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
     assert long_flood.retry_after == 108_000
 
     join_request = gateway._map_rpc_error(errors.InviteRequestSentError(None), context="join")
-    assert isinstance(join_request, PermanentGatewayError)
+    assert isinstance(join_request, TemporaryGatewayError)
     assert join_request.code == "join_request_pending"
+    assert join_request.retry_after == gateway._settings.membership_gate_retry_delay_seconds
 
     too_many_chats = gateway._map_rpc_error(errors.ChannelsTooMuchError(None), context="join")
     assert isinstance(too_many_chats, PermanentGatewayError)

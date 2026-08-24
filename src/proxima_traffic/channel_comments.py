@@ -353,7 +353,11 @@ class ChannelCommentService:
         # A bad or private channel must not prevent every other selected
         # channel from being armed.  Keep it out of this batch and report its
         # exact reason to the operator; fail only if none can be enabled.
-        ready_rules: list[tuple[str, str, ChannelCommentPreflight | None]] = []
+        # A private invite can legitimately answer ``join_request_pending``.
+        # The operator explicitly selected the link, so preserve a live rule
+        # instead of treating approval as a configuration failure.  The scan
+        # loop will re-check membership and start on its own after approval.
+        ready_rules: list[tuple[str, str, ChannelCommentPreflight | None, str | None]] = []
         failures: list[tuple[str, str]] = []
         for rule_name, channel_ref in zip(normalized_names, normalized_refs, strict=True):
             try:
@@ -362,10 +366,14 @@ class ChannelCommentService:
                         rule_name,
                         channel_ref,
                         await self._preflight_accounts(list(accounts.values()), channel_ref),
+                        None,
                     )
                 )
             except ConflictError as exc:
-                failures.append((channel_ref, str(exc)))
+                if failure_code(exc) == "join_request_pending":
+                    ready_rules.append((rule_name, channel_ref, None, str(exc)))
+                else:
+                    failures.append((channel_ref, str(exc)))
         if preflight_failures is not None:
             preflight_failures.extend(failures)
         if not ready_rules:
@@ -385,10 +393,10 @@ class ChannelCommentService:
                         ChannelCommentRule.archived_at.is_(None),
                         or_(
                             ChannelCommentRule.channel_ref.in_(
-                                [channel_ref for _, channel_ref, _ in ready_rules]
+                                [channel_ref for _, channel_ref, _, _ in ready_rules]
                             ),
                             ChannelCommentRule.name.in_(
-                                [rule_name for rule_name, _, _ in ready_rules]
+                                [rule_name for rule_name, _, _, _ in ready_rules]
                             ),
                         ),
                     )
@@ -476,8 +484,13 @@ class ChannelCommentService:
                     armed_at=utc_now(),
                     channel_title=preflight.title if preflight is not None else None,
                 )
-                for rule_name, channel_ref, preflight in ready_rules
+                for rule_name, channel_ref, preflight, pending_error in ready_rules
             ]
+            for rule, (_, _, _, pending_error) in zip(rules, ready_rules, strict=True):
+                if pending_error:
+                    rule.last_error = pending_error[:500]
+                    rule.last_error_code = "join_request_pending"
+                    rule.last_error_account_id = primary_account_id
             session.add_all(rules)
             try:
                 await session.flush()
@@ -1064,7 +1077,10 @@ class ChannelCommentService:
                 stored = await self._active_rule(session, rule_id)
                 if stored is not None:
                     self._store_rule_error(stored, exc, account_id=stored.primary_account_id)
-                    if failure_code(exc) in CHANNEL_COMMENT_AUTO_PAUSE_CODES:
+                    if (
+                        failure_code(exc) in CHANNEL_COMMENT_AUTO_PAUSE_CODES
+                        and failure_code(exc) != "join_request_pending"
+                    ):
                         await self._auto_pause_rule(
                             session,
                             stored,
@@ -1326,7 +1342,10 @@ class ChannelCommentService:
                 return
             self._store_rule_error(rule, exc, account_id=account_id)
             rule.last_scanned_at = utc_now()
-            if failure_code(exc) in CHANNEL_COMMENT_AUTO_PAUSE_CODES:
+            if (
+                failure_code(exc) in CHANNEL_COMMENT_AUTO_PAUSE_CODES
+                and failure_code(exc) != "join_request_pending"
+            ):
                 await self._auto_pause_rule(
                     session,
                     rule,
@@ -3213,11 +3232,19 @@ class ChannelCommentService:
                 "addlist",
             } and not parts[0].startswith("+"):
                 normalized = "@" + parts[0]
+            elif parts and parts[0].casefold() == "joinchat" and len(parts) == 2:
+                normalized = "https://t.me/+" + parts[1]
+            elif parts and parts[0].startswith("+") and len(parts) == 1:
+                normalized = "https://t.me/" + parts[0]
             else:
                 raise ConflictError(
-                    "для автокомментариев нужен публичный канал с @username; "
-                    "приватные invite-ссылки не подходят"
+                    "укажите публичную ссылку канала или действующую приватную invite-ссылку"
                 )
+        if normalized.startswith("https://t.me/+"):
+            invite_hash = normalized.removeprefix("https://t.me/+").strip()
+            if not invite_hash or "/" in invite_hash or len(invite_hash) > 200:
+                raise ConflictError("приватная invite-ссылка указана неверно")
+            return "https://t.me/+" + invite_hash
         if not normalized.startswith("@") or not 5 <= len(normalized) <= 33:
             raise ConflictError("укажите публичную ссылку канала в формате @channel")
         if not normalized[1:].replace("_", "").isalnum():

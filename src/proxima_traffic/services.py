@@ -880,11 +880,15 @@ class CampaignRunner:
             )
             if refreshed_membership is not None:
                 return refreshed_membership
-            rerouted = await self._reroute_broadcast_sender(
-                run, campaign, sender.id, target.id, exc
-            )
-            if rerouted is not None:
-                return rerouted
+            # A join request belongs to the chosen account.  Failing over here
+            # would submit the same private-chat request from every sender,
+            # while the first account is simply waiting for an administrator.
+            if getattr(exc, "code", None) != "join_request_pending":
+                rerouted = await self._reroute_broadcast_sender(
+                    run, campaign, sender.id, target.id, exc
+                )
+                if rerouted is not None:
+                    return rerouted
             handled = await self._on_send_failure(
                 run,
                 sender.id,
@@ -1970,6 +1974,7 @@ class CampaignRunner:
         if code not in {
             "chat_timer",
             "join_throttled",
+            "join_request_pending",
             "slow_mode",
             "flood_wait",
             "proxy_unavailable",
@@ -1977,6 +1982,58 @@ class CampaignRunner:
             return None
         retry_after = int(getattr(exc, "retry_after", None) or 60)
         return utc_now() + timedelta(seconds=retry_after)
+
+    async def _record_join_request_pending(
+        self,
+        account_id: int,
+        target_id: int,
+        exc: BaseException,
+    ) -> None:
+        """Persist a submitted private-chat request without poisoning the route.
+
+        Approval is an external asynchronous action.  It must be visible in
+        the target/launch reports, yet it is neither a ban nor a failed
+        delivery and therefore must not set ``send_blocked`` or lower target
+        quality.
+        """
+        async with self._session_factory() as session:
+            target = await session.get(Target, target_id)
+            if target is None:
+                return
+            now = utc_now()
+            error = safe_error_message(exc)[:500]
+            target.last_checked_at = now
+            target.last_error_code = "join_request_pending"
+            target.last_error = error
+            target.last_error_account_id = account_id
+            state = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.account_id == account_id,
+                    TargetAccountState.target_id == target_id,
+                )
+            )
+            if state is None:
+                state = TargetAccountState(account_id=account_id, target_id=target_id)
+                session.add(state)
+            state.membership_status = MembershipStatus.JOIN_PENDING
+            state.can_send = False
+            state.membership_checked_at = now
+            state.membership_error_code = "join_request_pending"
+            state.last_checked_at = now
+            state.last_error = error
+            # A previous stale result must not prevent the approval re-check.
+            state.send_blocked = False
+            state.blocked_reason = None
+            state.blocked_at = None
+            add_audit_event(
+                session,
+                event_type="target_account.join_request_pending",
+                entity_type="target_account_state",
+                entity_id=f"{target_id}:{account_id}",
+                details={"target_id": target_id, "account_id": account_id},
+                actor="worker",
+            )
+            await session.commit()
 
     async def _on_send_failure(
         self,
@@ -1992,6 +2049,8 @@ class CampaignRunner:
         resume_at = self._throttle_resume_at(exc)
         if resume_at is not None:
             reason = str(getattr(exc, "code", None) or "throttle")
+            if reason == "join_request_pending":
+                await self._record_join_request_pending(account_id, target_id, exc)
             if getattr(exc, "code", None) == "flood_wait":
                 await self._handle_account_failure(account_id, exc)
             async with self._session_factory() as session:

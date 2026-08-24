@@ -167,6 +167,21 @@ class FailingBatchPreflightGateway(RecordingChannelGateway):
         return await super().preflight_channel_comments(account=account, channel_ref=channel_ref)
 
 
+class PendingPrivateInviteGateway(RecordingChannelGateway):
+    async def preflight_channel_comments(
+        self,
+        *,
+        account: Account,
+        channel_ref: str,
+    ) -> ChannelCommentPreflight:
+        if channel_ref == "https://t.me/+privateInviteToken":
+            raise PermanentGatewayError(
+                "join request was sent and is waiting for approval",
+                code="join_request_pending",
+            )
+        return await super().preflight_channel_comments(account=account, channel_ref=channel_ref)
+
+
 class SelectivelyBlockedChannelGateway(RecordingChannelGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -303,7 +318,7 @@ async def test_new_launch_rejects_an_enabled_rule_for_the_same_channel(app: Fast
 
 
 @pytest.mark.asyncio
-async def test_channel_comment_accepts_preview_links_and_explains_private_links(
+async def test_channel_comment_accepts_preview_and_private_invite_links(
     app: FastAPI,
 ) -> None:
     service = _service(app, RecordingChannelGateway())
@@ -316,8 +331,43 @@ async def test_channel_comment_accepts_preview_links_and_explains_private_links(
         service._normalize_channel_ref("https://telegram.me/batch_comments_two/456#comments")
         == "@batch_comments_two"
     )
-    with pytest.raises(ConflictError, match="приватные invite-ссылки"):
+    assert (
         service._normalize_channel_ref("https://t.me/+privateInviteToken")
+        == "https://t.me/+privateInviteToken"
+    )
+    assert (
+        service._normalize_channel_ref("https://t.me/joinchat/privateInviteToken")
+        == "https://t.me/+privateInviteToken"
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_invite_join_request_creates_active_waiting_rule(app: FastAPI) -> None:
+    gateway = PendingPrivateInviteGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "private-comment-account")
+
+    rule = await service.create_rule(
+        name="Private comments",
+        channel_ref="https://t.me/+privateInviteToken",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Waiting is okay",
+        initial_delay_seconds=0,
+    )
+
+    assert rule.enabled is True
+    assert rule.channel_ref == "https://t.me/+privateInviteToken"
+    assert rule.last_error_code == "join_request_pending"
+    await service._record_scan_failure(
+        int(rule.id),
+        PermanentGatewayError("still waiting", code="join_request_pending"),
+    )
+    async with app.state.database.session_factory() as session:
+        stored = await session.get(ChannelCommentRule, rule.id)
+    assert stored is not None
+    assert stored.enabled is True
+    assert stored.last_error_code == "join_request_pending"
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,16 @@ class FloodWaitGateway:
         raise TemporaryGatewayError("flood wait 120s", retry_after=120, code="flood_wait")
 
 
+class JoinRequestPendingGateway:
+    async def send_message(self, **kwargs: object) -> SentMessage:
+        del kwargs
+        raise TemporaryGatewayError(
+            "join request accepted; approval is pending",
+            retry_after=300,
+            code="join_request_pending",
+        )
+
+
 class BlockingCountingGateway:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -1317,6 +1327,78 @@ async def test_flood_wait_cools_down_account_not_only_current_run(tmp_path) -> N
             if cooldown_until.tzinfo is None:
                 cooldown_until = cooldown_until.replace(tzinfo=UTC)
             assert cooldown_until > utc_now()
+
+    await app.state.database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_private_join_request_waits_for_approval_without_blocking_route(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'join-request-pending.db'}",
+        admin_api_key="test-admin-key",
+        dry_run=True,
+        worker_enabled=False,
+    )
+    app = create_app(settings=settings, gateway=JoinRequestPendingGateway())
+    await app.state.database.create_schema()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    headers = {"X-Admin-Key": "test-admin-key"}
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        account = (
+            await client.post(
+                "/api/v1/accounts",
+                headers=headers,
+                json={
+                    "label": "private-join",
+                    "telegram_user_id": 822,
+                    "ownership_confirmed": True,
+                },
+            )
+        ).json()
+        target = (
+            await client.post(
+                "/api/v1/targets",
+                headers=headers,
+                json={"chat_ref": "https://t.me/+privateInvite", "title": "Private chat"},
+            )
+        ).json()
+        await client.post(f"/api/v1/targets/{target['id']}/approve", headers=headers)
+        campaign = (
+            await client.post(
+                "/api/v1/campaigns",
+                headers=headers,
+                json={
+                    "name": "private-join-request",
+                    "mode": "broadcast",
+                    "primary_account_id": account["id"],
+                    "target_id": target["id"],
+                    "primary_text": "Hello",
+                },
+            )
+        ).json()
+        await client.post(
+            f"/api/v1/campaigns/{campaign['id']}/runs",
+            headers=headers,
+            json={"request_key": "private-join-request-001"},
+        )
+        result = await app.state.queue_worker.process_next()
+        assert result.status == RunStatus.QUEUED
+        assert result.error_code == "join_request_pending"
+        assert result.attempt_count == 0
+        assert ensure_utc(result.scheduled_for) > utc_now()
+
+        async with app.state.database.session_factory() as session:
+            state = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.account_id == account["id"],
+                    TargetAccountState.target_id == target["id"],
+                )
+            )
+            assert state is not None
+            assert state.membership_status == MembershipStatus.JOIN_PENDING
+            assert state.membership_error_code == "join_request_pending"
+            assert state.send_blocked is False
 
     await app.state.database.dispose()
 

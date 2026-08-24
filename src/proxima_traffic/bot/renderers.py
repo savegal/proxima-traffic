@@ -3974,6 +3974,11 @@ def _smart_waiting_state(reason: str | None, scheduled_for: datetime) -> str:
         return f"не удалось проверить активность; безопасно ждём повторную проверку {when}"
     if reason == "chat_timer":
         return f"ждём таймер чата · следующая {when}"
+    if reason == "join_request_pending":
+        return (
+            "заявка на вступление отправлена; ждём одобрения администратора "
+            f"· повторная проверка {when}"
+        )
     return f"следующая {when}"
 
 

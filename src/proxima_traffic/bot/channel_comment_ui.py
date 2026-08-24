@@ -513,7 +513,9 @@ def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[in
         ChannelCommentMode.DIALOGUE: "🧩 Цепочка",
         ChannelCommentMode.MESSAGE_EDIT: "✏️ С редактированием",
     }[rule.mode]
-    if rule.enabled:
+    if rule.enabled and rule.last_error_code == "join_request_pending":
+        state = "🕒 Заявка на вступление отправлена — ожидаем одобрения"
+    elif rule.enabled:
         state = "🟢 Отслеживание включено"
     elif rule.last_error_code in CHANNEL_COMMENT_AUTO_PAUSE_CODES:
         state = f"⛔ Автоматически остановлено: {failure_label(rule.last_error_code)}"

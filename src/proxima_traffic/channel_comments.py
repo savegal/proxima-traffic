@@ -328,25 +328,36 @@ class ChannelCommentService:
                     self._validate_account(dialogue_account)
                     accounts[account_id] = dialogue_account
 
-        # A paused rule is history, not a lock on the channel.  A new explicit
-        # launch replaces it after its Telegram preflight succeeds.  Only a
-        # currently enabled rule can create duplicate comments and must block
-        # this flow before making any Telegram calls.
+        # A paused rule is history, not a lock on the channel.  A currently
+        # enabled rule does protect its own channel from a duplicate flow, but
+        # it must not prevent the other channels of a batch from being armed.
         async with self._session_factory() as session:
-            conflicting = await session.scalar(
-                select(ChannelCommentRule.id).where(
-                    ChannelCommentRule.archived_at.is_(None),
-                    ChannelCommentRule.enabled.is_(True),
-                    or_(
-                        ChannelCommentRule.channel_ref.in_(normalized_refs),
-                        ChannelCommentRule.name.in_(normalized_names),
-                    ),
+            active_rules = list(
+                await session.scalars(
+                    select(ChannelCommentRule).where(
+                        ChannelCommentRule.archived_at.is_(None),
+                        ChannelCommentRule.enabled.is_(True),
+                        or_(
+                            ChannelCommentRule.channel_ref.in_(normalized_refs),
+                            ChannelCommentRule.name.in_(normalized_names),
+                        ),
+                    )
                 )
             )
-        if conflicting is not None:
-            raise ConflictError(
-                "этот канал уже отслеживается активным правилом; сначала остановите его"
-            )
+        active_refs = {rule.channel_ref for rule in active_rules}
+        active_names = {rule.name for rule in active_rules}
+        candidate_rules: list[tuple[str, str]] = []
+        failures: list[tuple[str, str]] = []
+        for rule_name, channel_ref in zip(normalized_names, normalized_refs, strict=True):
+            if channel_ref in active_refs or rule_name in active_names:
+                failures.append(
+                    (
+                        channel_ref,
+                        "уже отслеживается активным правилом; сначала остановите его",
+                    )
+                )
+                continue
+            candidate_rules.append((rule_name, channel_ref))
 
         # One Telegram preflight per channel is intentional: discussion groups
         # and sender permissions may differ even when the flow is identical.
@@ -358,8 +369,7 @@ class ChannelCommentService:
         # instead of treating approval as a configuration failure.  The scan
         # loop will re-check membership and start on its own after approval.
         ready_rules: list[tuple[str, str, ChannelCommentPreflight | None, str | None]] = []
-        failures: list[tuple[str, str]] = []
-        for rule_name, channel_ref in zip(normalized_names, normalized_refs, strict=True):
+        for rule_name, channel_ref in candidate_rules:
             try:
                 ready_rules.append(
                     (
@@ -379,8 +389,7 @@ class ChannelCommentService:
         if not ready_rules:
             details = "; ".join(f"{channel}: {reason}" for channel, reason in failures)
             raise ConflictError(
-                "ни один канал не прошёл проверку"
-                + (f": {details}" if details else "")
+                "ни один канал не прошёл проверку" + (f": {details}" if details else "")
             )
         async with self._session_factory() as session:
             # Repeat the active-rule check in the write transaction: another
@@ -402,10 +411,34 @@ class ChannelCommentService:
                     )
                 )
             )
-            if any(rule.enabled for rule in overlapping_rules):
-                raise ConflictError(
-                    "этот канал уже отслеживается активным правилом; сначала остановите его"
-                )
+            raced_active_rules = [rule for rule in overlapping_rules if rule.enabled]
+            if raced_active_rules:
+                raced_refs = {rule.channel_ref for rule in raced_active_rules}
+                raced_names = {rule.name for rule in raced_active_rules}
+                retained_rules: list[
+                    tuple[str, str, ChannelCommentPreflight | None, str | None]
+                ] = []
+                raced_failures: list[tuple[str, str]] = []
+                for prepared_rule in ready_rules:
+                    rule_name, channel_ref, _, _ = prepared_rule
+                    if channel_ref in raced_refs or rule_name in raced_names:
+                        raced_failures.append(
+                            (
+                                channel_ref,
+                                (
+                                    "стало активно отслеживаться во время проверки; "
+                                    "повторите при необходимости"
+                                ),
+                            )
+                        )
+                    else:
+                        retained_rules.append(prepared_rule)
+                ready_rules = retained_rules
+                if preflight_failures is not None:
+                    preflight_failures.extend(raced_failures)
+                if not ready_rules:
+                    raise ConflictError("ни один канал не доступен для нового запуска")
+                overlapping_rules = [rule for rule in overlapping_rules if not rule.enabled]
 
             retired_at = utc_now()
             for predecessor in overlapping_rules:
@@ -3225,12 +3258,17 @@ class ChannelCommentService:
             if parts and parts[0].casefold() == "s":
                 # Telegram's preview links use /s/<username>/<post-id>.
                 parts = parts[1:]
-            if parts and parts[0].casefold() not in {
-                "+",
-                "c",
-                "joinchat",
-                "addlist",
-            } and not parts[0].startswith("+"):
+            if (
+                parts
+                and parts[0].casefold()
+                not in {
+                    "+",
+                    "c",
+                    "joinchat",
+                    "addlist",
+                }
+                and not parts[0].startswith("+")
+            ):
                 normalized = "@" + parts[0]
             elif parts and parts[0].casefold() == "joinchat" and len(parts) == 2:
                 normalized = "https://t.me/+" + parts[1]

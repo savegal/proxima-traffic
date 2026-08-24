@@ -318,6 +318,41 @@ async def test_new_launch_rejects_an_enabled_rule_for_the_same_channel(app: Fast
 
 
 @pytest.mark.asyncio
+async def test_batch_creation_skips_an_already_active_channel(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "batch-active-conflict-comment-account")
+
+    await service.create_rule(
+        name="Уже активно",
+        channel_ref="@already_active_comment_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Первый текст",
+        initial_delay_seconds=0,
+    )
+    failures: list[tuple[str, str]] = []
+    rules = await service.create_rules(
+        name="Новый пакет",
+        channel_refs=("@already_active_comment_channel", "@new_comment_channel"),
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=int(account.id),
+        primary_text="Новый текст",
+        initial_delay_seconds=0,
+        preflight_failures=failures,
+    )
+
+    assert [rule.channel_ref for rule in rules] == ["@new_comment_channel"]
+    assert failures == [
+        (
+            "@already_active_comment_channel",
+            "уже отслеживается активным правилом; сначала остановите его",
+        )
+    ]
+    assert (int(account.id), "@already_active_comment_channel") not in gateway.preflight_calls[1:]
+
+
+@pytest.mark.asyncio
 async def test_channel_comment_accepts_preview_and_private_invite_links(
     app: FastAPI,
 ) -> None:

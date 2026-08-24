@@ -14331,6 +14331,11 @@ async def create_channel_comment_rule(
     repository: AdminRepository,
     settings: Settings,
 ) -> None:
+    # Telegram callbacks expire quickly, while a live preflight may need to
+    # resolve several channels and their linked discussion groups. Acknowledge
+    # the button before doing network work; the durable result is delivered as
+    # a normal message below instead of a late (and failing) callback toast.
+    await callback.answer("Проверяем каналы и доступ аккаунта…")
     data = await state.get_data()
     mode = ChannelCommentMode(str(data["comment_mode"]))
     skipped_channels: list[tuple[str, str]] = []
@@ -14385,15 +14390,18 @@ async def create_channel_comment_rule(
             preflight_failures=skipped_channels,
         )
     except (ConflictError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        if callback.message is not None:
+            await callback.message.answer(
+                f"⚠️ <b>Настройка не создана</b>\n\n{escape(callback_error_message(exc))}"
+            )
         return
     await state.clear()
     count = len(rules)
-    await callback.answer(
+    result_text = (
         "Канал включён: новые посты будут отслеживаться"
         if count == 1
         else f"Включено каналов: {count}"
-        + (f" · пропущено: {len(skipped_channels)}" if skipped_channels else ""),
+        + (f" · пропущено: {len(skipped_channels)}" if skipped_channels else "")
     )
     await _show_channel_comment_details(
         callback,
@@ -14403,6 +14411,8 @@ async def create_channel_comment_rule(
         rule_id=rules[0].id,
         page=0,
     )
+    if callback.message is not None:
+        await callback.message.answer(f"✅ {result_text}")
     if skipped_channels and callback.message is not None:
         skipped_text = "\n".join(
             f"• <code>{escape(channel_ref)}</code> — {escape(reason)}"

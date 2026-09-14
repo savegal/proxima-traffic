@@ -26,6 +26,21 @@ from proxima_traffic.models import (
 )
 
 
+def _direct_failure_label(code: str) -> str:
+    if code == "delivery_unconfirmed":
+        return "результат отправки Telegram не подтверждён"
+    return failure_label(code)
+
+
+def _direct_failure_hint(code: str) -> str | None:
+    if code == "recipient_unavailable":
+        return (
+            "Обновите данные получателя. Без новых данных следующий запуск может снова "
+            "получить тот же отказ Telegram."
+        )
+    return failure_hint(code)
+
+
 def direct_messages_home_text(dashboard: DirectMessageDashboard) -> str:
     if dashboard.list_count == 0:
         next_step = "📥 Импортируйте первую базу подписчиков."
@@ -704,8 +719,8 @@ def direct_launch_details_text(view: DirectLaunchView) -> str:
             issue += f"\nАккаунт: <b>{escape(view.last_error_account_label)}</b>"
         if view.last_error_recipient:
             issue += f"\nПолучатель: <code>{escape(view.last_error_recipient)}</code>"
-        issue += f"\nПричина: <b>{escape(failure_label(view.last_error_code))}</b>"
-        hint = failure_hint(view.last_error_code)
+        issue += f"\nПричина: <b>{escape(_direct_failure_label(view.last_error_code))}</b>"
+        hint = _direct_failure_hint(view.last_error_code)
         if hint:
             issue += f"\nЧто делать: {escape(hint)}"
         if view.last_error_status == DirectMessageTaskStatus.QUEUED:

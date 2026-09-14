@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import proxima_traffic.subscriber_import as subscriber_import
 from proxima_traffic.subscriber_import import (
     MAX_SUBSCRIBER_LINE_BYTES,
     SubscriberImportError,
@@ -41,3 +42,14 @@ def test_oversized_line_is_drained_and_next_record_is_still_imported(tmp_path: P
     assert stats.invalid == 1
     assert stats.issues[0].reason == "строка больше 64 КБ"
     assert stats.decoded_bytes == source.stat().st_size
+
+
+def test_decoded_byte_budget_stops_oversized_stream_before_end_of_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "budget.jsonl"
+    source.write_bytes(b"x" * 4_096)
+    monkeypatch.setattr(subscriber_import, "MAX_SUBSCRIBER_IMPORT_BYTES", 512)
+
+    with pytest.raises(SubscriberImportError, match="256 МБ"):
+        list(iter_subscriber_records(source))

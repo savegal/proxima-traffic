@@ -105,8 +105,6 @@ def _parameter_batches(values: Iterable[int]) -> Iterator[tuple[int, ...]]:
     iterator = iter(values)
     while batch := tuple(islice(iterator, SQLITE_PARAMETER_BATCH_SIZE)):
         yield batch
-
-
 DIRECT_RECIPIENT_ROUTE_CODES = frozenset(
     {
         "recipient_privacy_restricted",
@@ -1451,6 +1449,12 @@ class DirectMessageService:
         lease_until = now + timedelta(seconds=max(30, self._settings.worker_lease_seconds))
         recovered_launch_ids: set[int] = set()
         async with self._session_factory() as session:
+            # A task that was running when its launch was cancelled cannot be
+            # returned to QUEUED: the claim query deliberately excludes the
+            # launch, which would otherwise strand both task and recipient
+            # reservation forever.  We do not know whether a dead worker had
+            # already reached Telegram, so retain an explicit unknown-outcome
+            # failure rather than claiming that the message was not sent.
             cancelled_expired_tasks = list(
                 await session.scalars(
                     select(DirectMessageTask)

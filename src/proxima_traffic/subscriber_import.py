@@ -94,17 +94,25 @@ def iter_subscriber_records(
     import_stats = stats if stats is not None else SubscriberParseStats()
     seen_ids: set[int] = set()
     for source_name, stream in _subscriber_streams(Path(path)):
-        for line_number, raw_line in enumerate(stream, start=1):
+        line_number = 0
+        while True:
+            remaining_bytes = MAX_SUBSCRIBER_IMPORT_BYTES - import_stats.decoded_bytes
+            line = _read_stream_line(
+                source_name,
+                stream,
+                decoded_budget=remaining_bytes,
+            )
+            if line is None:
+                break
+            raw_line, line_size, oversized = line
+            line_number += 1
             import_stats.total_lines += 1
             if import_stats.total_lines > MAX_SUBSCRIBER_IMPORT_RECORDS:
                 raise SubscriberImportError(
                     f"в одном импорте допускается не больше {MAX_SUBSCRIBER_IMPORT_RECORDS:,} строк"
                 )
-            line_size = len(raw_line)
             import_stats.decoded_bytes += line_size
-            if import_stats.decoded_bytes > MAX_SUBSCRIBER_IMPORT_BYTES:
-                raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
-            if line_size > MAX_SUBSCRIBER_LINE_BYTES:
+            if oversized:
                 import_stats.add_issue(source_name, line_number, "строка больше 64 КБ")
                 continue
             raw_line = raw_line.strip()
@@ -136,6 +144,70 @@ def iter_subscriber_records(
             seen_ids.add(record.telegram_user_id)
             import_stats.valid_records += 1
             yield record
+
+
+def _read_stream_chunk(source_name: str, stream: BinaryIO, limit: int) -> bytes:
+    """Read one bounded line chunk and normalize lazy archive failures."""
+
+    try:
+        return stream.readline(limit)
+    except (gzip.BadGzipFile, zipfile.BadZipFile, EOFError, OSError) as exc:
+        source = Path(source_name).name[:120] or "файл импорта"
+        raise SubscriberImportError(f"часть {source!r} повреждена или не читается") from exc
+
+
+def _read_stream_line(
+    source_name: str,
+    stream: BinaryIO,
+    *,
+    decoded_budget: int,
+) -> tuple[bytes, int, bool] | None:
+    """Read one physical line without exceeding memory or decompressed-byte limits."""
+
+    if decoded_budget <= 0:
+        probe = _read_stream_chunk(source_name, stream, 1)
+        if not probe:
+            return None
+        raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
+
+    chunk_limit = MAX_SUBSCRIBER_LINE_BYTES + 1
+    first = _read_stream_chunk(
+        source_name,
+        stream,
+        min(chunk_limit, decoded_budget + 1),
+    )
+    if not first:
+        return None
+    line_size = len(first)
+    if line_size > decoded_budget:
+        raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
+    oversized = line_size > MAX_SUBSCRIBER_LINE_BYTES
+    complete = first.endswith(b"\n")
+
+    while not complete:
+        remaining = decoded_budget - line_size
+        if remaining <= 0:
+            probe = _read_stream_chunk(source_name, stream, 1)
+            if probe:
+                raise SubscriberImportError(
+                    "распакованный файл превышает безопасный лимит 256 МБ"
+                )
+            break
+        tail = _read_stream_chunk(
+            source_name,
+            stream,
+            min(chunk_limit, remaining + 1),
+        )
+        if not tail:
+            break
+        line_size += len(tail)
+        if line_size > decoded_budget:
+            raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
+        if line_size > MAX_SUBSCRIBER_LINE_BYTES:
+            oversized = True
+        complete = tail.endswith(b"\n")
+
+    return first, line_size, oversized
 
 
 def _normalize_record(value: object) -> SubscriberRecord:
@@ -200,10 +272,13 @@ def _subscriber_streams(path: Path) -> Iterator[tuple[str, BinaryIO]]:
         try:
             with gzip.open(path, "rb") as stream:
                 yield path.name, stream
-        except (gzip.BadGzipFile, OSError) as exc:
+        except (gzip.BadGzipFile, EOFError, OSError) as exc:
             raise SubscriberImportError("GZIP повреждён или не читается") from exc
         return
     if not lowered.endswith(".jsonl"):
         raise SubscriberImportError("поддерживаются .jsonl, .jsonl.gz и .zip")
-    with path.open("rb") as stream:
-        yield path.name, stream
+    try:
+        with path.open("rb") as stream:
+            yield path.name, stream
+    except OSError as exc:
+        raise SubscriberImportError("JSONL повреждён или не читается") from exc

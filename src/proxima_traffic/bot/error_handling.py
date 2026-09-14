@@ -7,7 +7,7 @@ from html import escape
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import CallbackQuery, ErrorEvent, Message, Update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from proxima_traffic.accounts import (
     AccountImportError,
@@ -46,10 +46,20 @@ def operator_error_message(exception: Exception) -> str:
         return "Telegram временно недоступен для панели. Действие не повторялось автоматически."
     if isinstance(exception, (TimeoutError, ConnectionError, OSError)):
         return "Временная ошибка сети. Действие не повторялось автоматически; попробуйте ещё раз."
+    if isinstance(exception, IntegrityError):
+        return (
+            "Действие нельзя завершить: объект связан с сохранёнными данными. "
+            "Ничего не удалено; проверьте связанные кампании или историю запусков."
+        )
+    if isinstance(exception, OperationalError):
+        return (
+            "База данных сейчас не смогла выполнить операцию. Ничего не повторялось "
+            "автоматически; обновите экран и попробуйте ещё раз."
+        )
     if isinstance(exception, SQLAlchemyError):
         return (
-            "База данных временно занята. Обновите экран и повторите действие через "
-            "несколько секунд."
+            "Не удалось изменить данные из-за внутренней ошибки базы. Ничего не повторялось "
+            "автоматически; обновите экран перед следующей попыткой."
         )
     if isinstance(exception, ConflictError):
         return safe_error_message(exception)[:500]

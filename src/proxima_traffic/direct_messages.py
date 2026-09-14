@@ -46,6 +46,9 @@ from proxima_traffic.models import (
     ProxyStatus,
     Subscriber,
     SubscriberAccountPeer,
+    SubscriberInviteAccountRoute,
+    SubscriberInviteCampaign,
+    SubscriberInviteLaunch,
     SubscriberInviteTask,
     SubscriberList,
     SubscriberListMember,
@@ -413,6 +416,20 @@ class DirectMessageService:
                 )
                 .values(
                     send_blocked=False,
+                    blocked_reason=None,
+                    last_error=None,
+                    updated_at=imported_at,
+                )
+            )
+            await session.execute(
+                update(SubscriberInviteAccountRoute)
+                .where(
+                    SubscriberInviteAccountRoute.subscriber_id.in_(routable_subscriber_ids),
+                    SubscriberInviteAccountRoute.blocked_reason
+                    == "invite_recipient_unresolvable",
+                )
+                .values(
+                    invite_blocked=False,
                     blocked_reason=None,
                     last_error=None,
                     updated_at=imported_at,
@@ -792,7 +809,7 @@ class DirectMessageService:
             item = await session.get(SubscriberList, list_id)
             if item is None:
                 raise NotFoundError("база подписчиков не найдена")
-            campaign_count = int(
+            direct_campaign_count = int(
                 await session.scalar(
                     select(func.count(DirectCampaign.id)).where(
                         DirectCampaign.subscriber_list_id == list_id
@@ -800,8 +817,38 @@ class DirectMessageService:
                 )
                 or 0
             )
-            if campaign_count:
+            if direct_campaign_count:
                 raise ConflictError("база используется сохранёнными ЛС-рассылками")
+            invite_campaign_count = int(
+                await session.scalar(
+                    select(func.count(SubscriberInviteCampaign.id)).where(
+                        SubscriberInviteCampaign.subscriber_list_id == list_id
+                    )
+                )
+                or 0
+            )
+            if invite_campaign_count:
+                raise ConflictError("база используется сохранёнными кампаниями приглашений")
+            direct_launch_count = int(
+                await session.scalar(
+                    select(func.count(DirectLaunch.id)).where(
+                        DirectLaunch.subscriber_list_id == list_id
+                    )
+                )
+                or 0
+            )
+            if direct_launch_count:
+                raise ConflictError("база связана с историей запусков ЛС-рассылок")
+            invite_launch_count = int(
+                await session.scalar(
+                    select(func.count(SubscriberInviteLaunch.id)).where(
+                        SubscriberInviteLaunch.subscriber_list_id == list_id
+                    )
+                )
+                or 0
+            )
+            if invite_launch_count:
+                raise ConflictError("база связана с историей запусков приглашений")
             await session.delete(item)
             await session.flush()
             await session.execute(

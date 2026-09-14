@@ -1,5 +1,5 @@
 from aiogram.types import CallbackQuery, ErrorEvent, Update, User
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from proxima_traffic.bot import error_handling
 from proxima_traffic.bot.error_handling import (
@@ -19,6 +19,21 @@ def test_operator_error_never_exposes_internal_exception_for_bad_input() -> None
     assert "База данных" in _operator_error(OperationalError("SELECT 1", {}, RuntimeError("busy")))
     assert "Временная ошибка сети" in _operator_error(ConnectionError("socket details"))
     assert "Spintax" in _operator_error(ContentError("Spintax: лишняя скобка"))
+
+
+def test_integrity_error_explains_linked_data_instead_of_claiming_database_is_busy() -> None:
+    message = _operator_error(
+        IntegrityError(
+            "DELETE FROM subscriber_lists WHERE id = ?",
+            {"id": 1},
+            RuntimeError("FOREIGN KEY constraint failed: private schema detail"),
+        )
+    )
+
+    assert "связан" in message
+    assert "Ничего не удалено" in message
+    assert "FOREIGN KEY" not in message
+    assert "private schema detail" not in message
 
 
 def test_callback_error_is_short_and_never_exposes_transport_details() -> None:

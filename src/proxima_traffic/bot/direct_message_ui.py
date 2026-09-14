@@ -26,6 +26,21 @@ from proxima_traffic.models import (
 )
 
 
+def _direct_failure_label(code: str) -> str:
+    if code == "delivery_unconfirmed":
+        return "результат отправки Telegram не подтверждён"
+    return failure_label(code)
+
+
+def _direct_failure_hint(code: str) -> str | None:
+    if code == "recipient_unavailable":
+        return (
+            "Обновите данные получателя. Без новых данных следующий запуск может снова "
+            "получить тот же отказ Telegram."
+        )
+    return failure_hint(code)
+
+
 def direct_messages_home_text(dashboard: DirectMessageDashboard) -> str:
     if dashboard.list_count == 0:
         next_step = "📥 Импортируйте первую базу подписчиков."
@@ -49,16 +64,17 @@ def direct_messages_home_text(dashboard: DirectMessageDashboard) -> str:
         f"⭐ Premium: <b>{dashboard.premium_count:,}</b>\n"
         f"🔗 С username: <b>{dashboard.username_count:,}</b>\n\n"
         f"🚫 В глобальном стоп-листе: <b>{dashboard.blacklist_count:,}</b>\n\n"
-        f"{section('Рассылки в ЛС')}\n"
+        f"{section('Основные статусы задач ЛС')}\n"
         f"📝 Заготовок: <b>{dashboard.campaign_count:,}</b>\n"
         f"🔵 Активных запусков: <b>{dashboard.active_launches:,}</b>\n"
         f"🕒 В очереди: <b>{dashboard.queued_tasks:,}</b>"
-        f" · отправляется: <b>{dashboard.running_tasks:,}</b>\n"
-        f"✅ Доставлено: <b>{dashboard.succeeded_tasks:,}</b>"
-        f" · ⏭ пропущено: <b>{dashboard.skipped_tasks:,}</b>"
-        f" · ❌ ошибок: <b>{dashboard.failed_tasks:,}</b>\n\n"
-        "<i>Сервис соблюдает общий лимит каждого аккаунта, не списывает Stars "
-        "и не повторяет сообщение одному человеку раньше заданного срока.</i>"
+        f" · выполняется: <b>{dashboard.running_tasks:,}</b>\n"
+        f"✅ Telegram подтвердил отправку: <b>{dashboard.succeeded_tasks:,}</b>\n"
+        f"⏭ Пропущено без отправки: <b>{dashboard.skipped_tasks:,}</b>\n"
+        f"⚠️ Ошибка или неясный результат: <b>{dashboard.failed_tasks:,}</b>\n\n"
+        "<i>На главной показаны основные статусы; отменённые задачи видны внутри конкретного "
+        "запуска. Успешная отправка не означает, что человек прочитал сообщение. Сервис "
+        "не списывает Stars и соблюдает заданную защиту от повтора.</i>"
     )
 
 
@@ -136,8 +152,9 @@ def subscriber_import_prompt_text(max_upload_bytes: int) -> str:
         '"is_premium":true}</code>\n\n'
         f"Лимит загружаемого файла: <b>{max_upload_bytes // (1024 * 1024)} МБ</b>; "
         "после распаковки — 256 МБ или 2 000 000 строк. Обработка идёт построчно, "
-        "дубликаты объединяются по Telegram ID. Повторный файл с тем же названием "
-        "обновит существующую базу."
+        "дубликаты объединяются по Telegram ID. Повторный файл с тем же логическим "
+        "названием добавляет новые записи и обновляет найденные профили; люди, которых нет "
+        "в новом файле, автоматически из существующей базы не удаляются."
     )
 
 
@@ -150,19 +167,20 @@ def subscriber_import_result_text(result: SubscriberImportResult) -> str:
             "Они пропущены без остановки остальных данных."
         )
     return (
-        screen_title("База импортирована", "Результат обработки") + "\n\n"
+        screen_title("База импортирована", "Фактический результат обработки") + "\n\n"
         f"Название: <b>{escape(subscriber_list.name)}</b>\n"
         f"Строк прочитано: <b>{result.total_lines:,}</b>\n"
-        f"Корректных записей: <b>{result.valid_records:,}</b>\n"
-        f"Добавлено в эту базу: <b>{result.added_members:,}</b>\n"
-        f"Новых людей глобально: <b>{result.inserted_profiles:,}</b>\n"
-        f"Обновлено профилей: <b>{result.updated_profiles:,}</b>\n"
-        f"Дубликатов в файле: <b>{result.duplicates:,}</b>{issue_note}\n\n"
-        "<b>Готовые сегменты</b>\n"
+        f"Корректных уникальных записей: <b>{result.valid_records:,}</b>\n"
+        f"Добавлено участников именно в эту базу: <b>{result.added_members:,}</b>\n"
+        f"Новых людей в общей таблице: <b>{result.inserted_profiles:,}</b>\n"
+        f"Существующих профилей обработано: <b>{result.updated_profiles:,}</b>\n"
+        f"Дубликатов Telegram ID внутри файла: <b>{result.duplicates:,}</b>{issue_note}\n\n"
+        "<b>Текущее состояние базы после импорта</b>\n"
         f"👤 Всего: <b>{subscriber_list.member_count:,}</b>\n"
         f"⭐ Premium: <b>{subscriber_list.premium_count:,}</b>\n"
         f"Обычные: <b>{subscriber_list.non_premium_count:,}</b>\n"
-        f"🔗 С username: <b>{subscriber_list.username_count:,}</b>"
+        f"🔗 С username: <b>{subscriber_list.username_count:,}</b>\n\n"
+        "<i>Импорт работает как добавление/обновление, а не как полная замена базы.</i>"
     )
 
 
@@ -260,9 +278,10 @@ def subscriber_list_details_text(item: SubscriberList) -> str:
         f"🔗 С username: <b>{item.username_count:,}</b>\n"
         f"Только ID: <b>{max(0, item.member_count - item.username_count):,}</b>\n\n"
         "<b>Последний импорт</b>\n"
-        f"Прочитано: <b>{item.last_import_total:,}</b> · добавлено: "
-        f"<b>{item.last_import_added:,}</b> · обновлено: <b>{item.last_import_updated:,}</b>\n"
-        f"Дубли: <b>{item.last_import_duplicates:,}</b> · ошибки: "
+        f"Прочитано строк: <b>{item.last_import_total:,}</b> · добавлено участников: "
+        f"<b>{item.last_import_added:,}</b>\n"
+        f"Существующих профилей обработано: <b>{item.last_import_updated:,}</b>\n"
+        f"Дубли: <b>{item.last_import_duplicates:,}</b> · некорректные строки: "
         f"<b>{item.last_import_invalid:,}</b>{error}"
     )
 
@@ -521,7 +540,7 @@ def direct_campaign_confirmation_text(view: DirectCampaignView) -> str:
         f"База: <b>{escape(view.list_name)}</b>\n"
         f"Сегмент: <b>{segment}</b>\n"
         f"Запрошено: <b>{campaign.recipient_limit:,}</b>\n"
-        f"Сейчас доступно: <b>{view.eligible_count:,}</b>\n"
+        f"Проходят фильтры сейчас: <b>{view.eligible_count:,}</b>\n"
         f"С username: <b>{view.username_count:,}</b>\n"
         f"На паузе повтора: <b>{view.recent_count:,}</b>\n"
         f"Уже заняты другим запуском: <b>{view.reserved_count:,}</b>\n"
@@ -529,7 +548,8 @@ def direct_campaign_confirmation_text(view: DirectCampaignView) -> str:
         f"Не писать повторно: <b>{campaign.contact_cooldown_days} дн.</b>{media}\n\n"
         f"<blockquote>{content_preview}</blockquote>\n"
         "⚠️ Запускайте только по людям, которые согласились получать ваши сообщения. "
-        "Stars за платные сообщения автоматически не списываются."
+        "Прохождение фильтров не гарантирует отправку: Telegram может отклонить конкретного "
+        "получателя или маршрут. Stars автоматически не списываются."
     )
 
 
@@ -639,7 +659,9 @@ def direct_launches_text(
     for view in items:
         lines.append(
             f"{icons[view.launch.status]} <b>{escape(view.campaign_name)}</b> · #{view.launch.id}\n"
-            f"   ✅ {view.succeeded} · 🕒 {view.active} · ⏭ {view.skipped} · ❌ {view.failed}"
+            f"   ✅ отправлено {view.succeeded:,} · ⏳ активно {view.active:,}\n"
+            f"   ⏭ пропущено {view.skipped:,} · ⚠️ ошибка/неясно {view.failed:,} · "
+            f"⏹ отменено {view.cancelled:,}"
         )
     if not items:
         lines.append("Запусков пока нет. После старта здесь появятся прогресс и причины пропусков.")
@@ -682,7 +704,7 @@ def direct_launch_details_text(view: DirectLaunchView) -> str:
         DirectLaunchStatus.RUNNING: "🔵 выполняется",
         DirectLaunchStatus.SUCCEEDED: "✅ завершён",
         DirectLaunchStatus.PARTIAL: "🟡 завершён частично",
-        DirectLaunchStatus.FAILED: "❌ не выполнен",
+        DirectLaunchStatus.FAILED: "❌ завершён с ошибкой",
         DirectLaunchStatus.CANCELLED: "⏸ остановлен",
     }[launch.status]
     issue = ""
@@ -692,13 +714,13 @@ def direct_launch_details_text(view: DirectLaunchView) -> str:
             "Это штатная пауза — сервис продолжит сам.</i>"
         )
     elif view.last_error_code:
-        issue = "\n\n<b>⚠️ Требуется внимание</b>"
+        issue = "\n\n<b>⚠️ Последняя зафиксированная ситуация</b>"
         if view.last_error_account_label:
             issue += f"\nАккаунт: <b>{escape(view.last_error_account_label)}</b>"
         if view.last_error_recipient:
             issue += f"\nПолучатель: <code>{escape(view.last_error_recipient)}</code>"
-        issue += f"\nПричина: <b>{escape(failure_label(view.last_error_code))}</b>"
-        hint = failure_hint(view.last_error_code)
+        issue += f"\nПричина: <b>{escape(_direct_failure_label(view.last_error_code))}</b>"
+        hint = _direct_failure_hint(view.last_error_code)
         if hint:
             issue += f"\nЧто делать: {escape(hint)}"
         if view.last_error_status == DirectMessageTaskStatus.QUEUED:
@@ -706,9 +728,19 @@ def direct_launch_details_text(view: DirectLaunchView) -> str:
                 "\n<i>Попытка перенесена; остальные доступные отправители продолжают работу.</i>"
             )
         elif view.last_error_status == DirectMessageTaskStatus.SKIPPED:
-            issue += "\n<i>Этот получатель пропущен; остальные задачи продолжаются.</i>"
+            issue += "\n<i>Получатель пропущен; подтверждённой отправки ему нет.</i>"
         elif view.last_error_status == DirectMessageTaskStatus.FAILED:
-            issue += "\n<i>Задача завершена без небезопасного повтора.</i>"
+            if view.last_error_code in {
+                "delivery_unconfirmed",
+                "step_timeout",
+                "cancelled_outcome_unknown",
+            }:
+                issue += (
+                    "\n<i>Итог отправки не подтверждён. Система не считает это успешной "
+                    "отправкой и не делает небезопасный повтор.</i>"
+                )
+            else:
+                issue += "\n<i>Задача завершена с ошибкой без небезопасного повтора.</i>"
     exclusions: list[str] = []
     if launch.excluded_recent:
         exclusions.append(f"не повторяем сейчас: <b>{launch.excluded_recent:,}</b>")
@@ -717,18 +749,30 @@ def direct_launch_details_text(view: DirectLaunchView) -> str:
     excluded_text = (
         "\n\n<i>При старте не включены — " + " · ".join(exclusions) + ".</i>" if exclusions else ""
     )
+    accounted = view.succeeded + view.queued + view.running + view.skipped + view.failed + view.cancelled
+    integrity_note = ""
+    if accounted != launch.total_tasks:
+        integrity_note = (
+            "\n\n⚠️ <b>Сводка задач расходится с запуском:</b> "
+            f"учтено {accounted:,} из {launch.total_tasks:,}. Обновите экран; "
+            "если расхождение останется — проверьте журнал."
+        )
     return (
         screen_title(f"Запуск #{launch.id}", f"Состояние: {status}") + "\n"
         f"Заготовка: <b>{escape(view.campaign_name)}</b>\n"
         f"База: <b>{escape(view.list_name)}</b>\n\n"
-        f"{section('Результат')}\n"
-        f"Получателей: <b>{launch.total_tasks:,}</b>\n"
-        f"✅ Доставлено: <b>{view.succeeded:,}</b>\n"
-        f"🕒 В очереди и работе: <b>{view.active:,}</b>\n"
-        f"⏭ Пропущено: <b>{view.skipped:,}</b>\n"
-        f"❌ Ошибок: <b>{view.failed:,}</b>\n"
-        f"⏸ Отменено: <b>{view.cancelled:,}</b>"
-        f"{excluded_text}{issue}"
+        f"{section('Фактический результат')}\n"
+        f"Всего задач запуска: <b>{launch.total_tasks:,}</b>\n"
+        f"✅ Telegram подтвердил отправку: <b>{view.succeeded:,}</b>\n"
+        f"🕒 В очереди: <b>{view.queued:,}</b>\n"
+        f"🔵 Выполняется сейчас: <b>{view.running:,}</b>\n"
+        f"⏭ Пропущено без отправки: <b>{view.skipped:,}</b>\n"
+        f"⚠️ Ошибка или неясный результат: <b>{view.failed:,}</b>\n"
+        f"⏹ Отменено до отправки: <b>{view.cancelled:,}</b>\n\n"
+        "<i>«Telegram подтвердил отправку» означает успешный ответ операции для нужного "
+        "получателя; это не означает, что человек прочитал сообщение. Неясные исходы в этот "
+        "счётчик не входят.</i>"
+        f"{integrity_note}{excluded_text}{issue}"
     )
 
 

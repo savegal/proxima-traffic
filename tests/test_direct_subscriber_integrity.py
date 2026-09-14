@@ -35,7 +35,9 @@ def _settings(tmp_path: Path, name: str) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_reimport_with_username_recovers_invite_unresolvable_route(tmp_path: Path) -> None:
+async def test_reimport_with_username_recovers_only_invite_unresolvable_route(
+    tmp_path: Path,
+) -> None:
     settings = _settings(tmp_path, "invite-route-recovery.db")
     database = Database(settings.database_url)
     await database.create_schema()
@@ -51,23 +53,34 @@ async def test_reimport_with_username_recovers_invite_unresolvable_route(tmp_pat
             username=None,
             is_premium=None,
         )
-        account = Account(label="sender", ownership_confirmed=True)
-        session.add_all([subscriber_list, subscriber, account])
+        unresolved_account = Account(label="unresolved-sender", ownership_confirmed=True)
+        privacy_account = Account(label="privacy-sender", ownership_confirmed=True)
+        session.add_all([subscriber_list, subscriber, unresolved_account, privacy_account])
         await session.flush()
-        route = SubscriberInviteAccountRoute(
+        unresolved_route = SubscriberInviteAccountRoute(
             subscriber_id=int(subscriber.id),
-            account_id=int(account.id),
+            account_id=int(unresolved_account.id),
             access_hash=None,
             invite_blocked=True,
             blocked_reason="invite_recipient_unresolvable",
             last_error="old unresolved route",
             updated_at=now,
         )
-        session.add(route)
+        privacy_route = SubscriberInviteAccountRoute(
+            subscriber_id=int(subscriber.id),
+            account_id=int(privacy_account.id),
+            access_hash=None,
+            invite_blocked=True,
+            blocked_reason="invite_recipient_privacy",
+            last_error="privacy restriction",
+            updated_at=now,
+        )
+        session.add_all([unresolved_route, privacy_route])
         await session.commit()
         list_id = int(subscriber_list.id)
         subscriber_id = int(subscriber.id)
-        route_id = int(route.id)
+        unresolved_route_id = int(unresolved_route.id)
+        privacy_route_id = int(privacy_route.id)
 
     async with database.session_factory() as session:
         await DirectMessageService._import_batch(
@@ -85,12 +98,17 @@ async def test_reimport_with_username_recovers_invite_unresolvable_route(tmp_pat
         await session.commit()
 
     async with database.session_factory() as session:
-        route = await session.get(SubscriberInviteAccountRoute, route_id)
+        unresolved_route = await session.get(SubscriberInviteAccountRoute, unresolved_route_id)
+        privacy_route = await session.get(SubscriberInviteAccountRoute, privacy_route_id)
         subscriber = await session.get(Subscriber, subscriber_id)
-        assert route is not None
-        assert route.invite_blocked is False
-        assert route.blocked_reason is None
-        assert route.last_error is None
+        assert unresolved_route is not None
+        assert unresolved_route.invite_blocked is False
+        assert unresolved_route.blocked_reason is None
+        assert unresolved_route.last_error is None
+        assert privacy_route is not None
+        assert privacy_route.invite_blocked is True
+        assert privacy_route.blocked_reason == "invite_recipient_privacy"
+        assert privacy_route.last_error == "privacy restriction"
         assert subscriber is not None
         assert subscriber.username == "restored_user"
 

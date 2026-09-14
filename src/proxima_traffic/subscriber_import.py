@@ -94,7 +94,7 @@ def iter_subscriber_records(
     import_stats = stats if stats is not None else SubscriberParseStats()
     seen_ids: set[int] = set()
     for source_name, stream in _subscriber_streams(Path(path)):
-        for line_number, raw_line in enumerate(
+        for line_number, (raw_line, line_size, oversized) in enumerate(
             _iter_stream_lines(source_name, stream),
             start=1,
         ):
@@ -103,11 +103,10 @@ def iter_subscriber_records(
                 raise SubscriberImportError(
                     f"в одном импорте допускается не больше {MAX_SUBSCRIBER_IMPORT_RECORDS:,} строк"
                 )
-            line_size = len(raw_line)
             import_stats.decoded_bytes += line_size
             if import_stats.decoded_bytes > MAX_SUBSCRIBER_IMPORT_BYTES:
                 raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
-            if line_size > MAX_SUBSCRIBER_LINE_BYTES:
+            if oversized:
                 import_stats.add_issue(source_name, line_number, "строка больше 64 КБ")
                 continue
             raw_line = raw_line.strip()
@@ -141,22 +140,49 @@ def iter_subscriber_records(
             yield record
 
 
-def _iter_stream_lines(source_name: str, stream: BinaryIO) -> Iterator[bytes]:
-    """Normalize deferred decompression/read failures into the import error contract.
-
-    ``gzip.open`` and ``ZipFile.open`` are lazy: a damaged archive can be opened
-    successfully and fail only when the caller starts reading from the yielded
-    stream. Catching errors only around the ``open`` call therefore misses the
-    most common corruption path and leaks backend exceptions into the control
-    bot. Keep the streaming behaviour, but translate failures at the actual
-    read boundary.
-    """
+def _read_stream_chunk(source_name: str, stream: BinaryIO, limit: int) -> bytes:
+    """Read one bounded line chunk and normalize lazy archive failures."""
 
     try:
-        yield from stream
+        return stream.readline(limit)
     except (gzip.BadGzipFile, zipfile.BadZipFile, EOFError, OSError) as exc:
         source = Path(source_name).name[:120] or "файл импорта"
         raise SubscriberImportError(f"часть {source!r} повреждена или не читается") from exc
+
+
+def _iter_stream_lines(source_name: str, stream: BinaryIO) -> Iterator[tuple[bytes, int, bool]]:
+    """Yield physical lines with bounded memory and exact decoded-byte accounting.
+
+    ``BinaryIO`` iteration and an unbounded ``readline()`` allocate the whole
+    physical line before the caller can enforce ``MAX_SUBSCRIBER_LINE_BYTES``.
+    A malformed export containing one enormous line could therefore consume
+    hundreds of megabytes despite the documented 64 KiB line limit. Read at
+    most ``limit + 1`` bytes at a time and drain the rest of an oversized line
+    in bounded chunks.
+
+    Archive readers are lazy as well, so decompression/CRC failures are caught
+    at each actual read rather than only when the stream is opened.
+    """
+
+    chunk_limit = MAX_SUBSCRIBER_LINE_BYTES + 1
+    while True:
+        first = _read_stream_chunk(source_name, stream, chunk_limit)
+        if not first:
+            return
+        line_size = len(first)
+        oversized = line_size > MAX_SUBSCRIBER_LINE_BYTES
+        complete = first.endswith(b"\n")
+        if not complete:
+            while True:
+                tail = _read_stream_chunk(source_name, stream, chunk_limit)
+                if not tail:
+                    break
+                line_size += len(tail)
+                if line_size > MAX_SUBSCRIBER_LINE_BYTES:
+                    oversized = True
+                if tail.endswith(b"\n"):
+                    break
+        yield first, line_size, oversized
 
 
 def _normalize_record(value: object) -> SubscriberRecord:

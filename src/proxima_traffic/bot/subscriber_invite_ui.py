@@ -249,7 +249,7 @@ def invite_campaign_text(view: SubscriberInviteCampaignView, *, confirm: bool = 
     campaign = view.campaign
     accounts = ", ".join(escape(label) for label in view.account_labels) or "—"
     action = (
-        "<b>Подтвердите запуск</b> — будут приглашены только люди из доступной выборки."
+        "<b>Подтвердите запуск</b> — очередь создастся только из прошедших фильтры людей."
         if confirm
         else "Можно запустить после подтверждения согласия и прав на цель."
     )
@@ -261,10 +261,12 @@ def invite_campaign_text(view: SubscriberInviteCampaignView, *, confirm: bool = 
         f"🔢 Лимит: <b>{campaign.recipient_limit:,}</b>\n"
         f"🛡 Повтор: не ранее <b>{campaign.contact_cooldown_days} дн.</b>\n"
         f"👤 Администраторы: <b>{accounts}</b>\n\n"
-        f"Доступно сейчас: <b>{view.eligible_count:,}</b>\n"
+        f"Проходят фильтры сейчас: <b>{view.eligible_count:,}</b>\n"
         f"Исключено недавно: <b>{view.recent_count:,}</b>\n"
         f"Занято другим запуском: <b>{view.reserved_count:,}</b>\n\n"
-        f"{action}\n<i>Приватность человека Telegram не обходится.</i>"
+        f"{action}\n"
+        "<i>Это не гарантия приглашения: окончательный результат определяет Telegram "
+        "для каждого человека и выбранного администратора. Приватность не обходится.</i>"
     )
 
 
@@ -363,7 +365,7 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
         DirectLaunchStatus.SUCCEEDED: "🟢 завершён",
         DirectLaunchStatus.PARTIAL: "🟡 завершён частично",
         DirectLaunchStatus.CANCELLED: "⚪ остановлен",
-        DirectLaunchStatus.FAILED: "🔴 ошибка",
+        DirectLaunchStatus.FAILED: "🔴 завершён с ошибкой",
     }.get(launch.status, escape(launch.status.value))
     timing = ""
     if view.next_scheduled_for is not None:
@@ -375,10 +377,10 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
     if view.issues:
         status_labels = {
             DirectMessageTaskStatus.QUEUED: "отложено",
-            DirectMessageTaskStatus.FAILED: "ошибка",
-            DirectMessageTaskStatus.SKIPPED: "пропущено",
+            DirectMessageTaskStatus.FAILED: "ошибка / неясный исход",
+            DirectMessageTaskStatus.SKIPPED: "пропущено без приглашения",
         }
-        issue_summary = "\n\n<b>📌 Основные причины</b>\n" + "\n".join(
+        issue_summary = "\n\n<b>📌 Частые причины — до 3</b>\n" + "\n".join(
             "• "
             f"<b>{count:,}</b> · {escape(failure_label(code))} "
             f"<i>({status_labels.get(status, status.value)})</i>"
@@ -386,7 +388,7 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
         )
     problem = ""
     if view.last_error_code:
-        problem = "\n\n<b>⚠️ Последняя ситуация</b>"
+        problem = "\n\n<b>⚠️ Последняя зафиксированная ситуация</b>"
         if view.last_error_account_label:
             problem += f"\nПриглашающий аккаунт: <b>{escape(view.last_error_account_label)}</b>"
         if view.last_error_recipient:
@@ -399,22 +401,51 @@ def invite_launch_text(view: SubscriberInviteLaunchView) -> str:
         if view.last_error_status == DirectMessageTaskStatus.QUEUED:
             problem += "\nСистема: попытка отложена; остальные безопасные приглашения продолжаются."
         elif view.last_error_status == DirectMessageTaskStatus.SKIPPED:
-            problem += "\nСистема: этот контакт пропущен; повтор не выполняется автоматически."
+            problem += "\nСистема: этот контакт пропущен; приглашение ему не подтверждено."
         elif view.last_error_status == DirectMessageTaskStatus.FAILED:
-            problem += "\nСистема: эта задача завершена без небезопасного повтора."
+            if view.last_error_code == "invite_delivery_unconfirmed":
+                problem += (
+                    "\nСистема: Telegram не подтвердил итог. Автоматического повтора нет, "
+                    "потому что человек уже мог быть добавлен."
+                )
+            else:
+                problem += "\nСистема: задача завершена без небезопасного повтора."
         if view.last_error:
             problem += f"\nТехнически: <code>{escape(view.last_error)}</code>"
+    accounted = (
+        view.invited
+        + view.already_participant
+        + view.queued
+        + view.running
+        + view.skipped
+        + view.failed
+        + view.cancelled
+    )
+    integrity_note = ""
+    if accounted != launch.total_tasks:
+        integrity_note = (
+            "\n\n⚠️ <b>Сводка задач расходится с запуском:</b> "
+            f"учтено {accounted:,} из {launch.total_tasks:,}. Обновите экран; "
+            "если расхождение останется — проверьте журнал."
+        )
     return (
         screen_title(f"Приглашение #{launch.id}", f"Статус: {status}") + "\n\n"
         f"🎯 Цель: <code>{escape(launch.destination_ref_snapshot)}</code>\n"
         f"📂 База: <b>{escape(view.list_name)}</b>\n"
         f"📝 Заготовка: <b>{escape(view.campaign_name)}</b>\n\n"
         f"{section('Результат')}\n"
-        f"✅ Приглашено: <b>{view.invited:,}</b>\n"
-        f"ℹ️ Уже участники: <b>{view.already_participant:,}</b>\n"
-        f"⏳ В очереди: <b>{view.queued:,}</b> · выполняется: <b>{view.running:,}</b>\n"
-        f"⏭ Пропущено: <b>{view.skipped:,}</b> · ❌ ошибки: <b>{view.failed:,}</b>"
+        f"Всего задач запуска: <b>{launch.total_tasks:,}</b>\n"
+        f"✅ Telegram подтвердил приглашение: <b>{view.invited:,}</b>\n"
+        f"ℹ️ Уже были участниками: <b>{view.already_participant:,}</b>\n"
+        f"🕒 В очереди: <b>{view.queued:,}</b>\n"
+        f"🔵 Выполняется сейчас: <b>{view.running:,}</b>\n"
+        f"⏭ Пропущено без приглашения: <b>{view.skipped:,}</b>\n"
+        f"⚠️ Ошибка или неясный результат: <b>{view.failed:,}</b>\n"
+        f"⏹ Отменено до выполнения: <b>{view.cancelled:,}</b>\n\n"
+        "<i>«Подтверждено» означает успешный результат операции Telegram. "
+        "Неподтверждённые исходы в этот счётчик не входят.</i>"
         f"{timing}"
+        f"{integrity_note}"
         f"{issue_summary}"
         f"{problem}"
     )
@@ -437,7 +468,9 @@ def invite_launches_text(
     for view in items:
         lines.append(
             f"👥 <b>#{view.launch.id} · {escape(view.campaign_name)}</b>\n"
-            f"   ✅ {view.invited:,} · ⏳ {view.active:,} · ❌ {view.failed:,}"
+            f"   ✅ приглашено {view.invited:,} · ℹ️ уже были {view.already_participant:,}\n"
+            f"   ⏳ активно {view.active:,} · ⏭ пропущено {view.skipped:,} · "
+            f"⚠️ ошибка/неясно {view.failed:,} · ⏹ отменено {view.cancelled:,}"
         )
     if not items:
         lines.append("Запусков ещё нет. После старта здесь появятся статус и причины пропусков.")

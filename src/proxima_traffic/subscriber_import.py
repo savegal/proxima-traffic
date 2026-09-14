@@ -94,7 +94,10 @@ def iter_subscriber_records(
     import_stats = stats if stats is not None else SubscriberParseStats()
     seen_ids: set[int] = set()
     for source_name, stream in _subscriber_streams(Path(path)):
-        for line_number, raw_line in enumerate(stream, start=1):
+        for line_number, raw_line in enumerate(
+            _iter_stream_lines(source_name, stream),
+            start=1,
+        ):
             import_stats.total_lines += 1
             if import_stats.total_lines > MAX_SUBSCRIBER_IMPORT_RECORDS:
                 raise SubscriberImportError(
@@ -136,6 +139,24 @@ def iter_subscriber_records(
             seen_ids.add(record.telegram_user_id)
             import_stats.valid_records += 1
             yield record
+
+
+def _iter_stream_lines(source_name: str, stream: BinaryIO) -> Iterator[bytes]:
+    """Normalize deferred decompression/read failures into the import error contract.
+
+    ``gzip.open`` and ``ZipFile.open`` are lazy: a damaged archive can be opened
+    successfully and fail only when the caller starts reading from the yielded
+    stream. Catching errors only around the ``open`` call therefore misses the
+    most common corruption path and leaks backend exceptions into the control
+    bot. Keep the streaming behaviour, but translate failures at the actual
+    read boundary.
+    """
+
+    try:
+        yield from stream
+    except (gzip.BadGzipFile, zipfile.BadZipFile, EOFError, OSError) as exc:
+        source = Path(source_name).name[:120] or "файл импорта"
+        raise SubscriberImportError(f"часть {source!r} повреждена или не читается") from exc
 
 
 def _normalize_record(value: object) -> SubscriberRecord:
@@ -200,10 +221,13 @@ def _subscriber_streams(path: Path) -> Iterator[tuple[str, BinaryIO]]:
         try:
             with gzip.open(path, "rb") as stream:
                 yield path.name, stream
-        except (gzip.BadGzipFile, OSError) as exc:
+        except (gzip.BadGzipFile, EOFError, OSError) as exc:
             raise SubscriberImportError("GZIP повреждён или не читается") from exc
         return
     if not lowered.endswith(".jsonl"):
         raise SubscriberImportError("поддерживаются .jsonl, .jsonl.gz и .zip")
-    with path.open("rb") as stream:
-        yield path.name, stream
+    try:
+        with path.open("rb") as stream:
+            yield path.name, stream
+    except OSError as exc:
+        raise SubscriberImportError("JSONL повреждён или не читается") from exc

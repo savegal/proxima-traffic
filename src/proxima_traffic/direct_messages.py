@@ -46,6 +46,9 @@ from proxima_traffic.models import (
     ProxyStatus,
     Subscriber,
     SubscriberAccountPeer,
+    SubscriberInviteAccountRoute,
+    SubscriberInviteCampaign,
+    SubscriberInviteLaunch,
     SubscriberInviteTask,
     SubscriberList,
     SubscriberListMember,
@@ -102,6 +105,8 @@ def _parameter_batches(values: Iterable[int]) -> Iterator[tuple[int, ...]]:
     iterator = iter(values)
     while batch := tuple(islice(iterator, SQLITE_PARAMETER_BATCH_SIZE)):
         yield batch
+
+
 DIRECT_RECIPIENT_ROUTE_CODES = frozenset(
     {
         "recipient_privacy_restricted",
@@ -413,6 +418,20 @@ class DirectMessageService:
                 )
                 .values(
                     send_blocked=False,
+                    blocked_reason=None,
+                    last_error=None,
+                    updated_at=imported_at,
+                )
+            )
+            await session.execute(
+                update(SubscriberInviteAccountRoute)
+                .where(
+                    SubscriberInviteAccountRoute.subscriber_id.in_(routable_subscriber_ids),
+                    SubscriberInviteAccountRoute.blocked_reason
+                    == "invite_recipient_unresolvable",
+                )
+                .values(
+                    invite_blocked=False,
                     blocked_reason=None,
                     last_error=None,
                     updated_at=imported_at,
@@ -792,7 +811,7 @@ class DirectMessageService:
             item = await session.get(SubscriberList, list_id)
             if item is None:
                 raise NotFoundError("база подписчиков не найдена")
-            campaign_count = int(
+            direct_campaign_count = int(
                 await session.scalar(
                     select(func.count(DirectCampaign.id)).where(
                         DirectCampaign.subscriber_list_id == list_id
@@ -800,8 +819,38 @@ class DirectMessageService:
                 )
                 or 0
             )
-            if campaign_count:
+            if direct_campaign_count:
                 raise ConflictError("база используется сохранёнными ЛС-рассылками")
+            invite_campaign_count = int(
+                await session.scalar(
+                    select(func.count(SubscriberInviteCampaign.id)).where(
+                        SubscriberInviteCampaign.subscriber_list_id == list_id
+                    )
+                )
+                or 0
+            )
+            if invite_campaign_count:
+                raise ConflictError("база используется сохранёнными кампаниями приглашений")
+            direct_launch_count = int(
+                await session.scalar(
+                    select(func.count(DirectLaunch.id)).where(
+                        DirectLaunch.subscriber_list_id == list_id
+                    )
+                )
+                or 0
+            )
+            if direct_launch_count:
+                raise ConflictError("база связана с историей запусков ЛС-рассылок")
+            invite_launch_count = int(
+                await session.scalar(
+                    select(func.count(SubscriberInviteLaunch.id)).where(
+                        SubscriberInviteLaunch.subscriber_list_id == list_id
+                    )
+                )
+                or 0
+            )
+            if invite_launch_count:
+                raise ConflictError("база связана с историей запусков приглашений")
             await session.delete(item)
             await session.flush()
             await session.execute(
@@ -1402,12 +1451,6 @@ class DirectMessageService:
         lease_until = now + timedelta(seconds=max(30, self._settings.worker_lease_seconds))
         recovered_launch_ids: set[int] = set()
         async with self._session_factory() as session:
-            # A task that was running when its launch was cancelled cannot be
-            # returned to QUEUED: the claim query deliberately excludes the
-            # launch, which would otherwise strand both task and recipient
-            # reservation forever.  We do not know whether a dead worker had
-            # already reached Telegram, so retain an explicit unknown-outcome
-            # failure rather than claiming that the message was not sent.
             cancelled_expired_tasks = list(
                 await session.scalars(
                     select(DirectMessageTask)

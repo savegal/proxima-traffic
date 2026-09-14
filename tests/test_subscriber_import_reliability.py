@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from proxima_traffic.subscriber_import import SubscriberImportError, iter_subscriber_records
+from proxima_traffic.subscriber_import import (
+    MAX_SUBSCRIBER_LINE_BYTES,
+    SubscriberImportError,
+    SubscriberParseStats,
+    iter_subscriber_records,
+)
 
 
 def test_corrupted_gzip_read_is_reported_as_subscriber_import_error(tmp_path: Path) -> None:
@@ -17,3 +22,22 @@ def test_corrupted_gzip_read_is_reported_as_subscriber_import_error(tmp_path: Pa
 
     with pytest.raises(SubscriberImportError, match="повреждена|не читается"):
         list(iter_subscriber_records(gzip_path))
+
+
+def test_oversized_line_is_drained_and_next_record_is_still_imported(tmp_path: Path) -> None:
+    source = tmp_path / "oversized.jsonl"
+    source.write_bytes(
+        b"x" * (MAX_SUBSCRIBER_LINE_BYTES * 3)
+        + b"\n"
+        + b'{"telegram_id":"2051","username":"bounded_member","is_premium":true}\n'
+    )
+    stats = SubscriberParseStats()
+
+    records = list(iter_subscriber_records(source, stats=stats))
+
+    assert [item.telegram_user_id for item in records] == [2051]
+    assert stats.total_lines == 2
+    assert stats.valid_records == 1
+    assert stats.invalid == 1
+    assert stats.issues[0].reason == "строка больше 64 КБ"
+    assert stats.decoded_bytes == source.stat().st_size

@@ -94,18 +94,24 @@ def iter_subscriber_records(
     import_stats = stats if stats is not None else SubscriberParseStats()
     seen_ids: set[int] = set()
     for source_name, stream in _subscriber_streams(Path(path)):
-        for line_number, (raw_line, line_size, oversized) in enumerate(
-            _iter_stream_lines(source_name, stream),
-            start=1,
-        ):
+        line_number = 0
+        while True:
+            remaining_bytes = MAX_SUBSCRIBER_IMPORT_BYTES - import_stats.decoded_bytes
+            line = _read_stream_line(
+                source_name,
+                stream,
+                decoded_budget=remaining_bytes,
+            )
+            if line is None:
+                break
+            raw_line, line_size, oversized = line
+            line_number += 1
             import_stats.total_lines += 1
             if import_stats.total_lines > MAX_SUBSCRIBER_IMPORT_RECORDS:
                 raise SubscriberImportError(
                     f"в одном импорте допускается не больше {MAX_SUBSCRIBER_IMPORT_RECORDS:,} строк"
                 )
             import_stats.decoded_bytes += line_size
-            if import_stats.decoded_bytes > MAX_SUBSCRIBER_IMPORT_BYTES:
-                raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
             if oversized:
                 import_stats.add_issue(source_name, line_number, "строка больше 64 КБ")
                 continue
@@ -150,39 +156,58 @@ def _read_stream_chunk(source_name: str, stream: BinaryIO, limit: int) -> bytes:
         raise SubscriberImportError(f"часть {source!r} повреждена или не читается") from exc
 
 
-def _iter_stream_lines(source_name: str, stream: BinaryIO) -> Iterator[tuple[bytes, int, bool]]:
-    """Yield physical lines with bounded memory and exact decoded-byte accounting.
+def _read_stream_line(
+    source_name: str,
+    stream: BinaryIO,
+    *,
+    decoded_budget: int,
+) -> tuple[bytes, int, bool] | None:
+    """Read one physical line without exceeding memory or decompressed-byte limits."""
 
-    ``BinaryIO`` iteration and an unbounded ``readline()`` allocate the whole
-    physical line before the caller can enforce ``MAX_SUBSCRIBER_LINE_BYTES``.
-    A malformed export containing one enormous line could therefore consume
-    hundreds of megabytes despite the documented 64 KiB line limit. Read at
-    most ``limit + 1`` bytes at a time and drain the rest of an oversized line
-    in bounded chunks.
-
-    Archive readers are lazy as well, so decompression/CRC failures are caught
-    at each actual read rather than only when the stream is opened.
-    """
+    if decoded_budget <= 0:
+        probe = _read_stream_chunk(source_name, stream, 1)
+        if not probe:
+            return None
+        raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
 
     chunk_limit = MAX_SUBSCRIBER_LINE_BYTES + 1
-    while True:
-        first = _read_stream_chunk(source_name, stream, chunk_limit)
-        if not first:
-            return
-        line_size = len(first)
-        oversized = line_size > MAX_SUBSCRIBER_LINE_BYTES
-        complete = first.endswith(b"\n")
-        if not complete:
-            while True:
-                tail = _read_stream_chunk(source_name, stream, chunk_limit)
-                if not tail:
-                    break
-                line_size += len(tail)
-                if line_size > MAX_SUBSCRIBER_LINE_BYTES:
-                    oversized = True
-                if tail.endswith(b"\n"):
-                    break
-        yield first, line_size, oversized
+    first = _read_stream_chunk(
+        source_name,
+        stream,
+        min(chunk_limit, decoded_budget + 1),
+    )
+    if not first:
+        return None
+    line_size = len(first)
+    if line_size > decoded_budget:
+        raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
+    oversized = line_size > MAX_SUBSCRIBER_LINE_BYTES
+    complete = first.endswith(b"\n")
+
+    while not complete:
+        remaining = decoded_budget - line_size
+        if remaining <= 0:
+            probe = _read_stream_chunk(source_name, stream, 1)
+            if probe:
+                raise SubscriberImportError(
+                    "распакованный файл превышает безопасный лимит 256 МБ"
+                )
+            break
+        tail = _read_stream_chunk(
+            source_name,
+            stream,
+            min(chunk_limit, remaining + 1),
+        )
+        if not tail:
+            break
+        line_size += len(tail)
+        if line_size > decoded_budget:
+            raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
+        if line_size > MAX_SUBSCRIBER_LINE_BYTES:
+            oversized = True
+        complete = tail.endswith(b"\n")
+
+    return first, line_size, oversized
 
 
 def _normalize_record(value: object) -> SubscriberRecord:

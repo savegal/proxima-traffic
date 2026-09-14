@@ -66,6 +66,7 @@ async def test_reimport_with_username_recovers_invite_unresolvable_route(tmp_pat
         session.add(route)
         await session.commit()
         list_id = int(subscriber_list.id)
+        subscriber_id = int(subscriber.id)
         route_id = int(route.id)
 
     async with database.session_factory() as session:
@@ -85,7 +86,7 @@ async def test_reimport_with_username_recovers_invite_unresolvable_route(tmp_pat
 
     async with database.session_factory() as session:
         route = await session.get(SubscriberInviteAccountRoute, route_id)
-        subscriber = await session.get(Subscriber, 1)
+        subscriber = await session.get(Subscriber, subscriber_id)
         assert route is not None
         assert route.invite_blocked is False
         assert route.blocked_reason is None

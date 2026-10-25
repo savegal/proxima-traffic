@@ -1,8 +1,9 @@
-"""Read-only chat scans that can be explicitly confirmed into the global stop-list."""
+"""Bounded chat scans with separate confirmation before changing the stop-list."""
 
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -81,13 +82,16 @@ class ChatBlacklistParser:
             raise ConflictError("нет готового подключённого аккаунта для чтения этого чата")
 
         errors: list[str] = []
+        stop_scan = False
         planned_modes = ("members", "messages") if mode == "auto" else (mode,)
         for account in accounts:
             joined_chat = False
+            join_attempted = False
             for index, effective_mode in enumerate(planned_modes):
                 async with self._session_factory() as session:
                     fresh = await session.get(Account, account.id)
                 if fresh is None or not self._ready_to_scan(fresh):
+                    stop_scan = joined_chat or join_attempted
                     break
                 account = fresh
                 expected_fingerprint = session_fingerprint(account)
@@ -103,12 +107,15 @@ class ChatBlacklistParser:
                         ),
                     )
                 except GatewayError as exc:
+                    join_attempted = join_attempted or bool(getattr(exc, "join_attempted", False))
+                    joined_chat = joined_chat or bool(getattr(exc, "joined_chat", False))
                     code = failure_code(exc, "gateway_error")
                     errors.append(
                         f"{account.label}: {failure_label(code)} ({safe_error_message(exc)})"
                     )
                     if code in ACCOUNT_WIDE_CODES:
                         await self._record_account_failure(account.id, expected_fingerprint, exc)
+                        stop_scan = joined_chat or join_attempted
                         break
                     if (
                         mode == "auto"
@@ -116,6 +123,18 @@ class ChatBlacklistParser:
                         and code == "account_missing_admin_rights"
                     ):
                         continue
+                    stop_scan = bool(
+                        joined_chat
+                        or join_attempted
+                        or normalized_ref.startswith("https://t.me/+")
+                        or code
+                        in {
+                            "join_request_pending",
+                            "target_unavailable",
+                            "comments_unavailable",
+                            "join_throttled",
+                        }
+                    )
                     break
                 joined_chat = joined_chat or scan.joined_chat
                 if scan.telegram_user_ids or effective_mode == "messages" or mode != "auto":
@@ -129,6 +148,8 @@ class ChatBlacklistParser:
                         joined_chat=joined_chat,
                         scan_limit=scan.scan_limit,
                     )
+            if stop_scan:
+                break
         detail = "; ".join(errors[:3])
         suffix = f" ({detail})" if detail else ""
         raise ConflictError("ни один подключённый аккаунт не смог прочитать этот чат" + suffix)
@@ -226,11 +247,20 @@ class ChatBlacklistParser:
         if not normalized or len(normalized) > 255 or any(ord(char) < 32 for char in normalized):
             raise ConflictError("отправьте @username, публичную ссылку t.me или числовой ID чата")
         lowered = normalized.casefold()
-        for prefix in ("https://t.me/", "http://t.me/", "https://telegram.me/"):
+        for prefix in (
+            "https://t.me/",
+            "http://t.me/",
+            "https://telegram.me/",
+            "http://telegram.me/",
+        ):
             if lowered.startswith(prefix):
-                slug = normalized[len(prefix) :].split("/", 1)[0]
+                path = normalized[len(prefix) :].split("?", 1)[0].split("#", 1)[0].rstrip("/")
+                slug = path.split("/", 1)[0]
                 if slug.startswith("+") or slug.casefold() == "joinchat":
-                    return normalized
+                    invite_hash = path[1:] if slug.startswith("+") else path[len(slug) + 1 :]
+                    if not re.fullmatch(r"[A-Za-z0-9_-]+", invite_hash):
+                        raise ConflictError("приватная ссылка чата имеет неверный формат")
+                    return "https://t.me/+" + invite_hash
                 normalized = "@" + slug.lstrip("@")
                 break
         if normalized.startswith("@"):

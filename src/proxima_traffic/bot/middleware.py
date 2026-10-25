@@ -20,6 +20,7 @@ from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 from proxima_traffic.bot.panel import current_panel_state, input_panel_origin
 from proxima_traffic.bot.states import AccountBulkAvatarState
 from proxima_traffic.db import begin_sql_timing, end_sql_timing
+from proxima_traffic.maintenance import cleanup_draft_media, media_paths_from_data
 
 logger = logging.getLogger(__name__)
 
@@ -251,16 +252,21 @@ class AdminOnlyMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        user = data.get("event_from_user")
+        control_event = event
+        if isinstance(event, Update):
+            control_event = event.message or event.callback_query
+            if control_event is None:
+                return None
+        user = data.get("event_from_user") or getattr(control_event, "from_user", None)
         if user is not None and user.id in self._admin_ids:
-            if _is_private_control_event(event):
+            if _is_private_control_event(control_event):
                 return await handler(event, data)
-            await _answer_private_chat_required(event)
+            await _answer_private_chat_required(control_event)
             return None
-        if isinstance(event, CallbackQuery):
-            await event.answer("Нет доступа", show_alert=True)
-        elif isinstance(event, Message):
-            await event.answer("Доступ к панели запрещён.")
+        if isinstance(control_event, CallbackQuery):
+            await control_event.answer("Нет доступа", show_alert=True)
+        elif isinstance(control_event, Message):
+            await control_event.answer("Доступ к панели запрещён.")
         return None
 
 
@@ -330,6 +336,43 @@ class PanelContextMiddleware(BaseMiddleware):
             return await handler(event, data)
         finally:
             current_panel_state.reset(token)
+
+
+class DraftMediaCleanupMiddleware(BaseMiddleware):
+    """Clean replaced/cancelled draft media after durable content has been saved."""
+
+    async def __call__(self, handler, event: TelegramObject, data: dict[str, Any]) -> Any:
+        state = data.get("state")
+        settings = data.get("settings")
+        if (
+            not isinstance(state, FSMContext)
+            or data.get("raw_state") is None
+            or not getattr(settings, "media_storage_path", None)
+        ):
+            return await handler(event, data)
+        try:
+            before = media_paths_from_data(await state.get_data())
+        except Exception:
+            logger.warning("Could not read media draft for cleanup", exc_info=True)
+            return await handler(event, data)
+        if not before:
+            return await handler(event, data)
+        try:
+            return await handler(event, data)
+        finally:
+            try:
+                abandoned = before - media_paths_from_data(await state.get_data())
+                if abandoned:
+                    await asyncio.to_thread(
+                        cleanup_draft_media,
+                        settings.database_url,
+                        Path(settings.media_storage_path),
+                        abandoned,
+                    )
+            except Exception:
+                # Retain files on failed reference checks. The normal orphan GC
+                # can retry later; cleanup must never replace an action result.
+                logger.warning("Could not clean abandoned draft media", exc_info=True)
 
 
 class BulkAvatarDraftCleanupMiddleware(BaseMiddleware):

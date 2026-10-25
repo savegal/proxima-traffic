@@ -137,6 +137,8 @@ class TelethonGateway:
             raise PermanentGatewayError("live context is missing persisted identifiers")
         async with self._account_operation(account.id):
             client: object | None = None
+            cached_before_check = account.id in self._clients
+            received_response = False
             try:
                 client = await self._ensure_client(account.id)
                 timeout = max(1.0, float(getattr(self._settings, "spambot_timeout_seconds", 15.0)))
@@ -147,6 +149,7 @@ class TelethonGateway:
                 ) as conversation:
                     await conversation.send_message("/start")
                     response = await conversation.get_response()
+                received_response = True
             except TimeoutError as exc:
                 raise TemporaryGatewayError(
                     "@SpamBot did not answer before the timeout",
@@ -159,7 +162,7 @@ class TelethonGateway:
                     raise mapped from exc
                 raise
             finally:
-                if client is not None:
+                if client is not None and (not cached_before_check or not received_response):
                     await self._disconnect_cached_client_locked(account.id, client)
             raw_text = (
                 getattr(response, "raw_text", None) or getattr(response, "message", None) or ""
@@ -1194,62 +1197,54 @@ class TelethonGateway:
         mode: str,
         limit: int,
     ) -> ChatBlacklistScan:
-        """Read participants or message authors without joining or changing a chat."""
+        """Read first; request membership only when needed and under join limits."""
+
+        from telethon import errors  # noqa: PLC0415
 
         if account.id is None or mode not in {"members", "messages"}:
             raise PermanentGatewayError("chat blacklist scan context is invalid")
         bounded_limit = max(1, min(int(limit), 1_000_000))
-        async with self._account_operation(account.id):
-            try:
+        joined_chat = False
+        join_attempted = False
+        try:
+            async with self._account_operation(account.id):
                 client = await self._ensure_client(account.id)
                 entity, joined_chat = await self._resolve_blacklist_scan_entity(
                     client, account.id, chat_ref
                 )
-                collected: list[int] = []
-                seen: set[int] = set()
-                scanned_records = 0
-                if mode == "members":
-                    async for user in client.iter_participants(  # type: ignore[attr-defined]
-                        entity, limit=bounded_limit
+                try:
+                    collected, scanned_records = await self._collect_blacklist_scan(
+                        client, entity, mode, bounded_limit
+                    )
+                except (errors.UserNotParticipantError, errors.ChannelPrivateError) as exc:
+                    public_channel = bool(
+                        getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False)
+                    )
+                    if joined_chat or not public_channel or (
+                        isinstance(exc, errors.ChannelPrivateError)
+                        and not getattr(entity, "left", False)
                     ):
-                        scanned_records += 1
-                        user_id = getattr(user, "id", None)
-                        if not isinstance(user_id, int) or user_id <= 0:
-                            continue
-                        if any(
-                            bool(getattr(user, attribute, False))
-                            for attribute in ("bot", "deleted", "self", "is_self")
-                        ):
-                            continue
-                        if user_id not in seen:
-                            seen.add(user_id)
-                            collected.append(user_id)
-                else:
-                    async for message in client.iter_messages(  # type: ignore[attr-defined]
-                        entity, limit=bounded_limit
-                    ):
-                        scanned_records += 1
-                        sender_id = getattr(message, "sender_id", None)
-                        if (
-                            not isinstance(sender_id, int)
-                            or sender_id <= 0
-                            or bool(getattr(message, "out", False))
-                            or getattr(message, "action", None) is not None
-                        ):
-                            continue
-                        sender = getattr(message, "sender", None)
-                        if any(
-                            bool(getattr(sender, attribute, False))
-                            for attribute in ("bot", "deleted", "self", "is_self")
-                        ):
-                            continue
-                        if sender_id not in seen:
-                            seen.add(sender_id)
-                            collected.append(sender_id)
-            except Exception as exc:  # noqa: BLE001 - one durable scanner vocabulary
-                if isinstance(exc, GatewayError):
-                    raise
-                raise self._map_rpc_error(exc, context="participant_reaction_scan") from exc
+                        raise
+                    join_attempted = True
+                    joined_chat = await self._join_blacklist_scan_channel(
+                        client, account.id, entity
+                    )
+                    collected, scanned_records = await self._collect_blacklist_scan(
+                        client, entity, mode, bounded_limit
+                    )
+        except Exception as exc:  # noqa: BLE001 - include lease loss after a successful join
+            mapped = (
+                exc
+                if isinstance(exc, GatewayError)
+                else self._map_rpc_error(exc, context="participant_reaction_scan")
+            )
+            if joined_chat or join_attempted:
+                mapped.join_attempted = True
+            if joined_chat:
+                mapped.joined_chat = True
+            if mapped is exc:
+                raise
+            raise mapped from exc
         return ChatBlacklistScan(
             telegram_user_ids=tuple(collected),
             mode=mode,
@@ -1257,6 +1252,66 @@ class TelethonGateway:
             joined_chat=joined_chat,
             scan_limit=bounded_limit,
         )
+
+    @staticmethod
+    async def _collect_blacklist_scan(
+        client: object, entity: object, mode: str, limit: int
+    ) -> tuple[list[int], int]:
+        collected: list[int] = []
+        seen: set[int] = set()
+        scanned = 0
+        iterator = (
+            client.iter_participants(entity, limit=limit)
+            if mode == "members"
+            else client.iter_messages(entity, limit=limit)
+        )
+        async for item in iterator:
+            scanned += 1
+            if mode == "members":
+                user_id, user = getattr(item, "id", None), item
+            else:
+                if getattr(item, "out", False) or getattr(item, "action", None) is not None:
+                    continue
+                user_id, user = getattr(item, "sender_id", None), getattr(item, "sender", None)
+            if not isinstance(user_id, int) or user_id <= 0:
+                continue
+            if any(getattr(user, flag, False) for flag in ("bot", "deleted", "self", "is_self")):
+                continue
+            if user_id not in seen:
+                seen.add(user_id)
+                collected.append(user_id)
+        return collected, scanned
+
+    async def _join_blacklist_scan_channel(
+        self, client: object, account_id: int, entity: object
+    ) -> bool:
+        from telethon import errors, functions  # noqa: PLC0415
+
+        await self._enforce_join_limit(account_id)
+        try:
+            await client(functions.channels.JoinChannelRequest(channel=entity))
+        except errors.UserAlreadyParticipantError:
+            return False
+        except errors.InviteRequestSentError as exc:
+            await self._account_service.record_join(account_id)
+            mapped = PermanentGatewayError(
+                "заявка на вступление отправлена; дождитесь одобрения",
+                code="join_request_pending",
+            )
+            mapped.join_attempted = True
+            raise mapped from exc
+        except Exception as exc:
+            mapped = (
+                exc
+                if isinstance(exc, GatewayError)
+                else self._map_rpc_error(exc, context="resolve")
+            )
+            mapped.join_attempted = True
+            if mapped is exc:
+                raise
+            raise mapped from exc
+        await self._account_service.record_join(account_id)
+        return True
 
     async def _resolve_blacklist_scan_entity(
         self, client: object, account_id: int, chat_ref: str
@@ -1269,15 +1324,21 @@ class TelethonGateway:
         private_prefixes = ("https://t.me/+", "https://t.me/joinchat/")
         if normalized.casefold().startswith(private_prefixes):
             invite_hash = normalized.rsplit("/", 1)[-1].lstrip("+")
+            join_attempted = False
+            joined_chat = False
             try:
                 invite = await client(  # type: ignore[operator]
                     functions.messages.CheckChatInviteRequest(invite_hash)
                 )
                 if isinstance(invite, types.ChatInviteAlready) and getattr(invite, "chat", None):
                     return invite.chat, False
+                await self._enforce_join_limit(account_id)
+                join_attempted = True
                 updates = await client(  # type: ignore[operator]
                     functions.messages.ImportChatInviteRequest(invite_hash)
                 )
+                joined_chat = True
+                await self._account_service.record_join(account_id)
                 chats = list(getattr(updates, "chats", None) or [])
                 if not chats:
                     raise PermanentGatewayError(
@@ -1286,32 +1347,29 @@ class TelethonGateway:
                     )
                 return await client.get_entity(chats[0]), True  # type: ignore[attr-defined]
             except errors.InviteRequestSentError as exc:
-                raise PermanentGatewayError(
+                await self._account_service.record_join(account_id)
+                mapped = PermanentGatewayError(
                     "заявка на вступление отправлена; дождитесь одобрения и запустите "
                     "парсинг снова",
                     code="join_request_pending",
-                ) from exc
+                )
+                mapped.join_attempted = True
+                raise mapped from exc
             except Exception as exc:  # noqa: BLE001 - preserve durable Telegram errors
-                if isinstance(exc, GatewayError):
+                mapped = (
+                    exc
+                    if isinstance(exc, GatewayError)
+                    else self._map_rpc_error(exc, context="resolve")
+                )
+                if join_attempted:
+                    mapped.join_attempted = True
+                if joined_chat:
+                    mapped.joined_chat = True
+                if mapped is exc:
                     raise
-                raise self._map_rpc_error(exc, context="resolve") from exc
+                raise mapped from exc
         entity = await self._resolve_entity(client, account_id, normalized)
-        if not (
-            bool(getattr(entity, "broadcast", False)) or bool(getattr(entity, "megagroup", False))
-        ):
-            return entity, False
-        try:
-            await client(functions.channels.JoinChannelRequest(channel=entity))  # type: ignore[operator]
-        except errors.UserAlreadyParticipantError:
-            return entity, False
-        except errors.InviteRequestSentError as exc:
-            raise PermanentGatewayError(
-                "заявка на вступление отправлена; дождитесь одобрения и запустите парсинг снова",
-                code="join_request_pending",
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 - do not hide an unavailable target
-            raise self._map_rpc_error(exc, context="resolve") from exc
-        return entity, True
+        return entity, False
 
     async def send_content(
         self,
@@ -1915,7 +1973,7 @@ class TelethonGateway:
                     if isinstance(mapped, GatewayError):
                         raise mapped
 
-                from proxima_traffic.story_content import story_caption
+                from proxima_traffic.story_content import story_caption, story_link_url
 
                 verified = []
                 usernames = []
@@ -1952,9 +2010,8 @@ class TelethonGateway:
 
                 # Detect URL to attach interactive link sticker area if present
                 media_areas = None
-                url_match = re.search(r"https?://[^\s]+", caption or "")
-                if url_match:
-                    found_url = url_match.group(0)
+                found_url = story_link_url(caption or "")
+                if found_url:
                     media_areas = [
                         types.MediaAreaUrl(
                             coordinates=types.MediaAreaCoordinates(

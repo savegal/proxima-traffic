@@ -3653,11 +3653,18 @@ class ChannelCommentService:
     ) -> None:
         if not run_ids:
             return
-        await session.execute(
-            update(ChannelCommentMentionState)
-            .where(ChannelCommentMentionState.reserved_run_id.in_(run_ids))
-            .values(reserved_run_id=None, reserved_until=None)
-        )
+        normalized_ids = list(dict.fromkeys(run_ids))
+        # Lease recovery can release far more runs than a visible UI page.
+        for offset in range(0, len(normalized_ids), 500):
+            await session.execute(
+                update(ChannelCommentMentionState)
+                .where(
+                    ChannelCommentMentionState.reserved_run_id.in_(
+                        normalized_ids[offset : offset + 500]
+                    )
+                )
+                .values(reserved_run_id=None, reserved_until=None)
+            )
 
     @staticmethod
     def _retry_reason_text(reason: str) -> str:

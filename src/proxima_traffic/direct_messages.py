@@ -812,6 +812,27 @@ class DirectMessageService:
         except Exception:  # noqa: BLE001 - preserve the original import failure
             logger.exception("Could not persist subscriber import failure")
 
+    async def _task_status_counts(
+        self, session: AsyncSession, *, launch_id: int | None = None
+    ) -> tuple[dict[DirectMessageTaskStatus, int], int]:
+        # Failed and uncertain must come from the same database snapshot. Two
+        # reads can straddle a worker completion and produce uncertain > failed.
+        statement = select(
+            DirectMessageTask.status,
+            func.count(DirectMessageTask.id),
+            func.sum(case((DirectMessageTask.error_code.in_(DIRECT_UNCERTAIN_CODES), 1), else_=0)),
+        )
+        if launch_id is not None:
+            statement = statement.where(DirectMessageTask.launch_id == launch_id)
+        rows = (await session.execute(statement.group_by(DirectMessageTask.status))).all()
+        counts: dict[DirectMessageTaskStatus, int] = {}
+        uncertain = 0
+        for status, count, uncertain_count in rows:
+            counts[DirectMessageTaskStatus(status)] = int(count)
+            if status == DirectMessageTaskStatus.FAILED:
+                uncertain = int(uncertain_count or 0)
+        return counts, uncertain
+
     async def dashboard(self) -> DirectMessageDashboard:
         async with self._session_factory() as session:
             list_count = int(await session.scalar(select(func.count(SubscriberList.id))) or 0)
@@ -836,15 +857,7 @@ class DirectMessageService:
                 subscriber_count = int(subscriber_stats.subscriber_count)
                 premium_count = int(subscriber_stats.premium_count)
                 username_count = int(subscriber_stats.username_count)
-            task_counts = dict(
-                (
-                    await session.execute(
-                        select(DirectMessageTask.status, func.count(DirectMessageTask.id)).group_by(
-                            DirectMessageTask.status
-                        )
-                    )
-                ).all()
-            )
+            task_counts, uncertain_tasks = await self._task_status_counts(session)
             active_launches = int(
                 await session.scalar(
                     select(func.count(DirectLaunch.id)).where(
@@ -893,15 +906,7 @@ class DirectMessageService:
                 succeeded_tasks=sum(int(value) for value in mode_counts.values()),
                 failed_tasks=int(task_counts.get(DirectMessageTaskStatus.FAILED, 0)),
                 skipped_tasks=int(task_counts.get(DirectMessageTaskStatus.SKIPPED, 0)),
-                uncertain_tasks=int(
-                    await session.scalar(
-                        select(func.count(DirectMessageTask.id)).where(
-                            DirectMessageTask.status == DirectMessageTaskStatus.FAILED,
-                            DirectMessageTask.error_code.in_(DIRECT_UNCERTAIN_CODES),
-                        )
-                    )
-                    or 0
-                ),
+                uncertain_tasks=uncertain_tasks,
                 simulated=self._settings.dry_run,
                 simulated_succeeded_tasks=int(mode_counts.get(True, 0)),
                 unknown_mode_succeeded_tasks=int(mode_counts.get(None, 0)),
@@ -1951,15 +1956,7 @@ class DirectMessageService:
         list_name = await session.scalar(
             select(SubscriberList.name).where(SubscriberList.id == launch.subscriber_list_id)
         )
-        counts = dict(
-            (
-                await session.execute(
-                    select(DirectMessageTask.status, func.count(DirectMessageTask.id))
-                    .where(DirectMessageTask.launch_id == launch.id)
-                    .group_by(DirectMessageTask.status)
-                )
-            ).all()
-        )
+        counts, uncertain = await self._task_status_counts(session, launch_id=launch.id)
         next_scheduled_for = await session.scalar(
             select(func.min(DirectMessageTask.scheduled_for)).where(
                 DirectMessageTask.launch_id == launch.id,
@@ -1967,16 +1964,6 @@ class DirectMessageService:
             )
         )
         task_total = sum(int(value or 0) for value in counts.values())
-        uncertain = int(
-            await session.scalar(
-                select(func.count(DirectMessageTask.id)).where(
-                    DirectMessageTask.launch_id == launch.id,
-                    DirectMessageTask.status == DirectMessageTaskStatus.FAILED,
-                    DirectMessageTask.error_code.in_(DIRECT_UNCERTAIN_CODES),
-                )
-            )
-            or 0
-        )
         error_row = (
             await session.execute(
                 select(
@@ -3068,16 +3055,8 @@ class DirectMessageService:
         if code in ACCOUNT_WIDE_CODES and not account_failure_applied:
             await self._runner.handle_external_account_failure(account_id, exc)
         if code in {"account_restricted", "peer_flood"}:
-            async with self._session_factory() as session:
-                await session.execute(
-                    update(Account)
-                    .where(Account.id == account_id)
-                    .values(
-                        spambot_status="active_restriction",
-                        spambot_parser_signal="peer_flood_error",
-                    )
-                )
-                await session.commit()
+            # The runner already requested an authoritative SpamBot check when
+            # available. An RPC refusal must not overwrite that observation.
             if self._settings.account_restriction_cooldown_hours == 0:
                 return await self._finish_task(
                     task_id,
@@ -3725,14 +3704,24 @@ class DirectMessageService:
             launch = await session.get(DirectLaunch, task.launch_id)
             if launch is None:
                 raise NotFoundError("запуск ЛС-рассылки не найден")
-            queued_subscriber_ids = tuple(
-                int(value)
-                for value in await session.scalars(
-                    select(DirectMessageTask.subscriber_id).where(
-                        DirectMessageTask.launch_id == launch.id,
-                        DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
-                    )
+            pending_subscriber_ids = select(DirectMessageTask.subscriber_id).where(
+                DirectMessageTask.launch_id == launch.id,
+                or_(
+                    DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                    DirectMessageTask.id == task.id,
+                ),
+            )
+            # Release only the queued recipients and this attempt. Other
+            # RUNNING tasks keep their reservations until their own outcome.
+            # A subquery also keeps the bind count independent of queue size.
+            await session.execute(
+                update(Subscriber)
+                .where(
+                    Subscriber.id.in_(pending_subscriber_ids),
+                    Subscriber.reserved_direct_launch_id == launch.id,
                 )
+                .values(reserved_direct_launch_id=None, updated_at=now)
+                .execution_options(synchronize_session=False)
             )
             task.status = DirectMessageTaskStatus.FAILED
             task.error_code = code
@@ -3752,14 +3741,6 @@ class DirectMessageService:
                     finished_at=now,
                     updated_at=now,
                 )
-            )
-            await session.execute(
-                update(Subscriber)
-                .where(
-                    Subscriber.id.in_((*queued_subscriber_ids, int(task.subscriber_id))),
-                    Subscriber.reserved_direct_launch_id == launch.id,
-                )
-                .values(reserved_direct_launch_id=None, updated_at=now)
             )
             launch.cancel_requested = True
             launch.status = DirectLaunchStatus.FAILED

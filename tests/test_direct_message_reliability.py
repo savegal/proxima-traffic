@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import sqlite3
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
@@ -32,6 +33,18 @@ from proxima_traffic.models import (
     utc_now,
 )
 from proxima_traffic.services import CampaignRunner, ConflictError
+
+
+async def limit_sqlite_variables(database, maximum=999):
+    def configure(connection, record):
+        connection.run_async(
+            lambda driver: driver._execute(
+                driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, maximum
+            )
+        )
+
+    await database.engine.dispose()
+    event.listen(database.engine.sync_engine, "connect", configure)
 
 
 @pytest.fixture
@@ -99,6 +112,102 @@ async def dm(tmp_path, schema_template):
         )
     finally:
         await database.dispose()
+
+
+async def test_large_launch_failure_releases_pending_but_not_other_running_tasks(dm, tmp_path):
+    source = tmp_path / "large-queue.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps({"telegram_id": 1_980_000 + index, "username": f"large_member_{index}"})
+            for index in range(1205)
+        ),
+        encoding="utf-8",
+    )
+    imported = await dm.service.import_subscribers(
+        source, list_name="Large queue", source_filename=source.name
+    )
+    async with dm.db.session_factory() as session:
+        campaign = await session.get(DirectCampaign, dm.campaign.id)
+        campaign.recipient_limit = 1200
+        campaign.subscriber_list_id = imported.subscriber_list.id
+        await session.commit()
+    launch = await dm.service.launch_campaign(dm.campaign.id, consent_confirmed=True)
+    first, other = await dm.service._claim_next(), await dm.service._claim_next()
+    assert first and other
+    await limit_sqlite_variables(dm.db)
+    result = await dm.service._fail_launch(
+        first.id, first.lease_token, "content_invalid", "invalid"
+    )
+    assert result.status == DirectMessageTaskStatus.FAILED
+    async with dm.db.session_factory() as session:
+        reserved = list(
+            await session.scalars(
+                select(Subscriber.id).where(Subscriber.reserved_direct_launch_id == launch.id)
+            )
+        )
+        assert reserved == [other.subscriber_id]
+        counts = dict(
+            (
+                await session.execute(
+                    select(DirectMessageTask.status, func.count())
+                    .where(DirectMessageTask.launch_id == launch.id)
+                    .group_by(DirectMessageTask.status)
+                )
+            ).all()
+        )
+        assert counts == {DirectMessageTaskStatus.FAILED: 1199, DirectMessageTaskStatus.RUNNING: 1}
+        stored = await session.get(DirectLaunch, launch.id)
+        assert stored.status == DirectLaunchStatus.FAILED and stored.cancel_requested
+
+
+async def test_replacement_queue_finishes_when_all_senders_become_unavailable(dm):
+    launch = await dm.service.launch_campaign(dm.campaign.id, consent_confirmed=True)
+    task = await dm.service._claim_next()
+    await dm.service._finish_task(
+        task.id,
+        task.lease_token,
+        status=DirectMessageTaskStatus.SKIPPED,
+        error_code="recipient_unavailable",
+        error="Recipient refused",
+    )
+    assert (await dm.service.get_launch_view(launch.id)).queued == 1
+    async with dm.db.session_factory() as session:
+        account = await session.get(Account, dm.account.id)
+        account.status = AccountStatus.DISABLED
+        await session.commit()
+    result = await dm.service.process_next()
+    assert result.status == DirectMessageTaskStatus.FAILED
+    view = await dm.service.get_launch_view(launch.id)
+    assert view.active == 0 and view.launch.status == DirectLaunchStatus.FAILED
+
+
+@pytest.mark.parametrize("official_status", ["free", "active_restriction"])
+async def test_peer_flood_does_not_replace_an_official_spambot_observation(dm, official_status):
+    launch = await dm.service.launch_campaign(dm.campaign.id, consent_confirmed=True)
+    task = await dm.service._claim_next()
+    checked_at = utc_now()
+    async with dm.db.session_factory() as session:
+        account = await session.get(Account, dm.account.id)
+        account.spambot_status = official_status
+        account.spambot_checked_at = checked_at
+        account.spambot_parser_signal = "official_reply"
+        await session.commit()
+    await dm.service._handle_gateway_failure(
+        task.id,
+        task.lease_token,
+        account_id=dm.account.id,
+        subscriber_id=task.subscriber_id,
+        exc=PermanentGatewayError("RPC refusal", code="peer_flood"),
+        account_failure_applied=True,
+    )
+    async with dm.db.session_factory() as session:
+        account = await session.get(Account, dm.account.id)
+        assert account.spambot_status == official_status
+        assert account.spambot_parser_signal == "official_reply"
+        assert ensure_utc(account.spambot_checked_at) == checked_at
+        assert dm.account.id in await dm.service._refused_launch_account_ids(session, launch.id)
+        future_refusals = await dm.service._refused_launch_account_ids(session, launch.id + 1)
+        assert (dm.account.id in future_refusals) == (official_status == "active_restriction")
 
 
 @pytest.mark.parametrize("operation_kind", ["message", "auto_delete"])
@@ -369,9 +478,7 @@ async def test_unexpected_failure_after_dispatch_blocks_retry_and_replacement(dm
         assert await session.scalar(select(func.count(DirectMessageTask.id))) == 1
 
 
-async def test_unconfirmed_direct_send_counts_as_unknown_and_reserves_sender_quota(
-    dm, monkeypatch
-):
+async def test_unconfirmed_direct_send_counts_as_unknown_and_reserves_sender_quota(dm, monkeypatch):
     launch = await dm.service.launch_campaign(dm.campaign.id, consent_confirmed=True)
     monkeypatch.setattr(
         dm.gateway,
@@ -443,11 +550,17 @@ async def test_restriction_is_preserved_when_task_waits_for_account(dm, monkeypa
     # A second available sender must not be described as blocked by Telegram.
     mixed = replace(
         view,
-        sender_states=view.sender_states + (
+        sender_states=view.sender_states
+        + (
             replace(
-                view.sender_states[0], account_id=999, label="Ready sender",
-                reason=None, resume_at=None, cooldown_reason=None,
-                spambot_status=None, spambot_checked_at=None,
+                view.sender_states[0],
+                account_id=999,
+                label="Ready sender",
+                reason=None,
+                resume_at=None,
+                cooldown_reason=None,
+                spambot_status=None,
+                spambot_checked_at=None,
             ),
         ),
     )

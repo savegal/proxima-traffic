@@ -1,3 +1,6 @@
+import logging
+
+import pytest
 from aiogram.types import CallbackQuery, ErrorEvent, Update, User
 from sqlalchemy.exc import OperationalError
 
@@ -14,7 +17,9 @@ from proxima_traffic.subscriber_import import SubscriberImportError
 
 
 def test_operator_error_never_exposes_internal_exception_for_bad_input() -> None:
-    assert "устарели" in _operator_error(ValueError("secret=do-not-show"))
+    text = _operator_error(ValueError("secret=do-not-show"))
+    assert "внутренней ошибки" in text
+    assert "secret" not in text
     assert "рабочий прокси" in _operator_error(ProxyRouteUnavailable("internal details"))
     assert "изменён" in _operator_error(NotFoundError("account 1"))
     assert "База данных" in _operator_error(OperationalError("SELECT 1", {}, RuntimeError("busy")))
@@ -54,3 +59,33 @@ async def test_unexpected_callback_error_is_acknowledged_safely(monkeypatch) -> 
 
     assert await handle_control_panel_error(event) is True
     assert "credentials" not in str(captured["text"])
+
+
+@pytest.mark.parametrize("error_type", [ValueError, KeyError, IndexError])
+async def test_programming_errors_keep_their_traceback(error_type, monkeypatch, caplog) -> None:
+    replies = []
+
+    async def answer(_callback, text):
+        replies.append(text)
+
+    monkeypatch.setattr(error_handling, "_answer_callback", answer)
+    try:
+        raise error_type("private internal detail")
+    except error_type as exception:
+        event = ErrorEvent(
+            update=Update(
+                update_id=9,
+                callback_query=CallbackQuery(
+                    id="broken",
+                    from_user=User(id=1, is_bot=False, first_name="Admin"),
+                    chat_instance="test",
+                ),
+            ),
+            exception=exception,
+        )
+    with caplog.at_level(logging.ERROR, logger=error_handling.__name__):
+        assert await handle_control_panel_error(event)
+    record = next(record for record in caplog.records if record.exc_info)
+    assert record.exc_info[0] is error_type
+    assert record.exc_info[2] is not None
+    assert "private internal detail" not in replies[0]

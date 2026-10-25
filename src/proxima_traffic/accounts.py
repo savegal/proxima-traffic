@@ -1125,7 +1125,7 @@ class AccountService:
 
     async def record_join(self, account_id: int) -> None:
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
+            account = await locked_account(session, account_id)
             if account is None:
                 return
             now = utc_now()

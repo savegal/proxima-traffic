@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from html import escape
@@ -221,9 +222,12 @@ def channel_comment_reactions_text(
     )
     state = "включены" if rule.reactions_enabled and rule.reaction_count else "Ⅱ выключены"
     steps = _channel_comment_steps(rule)
-    selected_step = min(max(1, int(rule.reaction_dialogue_step)), len(steps))
-    source_account_id = int(steps[selected_step - 1].account_id)
-    maximum_reactors = len(selected - {source_account_id})
+    selected_step = (
+        int(rule.reaction_dialogue_step) if rule.reaction_dialogue_step is not None else 1
+    )
+    valid_step = 1 <= selected_step <= len(steps)
+    source_account_id = int(steps[selected_step - 1].account_id) if valid_step else None
+    maximum_reactors = len(selected - {source_account_id}) if valid_step else 0
     lines = [
         screen_title(f"Реакции на комментарий · {escape(rule.name)}", state),
         "",
@@ -232,6 +236,11 @@ def channel_comment_reactions_text(
     ]
     if rule.mode == ChannelCommentMode.DIALOGUE:
         lines.append(f"Комментарий цепочки: <b>№ {rule.reaction_dialogue_step}</b>")
+    if not valid_step:
+        lines.append(
+            "! <b>Цепочка или выбранный шаг повреждены.</b> "
+            "Исправьте правило перед включением реакций."
+        )
     lines.extend(
         [
             f"Аккаунты: {account_labels}\n",
@@ -315,11 +324,22 @@ def channel_comment_reaction_account_ids(view: ChannelCommentRuleView) -> set[in
         raw = json.loads(view.rule.reaction_account_ids_json or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         return set()
+    if not isinstance(raw, list):
+        return set()
     return {
         int(value)
         for value in raw
         if isinstance(value, int) and not isinstance(value, bool) and value > 0
     }
+
+
+def channel_comment_account_ids(view: ChannelCommentRuleView) -> set[int]:
+    ids = channel_comment_reaction_account_ids(view)
+    ids.add(int(view.rule.primary_account_id))
+    ids.update(step.account_id for step in _channel_comment_steps(view.rule))
+    if view.rule.last_error_account_id is not None:
+        ids.add(int(view.rule.last_error_account_id))
+    return ids
 
 
 def _channel_comment_steps(rule: ChannelCommentRule) -> list[DialogueStep]:
@@ -336,14 +356,18 @@ def _channel_comment_steps(rule: ChannelCommentRule) -> list[DialogueStep]:
                 media_size=rule.primary_media_size,
             )
         ]
-    return parse_dialogue_steps(
-        rule.dialogue_steps_json,
-        primary_account_id=int(rule.primary_account_id),
-        primary_text=str(rule.primary_text),
-        reply_account_id=None,
-        reply_text="",
-        reply_delay_seconds=0,
-    )
+    try:
+        return parse_dialogue_steps(
+            rule.dialogue_steps_json,
+            primary_account_id=int(rule.primary_account_id),
+            primary_text=str(rule.primary_text),
+            reply_account_id=None,
+            reply_text="",
+            reply_delay_seconds=0,
+        )
+    except (TypeError, ValueError):
+        # Keep the recovery screen usable without inventing a replacement step.
+        return []
 
 
 def channel_comment_delete_menu(rule_id: int, *, page: int) -> InlineKeyboardMarkup:
@@ -574,6 +598,8 @@ def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[in
             else "Реакции на свой комментарий: <b>выключены</b>"
         ),
     ]
+    if rule.mode == ChannelCommentMode.DIALOGUE and not _channel_comment_steps(rule):
+        lines.append("! <b>Сохранённая цепочка повреждена.</b> Пересоздайте правило.")
     if rule.mode == ChannelCommentMode.MESSAGE_EDIT:
         initial_text = escape(_comment_preview(rule.message_edit_initial_text or "", 500))
         lines.append(
@@ -950,11 +976,32 @@ def channel_comment_draft_text(data: dict[str, object], accounts: dict[int, str]
 
 
 def _comment_preview(value: str, maximum: int) -> str:
-    """Bound UTF-16 length before HTML escaping, preserving entities and tags."""
+    """Bound UTF-16 length without cutting an emoji or combining sequence."""
+    if maximum <= 0:
+        return ""
     encoded = value.encode("utf-16-le")
     if len(encoded) // 2 <= maximum:
         return value
-    return encoded[: (maximum - 1) * 2].decode("utf-16-le", errors="ignore") + "…"
+    end = len(encoded[: (maximum - 1) * 2].decode("utf-16-le", errors="ignore"))
+    while end:
+        following, previous = value[end], value[end - 1]
+        joins_sequence = (
+            following == "\u200d"
+            or previous == "\u200d"
+            or unicodedata.category(following) in {"Mn", "Mc", "Me"}
+            or "\U0001f3fb" <= following <= "\U0001f3ff"
+            or "\U000e0020" <= following <= "\U000e007f"
+            or (previous == "\r" and following == "\n")
+        )
+        if "\U0001f1e6" <= following <= "\U0001f1ff":
+            start = end
+            while start and "\U0001f1e6" <= value[start - 1] <= "\U0001f1ff":
+                start -= 1
+            joins_sequence = joins_sequence or (end - start) % 2 == 1
+        if not joins_sequence:
+            break
+        end -= 1
+    return value[:end] + "…"
 
 
 def _delay(seconds: int) -> str:

@@ -428,7 +428,15 @@ def live_gateway(tmp_path, *, failure=None, no_update=False):
 
 
 @pytest.mark.asyncio
-async def test_real_request_contains_explicit_mentions_and_matching_story_id(tmp_path):
+@pytest.mark.parametrize("caption,expected_url", [
+    ("🔥 literal <b>", None),
+    ("Канал: https://t.me/example_channel.", "https://t.me/example_channel"),
+    ("(https://example.org/route_(one)).", "https://example.org/route_(one)"),
+    ("[https://label.example](https://target.example/path).", "https://target.example/path"),
+])
+async def test_real_request_contains_explicit_mentions_and_matching_story_id(
+    tmp_path, caption, expected_url
+):
     gateway, account, _, requests, settings = live_gateway(tmp_path)
     photo = BytesIO()
     Image.new("RGB", (720, 1280), (40, 90, 160)).save(photo, "JPEG")
@@ -437,7 +445,7 @@ async def test_real_request_contains_explicit_mentions_and_matching_story_id(tmp
         account=account,
         media_path=media.path,
         media_kind="photo",
-        caption="🔥 literal <b>",
+        caption=caption,
         tagged_subscribers=[Subscriber(id=1, telegram_user_id=5000, username="alice")],
         idempotency_key="stable-key",
     )
@@ -445,9 +453,10 @@ async def test_real_request_contains_explicit_mentions_and_matching_story_id(tmp
     assert result.story_id == 42
     assert result.tagged_subscriber_ids == (1,)
     assert result.story_url == "https://t.me/sender/s/42"
-    assert sent.caption == "🔥 literal <b>\n\n@alice"
+    assert sent.caption == caption + "\n\n@alice"
     assert isinstance(sent.entities[0], types.MessageEntityMention)
-    assert sent.entities[0].offset == utf16_length("🔥 literal <b>\n\n")
+    assert sent.entities[0].offset == utf16_length(caption + "\n\n")
+    assert (sent.media_areas[0].url if sent.media_areas else None) == expected_url
 
 
 @pytest.mark.asyncio

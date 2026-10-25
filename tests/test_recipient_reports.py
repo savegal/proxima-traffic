@@ -398,6 +398,9 @@ class State:
     async def set_state(self, value):
         self.state = value
 
+    async def get_state(self):
+        return self.state
+
 
 async def test_directory_pagination_has_direct_jump_and_controls_at_both_ends(reports):
     report = await reports.direct.list_subscriber_directory()

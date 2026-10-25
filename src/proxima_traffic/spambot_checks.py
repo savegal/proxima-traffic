@@ -131,6 +131,7 @@ class SpamBotCheckService:
                         Account.session_encrypted.is_not(None),
                         or_(
                             Account.spambot_checked_at.is_(None),
+                            Account.spambot_parser_signal == "peer_flood_error",
                             Account.spambot_checked_at <= now - minimum,
                             (
                                 (
@@ -348,6 +349,7 @@ class SpamBotCheckService:
         checked_at = ensure_utc(account.spambot_checked_at)
         if (
             force
+            or account.spambot_parser_signal == "peer_flood_error"
             or checked_at is None
             or now - checked_at >= timedelta(seconds=self._minimum_interval_seconds)
         ):

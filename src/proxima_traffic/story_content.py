@@ -4,10 +4,51 @@ from __future__ import annotations
 
 import re
 from io import BytesIO
+from urllib.parse import urlsplit
 
 from proxima_traffic.content import ContentError
 
 STORY_REACTIONS = ("🔥", "❤️", "👍", "⚡", "🎉", "👏", "😍", "🥳", "💯", "⭐")
+
+
+def story_link_url(caption: str) -> str | None:
+    """Extract the first link target without surrounding prose/Markdown punctuation."""
+    plain = re.search(r'https?://[^\s<>"\']+', caption, re.IGNORECASE)
+    if plain is None:
+        return None
+    markdown = re.search(r"\[[^\[\]\r\n]*\]\((https?://)", caption, re.IGNORECASE)
+    url = None
+    if markdown is not None and markdown.start() <= plain.start():
+        start, depth = markdown.start(1), 0
+        for index in range(start, len(caption)):
+            character = caption[index]
+            if character.isspace() or character in "<>\"'":
+                break
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                if depth == 0:
+                    url = caption[start:index]
+                    break
+                depth -= 1
+    if url is None:
+        url = plain.group(0)
+        pairs = {")": "(", "]": "[", "}": "{"}
+        while url:
+            url = url.rstrip(".,;:!?")
+            closing = url[-1:]
+            opening = pairs.get(closing)
+            if opening is None or url.count(closing) <= url.count(opening):
+                break
+            url = url[:-1]
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        _ = parsed.port  # Reject a malformed port without changing a valid URL.
+    except ValueError:
+        return None
+    return url
 
 
 def prepare_story_photo(data: bytes) -> bytes:

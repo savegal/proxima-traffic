@@ -72,7 +72,7 @@ def direct_messages_home_text(dashboard: DirectMessageDashboard) -> str:
         section("Результаты"),
         f"Отправлено и подтверждено: <b>{live_successes:,}</b>",
         f"Пропущено: <b>{dashboard.skipped_tasks:,}</b>"
-        f" · ошибок: <b>{dashboard.failed_tasks - dashboard.uncertain_tasks:,}</b>",
+        f" · ошибок: <b>{max(0, dashboard.failed_tasks - dashboard.uncertain_tasks):,}</b>",
         f"Не подтверждено: <b>{dashboard.uncertain_tasks:,}</b>",
     ]
     if dashboard.service_succeeded_tasks:
@@ -153,7 +153,6 @@ def direct_service_action_text() -> str:
     )
 
 
-@themed_keyboard
 def direct_service_action_menu() -> InlineKeyboardMarkup:
     rows = [
         [
@@ -285,12 +284,13 @@ def direct_blacklist_add_prompt_text() -> str:
 
 def direct_blacklist_parse_prompt_text() -> str:
     return (
-        screen_title("Собрать ID из чата", "Сначала только чтение, затем отдельное подтверждение")
+        screen_title("Собрать ID из чата", "Добавление в стоп-лист подтверждается отдельно")
         + "\n\n"
         "Отправьте <b>@username</b>, публичную ссылку <code>https://t.me/name</code> или "
         "числовой ID доступного вашим аккаунтам чата.\n\n"
-        "Никаких сообщений и изменений чата не будет. Если аккаунт ещё не состоит в доступном "
-        "публичном/приватном чате, сервис может вступить перед чтением. После чтения бот "
+        "Сообщения в чат не отправляются. Публичный чат сначала читается без вступления. "
+        "Если для доступа нужно вступить, используется один аккаунт с учётом лимитов. "
+        "При заявке на вступление сервис остановится до её одобрения. После чтения бот "
         "отправит файл с уникальными Telegram ID и спросит, добавлять ли их в глобальный "
         "стоп-лист.\n\n"
         "Для приватного чата можно использовать invite-ссылку <code>t.me/+…</code> или его "
@@ -1014,7 +1014,7 @@ def direct_launches_text(
             f"{icon} <b>{escape(view.campaign_name)}</b> · #{view.launch.id}\n"
             f"  {result_label}: "
             f"{view.succeeded} · в работе {view.active}\n"
-            f"  пропущено {view.skipped} · ошибок {view.failed - view.uncertain} "
+            f"  пропущено {view.skipped} · ошибок {max(0, view.failed - view.uncertain)} "
             f"· не подтверждено {view.uncertain}\n"
         )
     if not items:
@@ -1233,7 +1233,7 @@ def direct_launch_details_text(view: DirectLaunchView) -> str:
         f"<b>{view.succeeded:,}</b>\n"
         f"В очереди и работе: <b>{view.active:,}</b>\n"
         f"›› Пропущено: <b>{view.skipped:,}</b>\n"
-        f"× Ошибок: <b>{view.failed - view.uncertain:,}</b>\n"
+        f"× Ошибок: <b>{max(0, view.failed - view.uncertain):,}</b>\n"
         f"? Результат не подтверждён: <b>{view.uncertain:,}</b>\n"
         f"Ⅱ Отменено: <b>{view.cancelled:,}</b>"
         f"{replacement_text}{timing_text}{sender_text}{excluded_text}"
@@ -1308,7 +1308,8 @@ def direct_service_launch_text(view: DirectLaunchView) -> str:
     lines.extend(
         [
             f"В очереди: <b>{view.queued:,}</b> · выполняется: <b>{view.running:,}</b>",
-            f"Пропущено: <b>{view.skipped:,}</b> · ошибок: <b>{view.failed - view.uncertain:,}</b>",
+            f"Пропущено: <b>{view.skipped:,}</b> · "
+            f"ошибок: <b>{max(0, view.failed - view.uncertain):,}</b>",
             f"Результат действия неизвестен: <b>{view.uncertain:,}</b>"
             f" · отменено: <b>{view.cancelled:,}</b>",
         ]

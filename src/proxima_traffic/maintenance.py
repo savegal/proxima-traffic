@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -314,12 +315,49 @@ def cleanup_media_orphans(
     )
 
 
-def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
+def cleanup_draft_media(
+    database_url: str, storage_path: Path, raw_paths: set[str]
+) -> list[str]:
+    """Remove abandoned draft files while preserving all durable references."""
+    root = storage_path.expanduser().resolve()
+    candidates = {
+        candidate
+        for raw_path in raw_paths
+        if not Path(raw_path).is_symlink()
+        and (candidate := _managed_media_path(raw_path, root)) is not None
+        and candidate.is_file()
+    }
+    if not candidates:
+        return []
+    removed = []
+    database_path = sqlite_path_from_url(database_url)
+    if not database_path.is_file():
+        raise FileNotFoundError(database_path)
+    # A new campaign or another durable draft must not acquire a reference
+    # between the reference check and file deletion.
+    with sqlite3.connect(database_path, timeout=2) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        references = _media_references(database_url, root, connection=connection)
+        for candidate in sorted(candidates - references):
+            candidate.unlink(missing_ok=True)
+            removed.append(str(candidate))
+    return removed
+
+
+def _media_references(
+    database_url: str,
+    storage_root: Path,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> frozenset[Path]:
     database_path = sqlite_path_from_url(database_url)
     if not database_path.is_file():
         raise FileNotFoundError(database_path)
     raw_paths: set[str] = set()
-    with sqlite3.connect(database_path) as connection:
+    connection_context = (
+        nullcontext(connection) if connection is not None else sqlite3.connect(database_path)
+    )
+    with connection_context as connection:
         tables = {
             str(row[0])
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -359,7 +397,9 @@ def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
                 if isinstance(media_path, str):
                     raw_paths.add(media_path)
         if "story_tagging_campaigns" in tables:
-            for (media_path,) in connection.execute("SELECT media_path FROM story_tagging_campaigns"):
+            for (media_path,) in connection.execute(
+                "SELECT media_path FROM story_tagging_campaigns"
+            ):
                 if isinstance(media_path, str):
                     raw_paths.add(media_path)
         if "channel_comment_rules" in tables:
@@ -386,6 +426,11 @@ def _media_paths_from_json(raw_json: object) -> set[str]:
         payload = json.loads(raw_json)
     except json.JSONDecodeError:
         return set()
+    return media_paths_from_data(payload)
+
+
+def media_paths_from_data(payload: object) -> set[str]:
+    """Collect paths from the nested content formats used by drafts and snapshots."""
     paths: set[str] = set()
 
     def visit(value: object) -> None:

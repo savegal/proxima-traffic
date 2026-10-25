@@ -12,6 +12,7 @@ from proxima_traffic.bot.middleware import (
     CallbackTimingMiddleware,
     CleanFsmInputMiddleware,
     ControlEventIsolation,
+    DraftMediaCleanupMiddleware,
     PanelContextMiddleware,
 )
 
@@ -32,16 +33,17 @@ def create_dispatcher(
         storage=storage or MemoryStorage(), events_isolation=ControlEventIsolation(admin_ids)
     )
     middleware = AdminOnlyMiddleware(admin_ids)
-    dispatcher.message.middleware(middleware)
     dispatcher.message.middleware(PanelContextMiddleware())
     dispatcher.message.middleware(CleanFsmInputMiddleware())
+    dispatcher.message.middleware(DraftMediaCleanupMiddleware())
     dispatcher.message.middleware(BulkAvatarDraftCleanupMiddleware())
-    dispatcher.callback_query.middleware(middleware)
     dispatcher.callback_query.middleware(PanelContextMiddleware())
+    dispatcher.callback_query.middleware(DraftMediaCleanupMiddleware())
     dispatcher.callback_query.middleware(BulkAvatarDraftCleanupMiddleware())
     # Update-level placement starts the clock before aiogram loads durable FSM
     # state, so callback-to-ack and SQL metrics cover the whole local pipeline.
     dispatcher.update.outer_middleware.unregister(dispatcher.fsm)
+    dispatcher.update.outer_middleware(middleware)
     dispatcher.update.outer_middleware(CallbackTimingMiddleware(admin_ids))
     dispatcher.update.outer_middleware(dispatcher.fsm)
     dispatcher.include_router(router)

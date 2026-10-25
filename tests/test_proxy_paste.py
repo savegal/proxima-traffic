@@ -26,6 +26,9 @@ class State:
     async def set_state(self, value):
         self.state = value
 
+    async def get_state(self):
+        return self.state
+
     async def clear(self):
         self.data.clear()
         self.state = None
@@ -109,7 +112,9 @@ async def test_large_pasted_import_is_rejected_without_db_write(app):
         entities=[], caption_entities=[],
         answer=AsyncMock(),
     )
-    await handlers.import_proxy_document(message, State(), object(), app.state.proxy_service)
+    state = State()
+    state.data.clear()  # Exercise panel recovery when the original screen is unavailable.
+    await handlers.import_proxy_document(message, state, object(), app.state.proxy_service)
     assert "2000" in message.answer.call_args.args[0]
     async with app.state.database.session_factory() as session:
         assert await session.scalar(select(ProxyEndpoint)) is None

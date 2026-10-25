@@ -622,7 +622,11 @@ async def test_cancelled_preflight_does_not_clear_new_draft(monkeypatch):
 async def test_invalid_active_duration_cannot_create_indefinite_launch(text):
     message = SimpleNamespace(text=text, answer=AsyncMock())
     queue = SimpleNamespace(update_active_launch=AsyncMock())
-    state = SimpleNamespace(get_data=AsyncMock(), clear=AsyncMock())
+    state = SimpleNamespace(
+        get_data=AsyncMock(return_value={}),
+        get_state=AsyncMock(return_value="active:duration"),
+        clear=AsyncMock(),
+    )
     await handlers.save_active_launch_duration(message, state, object(), object(), queue)
     queue.update_active_launch.assert_not_awaited()
     state.clear.assert_not_awaited()

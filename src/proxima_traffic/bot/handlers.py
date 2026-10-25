@@ -44,6 +44,7 @@ from proxima_traffic.blacklist_import import (
 )
 from proxima_traffic.blacklist_parser import ChatBlacklistParser
 from proxima_traffic.bot.channel_comment_ui import (
+    channel_comment_account_ids,
     channel_comment_account_picker,
     channel_comment_chain_menu,
     channel_comment_confirmation_menu,
@@ -758,10 +759,7 @@ async def _show_channel_comment_details(
     page: int,
 ) -> None:
     view = await channel_comments.get_rule_view(rule_id)
-    account_ids = {step.account_id for step in ChannelCommentService._rule_steps(view.rule)}
-    if view.rule.last_error_account_id is not None:
-        account_ids.add(view.rule.last_error_account_id)
-    labels = await repository.account_labels_by_ids(account_ids)
+    labels = await repository.account_labels_by_ids(channel_comment_account_ids(view))
     await _edit_callback(
         callback,
         channel_comment_details_text(view, labels),
@@ -780,7 +778,7 @@ async def _show_channel_comment_reactions(
     page: int,
 ) -> None:
     view = await channel_comments.get_rule_view(rule_id)
-    _, labels = await _comment_accounts(repository, settings)
+    labels = await repository.account_labels_by_ids(channel_comment_account_ids(view))
     await _edit_callback(
         callback,
         channel_comment_reactions_text(view, labels),
@@ -818,8 +816,11 @@ async def _show_participant_reaction_details(
     page: int,
 ) -> None:
     view = await participant_reactions.get_rule_view(rule_id)
-    accounts, labels = await _comment_accounts(repository, settings)
-    del accounts
+    try:
+        account_ids = set(ParticipantReactionService._account_ids(view.rule))
+    except (TypeError, ValueError):
+        account_ids = set()
+    labels = await repository.account_labels_by_ids(account_ids)
     await _edit_callback(
         callback,
         participant_reaction_details_text(view, labels),
@@ -1935,7 +1936,7 @@ async def save_order_name(
 ) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 150:
-        await message.answer("Название должно содержать от 1 до 150 символов.")
+        await answer_panel_input(message, state, "Название должно содержать от 1 до 150 символов.")
         return
     await state.update_data(order_name=value)
     await state.set_state(OrderDraftState.action)
@@ -2160,7 +2161,7 @@ async def save_custom_order_mention_cooldown(
     except ValueError:
         days = 0
     if not 1 <= days <= 365:
-        await message.answer("Введите целое число дней от 1 до 365.")
+        await answer_panel_input(message, state, "Введите целое число дней от 1 до 365.")
         return
     await state.update_data(mention_cooldown_days=days)
     await state.set_state(OrderDraftState.engagement)
@@ -3227,7 +3228,7 @@ async def search_order_audience(
 ) -> None:
     query = (message.text or "").strip()
     if not 1 <= len(query) <= 120:
-        await message.answer("Отправьте запрос длиной от 1 до 120 символов.")
+        await answer_panel_input(message, state, "Отправьте запрос длиной от 1 до 120 символов.")
         return
     data = await state.get_data()
     kind = str(data.get("order_audience_search_kind") or "")
@@ -3245,7 +3246,7 @@ async def search_order_audience(
         ]
     else:
         await state.set_state(OrderDraftState.action)
-        await message.answer("Поиск устарел. Вернитесь в карточку рассылки.")
+        await answer_panel_input(message, state, "Поиск устарел. Вернитесь в карточку рассылки.")
         return
     await state.set_state(
         OrderDraftState.audience_targets if kind == "chats" else OrderDraftState.audience
@@ -3829,7 +3830,7 @@ async def perform_list_search(
 ) -> None:
     query = (message.text or "").strip()
     if not 1 <= len(query) <= 120:
-        await message.answer("Отправьте запрос длиной от 1 до 120 символов.")
+        await answer_panel_input(message, state, "Отправьте запрос длиной от 1 до 120 символов.")
         return
     data = await state.get_data()
     section = str(data.get("search_section") or "")
@@ -3861,7 +3862,7 @@ async def perform_list_search(
             items = await repository.search_target_list_targets(target_list_id, query)
         except NotFoundError as exc:
             await state.clear()
-            await message.answer(escape(operator_error_message(exc)))
+            await answer_panel_input(message, state, escape(operator_error_message(exc)))
             return
         results = [
             (
@@ -3905,7 +3906,7 @@ async def perform_list_search(
         ]
     else:
         await state.clear()
-        await message.answer("Раздел поиска устарел. Откройте список заново.")
+        await answer_panel_input(message, state, "Раздел поиска устарел. Откройте список заново.")
         return
     await _edit_origin_data(
         bot,
@@ -4178,7 +4179,11 @@ async def proxy_add_url(
     try:
         parsed = parse_proxy(value)
     except ProxyInputError as exc:
-        await message.answer(f"Некорректный адрес: {escape(operator_error_message(exc))}")
+        await answer_panel_input(
+            message,
+            state,
+            f"Некорректный адрес: {escape(operator_error_message(exc))}",
+        )
         return
     # FSM state survives bot restarts and therefore must not retain a raw
     # proxy password or MTProto secret between wizard steps.
@@ -4213,7 +4218,9 @@ async def proxy_add_label(
 ) -> None:
     value = (message.text or "").strip()
     if value != "-" and not 1 <= len(value) <= 100:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Название должно содержать от 1 до 100 символов или быть <code>-</code>."
         )
         return
@@ -4224,7 +4231,9 @@ async def proxy_add_label(
             proxy_url = _proxy_draft_url(data, settings)
         except ProxyInputError:
             await state.clear()
-            await message.answer(
+            await answer_panel_input(
+                message,
+                state,
                 "Черновик прокси больше нельзя безопасно восстановить. Начните добавление заново."
             )
             return
@@ -4234,7 +4243,7 @@ async def proxy_add_label(
                 label=data.get("proxy_label"),
             )
         except (ProxyInputError, ConflictError) as exc:
-            await message.answer(escape(operator_error_message(exc)))
+            await answer_panel_input(message, state, escape(operator_error_message(exc)))
             return
         await state.clear()
         await _edit_origin_data(
@@ -4269,7 +4278,9 @@ async def proxy_add_group(
 ) -> None:
     value = (message.text or "").strip()
     if value != "-" and not 1 <= len(value) <= 100:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Имя группы должно содержать от 1 до 100 символов или быть <code>-</code>."
         )
         return
@@ -4302,14 +4313,20 @@ async def proxy_add_rotation_url(
     try:
         rotation_url = None if value == "-" else validate_rotation_url(value)
     except ProxyInputError as exc:
-        await message.answer(f"Некорректная ссылка ротации: {escape(operator_error_message(exc))}")
+        await answer_panel_input(
+            message,
+            state,
+            f"Некорректная ссылка ротации: {escape(operator_error_message(exc))}",
+        )
         return
     data = await state.get_data()
     try:
         proxy_url = _proxy_draft_url(data, settings)
     except ProxyInputError:
         await state.clear()
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Черновик прокси больше нельзя безопасно восстановить. Начните добавление заново."
         )
         return
@@ -4321,7 +4338,7 @@ async def proxy_add_rotation_url(
             rotation_url=rotation_url,
         )
     except (ProxyInputError, ConflictError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -4375,7 +4392,9 @@ async def begin_proxy_import(callback: CallbackQuery, state: FSMContext) -> None
 async def proxy_import_group(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if value != "-" and not 1 <= len(value) <= 100:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Имя группы должно содержать от 1 до 100 символов или быть <code>-</code>."
         )
         return
@@ -4410,20 +4429,24 @@ async def import_proxy_document(
     linked_urls = []
     if document is not None:
         if not (document.file_name or "").lower().endswith(".txt"):
-            await message.answer("Нужен файл .txt или сообщение со ссылками прокси.")
+            await answer_panel_input(
+                message,
+                state,
+                "Нужен файл .txt или сообщение со ссылками прокси.",
+            )
             return
         if document.file_size is not None and document.file_size > 2_097_152:
-            await message.answer("Файл больше 2 МБ.")
+            await answer_panel_input(message, state, "Файл больше 2 МБ.")
             return
         buffer = BytesIO()
         await bot.download(document, destination=buffer)
         if buffer.getbuffer().nbytes > 2_097_152:
-            await message.answer("Файл больше 2 МБ.")
+            await answer_panel_input(message, state, "Файл больше 2 МБ.")
             return
         try:
             content = buffer.getvalue().decode("utf-8-sig")
         except UnicodeDecodeError:
-            await message.answer("Файл должен быть сохранён в UTF-8.")
+            await answer_panel_input(message, state, "Файл должен быть сохранён в UTF-8.")
             return
     else:
         content = message.text or message.caption or ""
@@ -4432,20 +4455,24 @@ async def import_proxy_document(
             if entity.url
         ]
         if not content and not linked_urls:
-            await message.answer("Вставьте MTProto-ссылки или отправьте файл .txt.")
+            await answer_panel_input(
+                message,
+                state,
+                "Вставьте MTProto-ссылки или отправьте файл .txt.",
+            )
             return
         if len(content.encode("utf-8")) > 2_097_152:
-            await message.answer("Список больше 2 МБ.")
+            await answer_panel_input(message, state, "Список больше 2 МБ.")
             return
     values = proxy_import_values(content, linked_urls=linked_urls)
     if len(values) > 2000:
-        await message.answer("За один импорт разрешено не более 2000 адресов.")
+        await answer_panel_input(message, state, "За один импорт разрешено не более 2000 адресов.")
         return
     data = await state.get_data()
     try:
         result = await proxy_service.import_proxies(values, group_name=data.get("proxy_group"))
     except ProxyInputError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     page = await proxy_service.list_proxies(0, PAGE_SIZE)
@@ -4519,14 +4546,18 @@ async def save_proxy_edit(
     try:
         parse_proxy(value)
     except ProxyInputError as exc:
-        await message.answer(f"Некорректный адрес: {escape(operator_error_message(exc))}")
+        await answer_panel_input(
+            message,
+            state,
+            f"Некорректный адрес: {escape(operator_error_message(exc))}",
+        )
         return
     data = await state.get_data()
     try:
         item = await proxy_service.replace_proxy_url(int(data["edit_proxy_id"]), value)
         await _close_rotated_account_client(item, gateway)
     except (NotFoundError, ConflictError, ProxyInputError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -4575,7 +4606,7 @@ async def save_proxy_rotation_url(
             None if value == "-" else value,
         )
     except (NotFoundError, ProxyInputError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -4680,7 +4711,7 @@ async def proxy_metadata_label(
 ) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 100:
-        await message.answer("Название должно содержать от 1 до 100 символов.")
+        await answer_panel_input(message, state, "Название должно содержать от 1 до 100 символов.")
         return
     data = await state.get_data()
     try:
@@ -4690,7 +4721,7 @@ async def proxy_metadata_label(
             group_name=data.get("meta_group_name"),
         )
     except (NotFoundError, ProxyInputError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -4710,7 +4741,11 @@ async def save_proxy_metadata(
 ) -> None:
     group = (message.text or "").strip()
     if group != "-" and not 1 <= len(group) <= 100:
-        await message.answer("Имя группы должно содержать от 1 до 100 символов или быть «-».")
+        await answer_panel_input(
+            message,
+            state,
+            "Имя группы должно содержать от 1 до 100 символов или быть «-».",
+        )
         return
     data = await state.get_data()
     try:
@@ -4720,7 +4755,7 @@ async def save_proxy_metadata(
             group_name=None if group == "-" else group,
         )
     except (NotFoundError, ProxyInputError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -4814,7 +4849,11 @@ async def begin_proxy_auto_assign(callback: CallbackQuery, state: FSMContext) ->
 async def proxy_auto_group(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if value != "-" and not 1 <= len(value) <= 100:
-        await message.answer("Имя группы должно содержать от 1 до 100 символов или быть «-».")
+        await answer_panel_input(
+            message,
+            state,
+            "Имя группы должно содержать от 1 до 100 символов или быть «-».",
+        )
         return
     await state.update_data(auto_group=None if value == "-" else value)
     await state.set_state(ProxyAutoAssignState.assignment_key)
@@ -4835,7 +4874,7 @@ async def proxy_auto_group(message: Message, state: FSMContext, bot: Bot) -> Non
 async def proxy_auto_key(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 150:
-        await message.answer("Ключ должен содержать от 1 до 150 символов.")
+        await answer_panel_input(message, state, "Ключ должен содержать от 1 до 150 символов.")
         return
     await state.update_data(assignment_key=value)
     await state.set_state(ProxyAutoAssignState.purpose)
@@ -4862,7 +4901,7 @@ async def finish_proxy_auto_assign(
 ) -> None:
     purpose = (message.text or "").strip()
     if purpose != "-" and len(purpose) > 250:
-        await message.answer("Описание не должно быть длиннее 250 символов.")
+        await answer_panel_input(message, state, "Описание не должно быть длиннее 250 символов.")
         return
     data = await state.get_data()
     try:
@@ -4873,7 +4912,7 @@ async def finish_proxy_auto_assign(
         )
         await _close_assignment_account_client(str(data["assignment_key"]), gateway)
     except (ConflictError, ProxyInputError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -4909,7 +4948,7 @@ async def begin_proxy_assign(callback: CallbackQuery, state: FSMContext) -> None
 async def proxy_assignment_key(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 150:
-        await message.answer("Ключ должен содержать от 1 до 150 символов.")
+        await answer_panel_input(message, state, "Ключ должен содержать от 1 до 150 символов.")
         return
     await state.update_data(assignment_key=value)
     await state.set_state(ProxyAssignState.purpose)
@@ -4936,7 +4975,7 @@ async def proxy_assignment_purpose(
 ) -> None:
     purpose = (message.text or "").strip()
     if purpose != "-" and len(purpose) > 250:
-        await message.answer("Описание не должно быть длиннее 250 символов.")
+        await answer_panel_input(message, state, "Описание не должно быть длиннее 250 символов.")
         return
     data = await state.get_data()
     try:
@@ -4947,7 +4986,7 @@ async def proxy_assignment_purpose(
         )
         await _close_assignment_account_client(str(data["assignment_key"]), gateway)
     except (NotFoundError, ConflictError, ProxyInputError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -5075,7 +5114,7 @@ async def begin_proxy_group_create(callback: CallbackQuery, state: FSMContext) -
 async def proxy_group_name(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 100:
-        await message.answer("Имя должно содержать от 1 до 100 символов.")
+        await answer_panel_input(message, state, "Имя должно содержать от 1 до 100 символов.")
         return
     await state.update_data(proxy_group_name=value)
     await state.set_state(ProxyGroupCreateState.description)
@@ -5101,7 +5140,7 @@ async def proxy_group_description(
 ) -> None:
     value = (message.text or "").strip()
     if value != "-" and len(value) > 500:
-        await message.answer("Описание не должно быть длиннее 500 символов.")
+        await answer_panel_input(message, state, "Описание не должно быть длиннее 500 символов.")
         return
     data = await state.get_data()
     try:
@@ -5109,7 +5148,7 @@ async def proxy_group_description(
             str(data["proxy_group_name"]), "" if value == "-" else value
         )
     except (ProxyInputError, ConflictError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     groups = await proxy_service.list_groups()
@@ -5144,7 +5183,7 @@ async def begin_account_create(callback: CallbackQuery, state: FSMContext) -> No
 async def account_label(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 100:
-        await message.answer("Название должно содержать от 1 до 100 символов.")
+        await answer_panel_input(message, state, "Название должно содержать от 1 до 100 символов.")
         return
     await state.update_data(label=value)
     await state.set_state(AccountCreateState.telegram_user_id)
@@ -5170,10 +5209,10 @@ async def account_telegram_id(message: Message, state: FSMContext, bot: Bot) -> 
         try:
             telegram_user_id = int(value)
         except ValueError:
-            await message.answer("Нужен числовой ID или символ <code>-</code>.")
+            await answer_panel_input(message, state, "Нужен числовой ID или символ <code>-</code>.")
             return
         if telegram_user_id <= 0:
-            await message.answer("Telegram User ID должен быть положительным.")
+            await answer_panel_input(message, state, "Telegram User ID должен быть положительным.")
             return
     await state.update_data(telegram_user_id=telegram_user_id)
     await state.set_state(AccountCreateState.confirm)
@@ -5560,7 +5599,11 @@ async def begin_account_group_create(callback: CallbackQuery, state: FSMContext)
 async def receive_account_group_name(message: Message, state: FSMContext, bot: Bot) -> None:
     value = " ".join((message.text or "").split())
     if not 1 <= len(value) <= 100:
-        await message.answer("Название группы должно содержать от 1 до 100 символов.")
+        await answer_panel_input(
+            message,
+            state,
+            "Название группы должно содержать от 1 до 100 символов.",
+        )
         return
     await state.update_data(account_group_name=value)
     await state.set_state(AccountGroupCreateState.description)
@@ -5587,7 +5630,11 @@ async def receive_account_group_description(
 ) -> None:
     description = "" if (message.text or "").strip() == "-" else (message.text or "").strip()
     if len(description) > 500:
-        await message.answer("Описание группы не должно быть длиннее 500 символов.")
+        await answer_panel_input(
+            message,
+            state,
+            "Описание группы не должно быть длиннее 500 символов.",
+        )
         return
     data = await state.get_data()
     try:
@@ -5595,7 +5642,7 @@ async def receive_account_group_description(
             str(data.get("account_group_name") or ""), description
         )
     except (ConflictError, ValueError) as exc:
-        await message.answer(f"× {escape(operator_error_message(exc))}")
+        await answer_panel_input(message, state, f"× {escape(operator_error_message(exc))}")
         return
     try:
         account_filter = AccountListFilter(
@@ -5711,7 +5758,11 @@ async def receive_account_group_edit_name(
 ) -> None:
     value = " ".join((message.text or "").split())
     if not 1 <= len(value) <= 100:
-        await message.answer("Название группы должно содержать от 1 до 100 символов.")
+        await answer_panel_input(
+            message,
+            state,
+            "Название группы должно содержать от 1 до 100 символов.",
+        )
         return
     await state.update_data(account_group_edit_name=value)
     await state.set_state(AccountGroupEditState.description)
@@ -5738,7 +5789,11 @@ async def receive_account_group_edit_description(
 ) -> None:
     description = "" if (message.text or "").strip() == "-" else (message.text or "").strip()
     if len(description) > 500:
-        await message.answer("Описание группы не должно быть длиннее 500 символов.")
+        await answer_panel_input(
+            message,
+            state,
+            "Описание группы не должно быть длиннее 500 символов.",
+        )
         return
     data = await state.get_data()
     group_id = int(data.get("account_group_edit_id") or 0)
@@ -5749,7 +5804,7 @@ async def receive_account_group_edit_description(
             description=description,
         )
     except (ConflictError, NotFoundError, ValueError) as exc:
-        await message.answer(f"× {escape(operator_error_message(exc))}")
+        await answer_panel_input(message, state, f"× {escape(operator_error_message(exc))}")
         return
     try:
         account_filter = AccountListFilter(str(data.get("account_group_edit_filter") or "all"))
@@ -5763,7 +5818,7 @@ async def receive_account_group_edit_description(
         members = await repository.list_account_group_member_ids(group_id)
         group_views = await repository.list_account_group_views()
     except NotFoundError as exc:
-        await message.answer(f"× {escape(operator_error_message(exc))}")
+        await answer_panel_input(message, state, f"× {escape(operator_error_message(exc))}")
         return
     view = next((item for item in group_views if item.id == group_id), None)
     ready_count = view.ready_count if view is not None else 0
@@ -6854,12 +6909,18 @@ async def apply_generated_account_names(
         for item in raw_assignments
     }
     labels = {int(item["account_id"]): str(item["label"]) for item in raw_assignments}
-    await _safe_callback_answer(callback, "Применяю имена через Telegram…")
-    if isinstance(callback.message, Message):
-        await callback.message.edit_text(
+    try:
+        await _safe_callback_answer(callback, "Применяю имена через Telegram…")
+        await _edit_callback(
+            callback,
             "<b>Обновляю профили Telegram</b>\n\n"
             f"Аккаунтов: <b>{len(assignments)}</b>. Сбой одного аккаунта не остановит остальные.",
-            reply_markup=None,
+            None,
+            answer=False,
+        )
+    except TelegramAPIError:
+        logger.warning(
+            "Could not show bulk-name progress; applying the confirmed draft", exc_info=True
         )
     result = await account_service.bulk_update_profile_names(assignments)
     failures = [
@@ -6975,7 +7036,7 @@ async def save_account_label(
             label=message.text or "",
         )
     except (NotFoundError, ConflictError, AccountImportError) as exc:
-        await message.answer(f"× {escape(operator_error_message(exc))}")
+        await answer_panel_input(message, state, f"× {escape(operator_error_message(exc))}")
         return
     proxy_slot, shared_proxy_accounts, proxy_view = await _account_proxy_summary(
         proxy_service, account_id
@@ -7006,7 +7067,7 @@ async def account_profile_first_name(message: Message, state: FSMContext, bot: B
     try:
         first_name = _profile_name_input(message.text or "", required=True)
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(profile_first_name=first_name)
     await state.set_state(AccountNameEditState.last_name)
@@ -7029,7 +7090,7 @@ async def account_profile_last_name(message: Message, state: FSMContext, bot: Bo
     try:
         last_name = "" if raw_value == "-" else _profile_name_input(raw_value, required=False)
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(profile_last_name=last_name)
     await state.set_state(AccountNameEditState.confirm)
@@ -7128,7 +7189,7 @@ async def account_profile_about(message: Message, state: FSMContext, bot: Bot) -
     try:
         about = _profile_about_input(message.text or "")
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(profile_about=about)
     data = await state.get_data()
@@ -7283,10 +7344,10 @@ async def receive_bulk_account_about(message: Message, state: FSMContext, bot: B
     try:
         about = _profile_about_input(message.text or "")
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     if not about:
-        await message.answer("Для очистки используйте кнопку «Очистить все».")
+        await answer_panel_input(message, state, "Для очистки используйте кнопку «Очистить все».")
         return
     await state.update_data(profile_about_bulk=about)
     await state.set_state(AccountAboutBulkState.confirm)
@@ -7453,14 +7514,16 @@ async def receive_bulk_account_avatar(
     try:
         photo_bytes, file_name = await _download_profile_photo(message, bot)
     except AccountProfileError as exc:
-        await message.answer(f"× {escape(operator_error_message(exc))}")
+        await answer_panel_input(message, state, f"× {escape(operator_error_message(exc))}")
         return
 
     data = await state.get_data()
     account_ids = _frozen_bulk_avatar_ids(data)
     if not account_ids:
         await state.clear()
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "× Выбор аккаунтов устарел. Откройте массовую установку аватара заново."
         )
         return
@@ -7472,7 +7535,9 @@ async def receive_bulk_account_avatar(
             file_name,
         )
     except (AccountProfileError, OSError):
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "× Не удалось безопасно сохранить фото для подтверждения. Попробуйте ещё раз."
         )
         return
@@ -8160,7 +8225,7 @@ async def account_import_payload(
                     proxy_route=import_proxy_route,
                 )
             else:  # pragma: no cover - guarded on entry
-                await message.answer("Неизвестный тип импорта.")
+                await answer_panel_input(message, state, "Неизвестный тип импорта.")
                 return
             if account is not None and temporary_proxy_key is not None:
                 await proxy_service.move_assignment(
@@ -8170,7 +8235,7 @@ async def account_import_payload(
                 )
                 temporary_proxy_moved = True
     except (AccountImportError, ConflictError, NotFoundError, ProxyInputError) as exc:
-        await message.answer(f"× {escape(operator_error_message(exc))}")
+        await answer_panel_input(message, state, f"× {escape(operator_error_message(exc))}")
         return
     finally:
         try:
@@ -8577,7 +8642,7 @@ async def begin_target_import(callback: CallbackQuery, state: FSMContext) -> Non
 async def target_list_name(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 150:
-        await message.answer("Название должно содержать от 1 до 150 символов.")
+        await answer_panel_input(message, state, "Название должно содержать от 1 до 150 символов.")
         return
     await state.update_data(target_list_name=value)
     await state.set_state(TargetImportState.document)
@@ -8608,37 +8673,51 @@ async def import_target_document(
     document = message.document
     if document is not None:
         if not (document.file_name or "").lower().endswith(".txt"):
-            await message.answer("Нужен UTF-8 документ <code>.txt</code> или текстовый список.")
+            await answer_panel_input(
+                message,
+                state,
+                "Нужен UTF-8 документ <code>.txt</code> или текстовый список.",
+            )
             return
         if document.file_size is not None and document.file_size > 1_048_576:
-            await message.answer("Файл больше 1 МБ.")
+            await answer_panel_input(message, state, "Файл больше 1 МБ.")
             return
         buffer = BytesIO()
         await bot.download(document, destination=buffer)
         try:
             content = buffer.getvalue().decode("utf-8-sig")
         except UnicodeDecodeError:
-            await message.answer("Файл должен быть сохранён в UTF-8.")
+            await answer_panel_input(message, state, "Файл должен быть сохранён в UTF-8.")
             return
     elif message.text:
         content = message.text
     else:
-        await message.answer("Прикрепите TXT-файл или вставьте список обычным сообщением.")
+        await answer_panel_input(
+            message,
+            state,
+            "Прикрепите TXT-файл или вставьте список обычным сообщением.",
+        )
         return
     lines = content.splitlines()
     if len(lines) > 500:
-        await message.answer("За один импорт разрешено не более 500 строк.")
+        await answer_panel_input(message, state, "За один импорт разрешено не более 500 строк.")
         return
     parsed = parse_target_batch(lines)
     if not parsed.targets and not parsed.folders:
         preview = "\n".join(f"строка {issue.line}: {issue.reason}" for issue in parsed.issues[:5])
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Не найдено корректных Telegram-чатов."
             + (f"\n\n<code>{escape(preview)}</code>" if preview else "")
         )
         return
     if len(parsed.folders) > 10:
-        await message.answer("За один импорт разрешено не более 10 ссылок на папки Telegram.")
+        await answer_panel_input(
+            message,
+            state,
+            "За один импорт разрешено не более 10 ссылок на папки Telegram.",
+        )
         return
     issues = [f"строка {issue.line}: {issue.reason}" for issue in parsed.issues]
     await state.update_data(
@@ -8650,7 +8729,9 @@ async def import_target_document(
     if parsed.folders:
         accounts = await repository.active_owned_accounts(require_authorized_session=True)
         if not accounts:
-            await message.answer(
+            await answer_panel_input(
+                message,
+                state,
                 "Для чтения папки <code>t.me/addlist/...</code> нужен хотя бы один "
                 "активный аккаунт с проверенной Telegram-сессией."
             )
@@ -8869,10 +8950,16 @@ async def target_chat_ref(
     try:
         parsed = parse_target_reference(value)
     except TargetReferenceError as exc:
-        await message.answer(f"Не удалось распознать чат: {escape(operator_error_message(exc))}")
+        await answer_panel_input(
+            message,
+            state,
+            f"Не удалось распознать чат: {escape(operator_error_message(exc))}",
+        )
         return
     if parsed.kind == TargetReferenceKind.CHAT_FOLDER:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Это ссылка на папку. Используйте « Импорт .txt» — там бот покажет "
             "отдельный отчёт по папкам."
         )
@@ -8893,7 +8980,7 @@ async def target_chat_ref(
     try:
         await repository.create_target(chat_ref=parsed.canonical)
     except ConflictError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     data = await state.get_data()
     await state.clear()
@@ -9164,10 +9251,10 @@ async def save_target_cooldown(
     try:
         minutes = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число минут от 0 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 0 до 10080.")
         return
     if not 0 <= minutes <= 10080:
-        await message.answer("Интервал должен быть от 0 до 10080 минут.")
+        await answer_panel_input(message, state, "Интервал должен быть от 0 до 10080 минут.")
         return
     data = await state.get_data()
     target_list_id = data.get("cooldown_target_list_id")
@@ -9182,7 +9269,7 @@ async def save_target_cooldown(
             )
         timings = await repository.target_timings(target.id)
     except (NotFoundError, ConflictError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     if target_list_id is not None:
@@ -9336,7 +9423,7 @@ async def save_target_list_name(
     try:
         item = await repository.rename_target_list(int(data["target_list_rename_id"]), name)
     except (NotFoundError, ConflictError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -9648,7 +9735,7 @@ async def begin_template_create(callback: CallbackQuery, state: FSMContext) -> N
 async def template_name(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 150:
-        await message.answer("Название должно содержать от 1 до 150 символов.")
+        await answer_panel_input(message, state, "Название должно содержать от 1 до 150 символов.")
         return
     await state.update_data(name=value)
     await state.set_state(TemplateCreateState.primary_text)
@@ -9664,7 +9751,7 @@ async def template_name(message: Message, state: FSMContext, bot: Bot) -> None:
 async def template_primary_text(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 4096:
-        await message.answer("Текст должен содержать от 1 до 4096 символов.")
+        await answer_panel_input(message, state, "Текст должен содержать от 1 до 4096 символов.")
         return
     await state.update_data(primary_text=value)
     await state.set_state(TemplateCreateState.reply_text)
@@ -9686,7 +9773,11 @@ async def template_primary_text(message: Message, state: FSMContext, bot: Bot) -
 async def template_reply_text(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 4096:
-        await message.answer("Отправьте ответ, символ <code>-</code> или текст до 4096 символов.")
+        await answer_panel_input(
+            message,
+            state,
+            "Отправьте ответ, символ <code>-</code> или текст до 4096 символов.",
+        )
         return
     await state.update_data(reply_text="" if value == "-" else value)
     await state.set_state(TemplateCreateState.confirm)
@@ -9829,7 +9920,7 @@ async def begin_template_edit(
 async def edit_template_primary(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 4096:
-        await message.answer("Текст должен содержать от 1 до 4096 символов.")
+        await answer_panel_input(message, state, "Текст должен содержать от 1 до 4096 символов.")
         return
     await state.update_data(edit_primary_text=value)
     await state.set_state(TemplateEditState.reply_text)
@@ -9851,7 +9942,11 @@ async def edit_template_primary(message: Message, state: FSMContext, bot: Bot) -
 async def edit_template_reply(message: Message, state: FSMContext, bot: Bot) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 4096:
-        await message.answer("Отправьте ответ, символ <code>-</code> или текст до 4096 символов.")
+        await answer_panel_input(
+            message,
+            state,
+            "Отправьте ответ, символ <code>-</code> или текст до 4096 символов.",
+        )
         return
     await state.update_data(edit_reply_text="" if value == "-" else value)
     await state.set_state(TemplateEditState.confirm)
@@ -9998,7 +10093,7 @@ async def campaign_name(
 ) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > 150:
-        await message.answer("Название должно содержать от 1 до 150 символов.")
+        await answer_panel_input(message, state, "Название должно содержать от 1 до 150 символов.")
         return
     await state.update_data(name=value)
     data = await state.get_data()
@@ -10380,7 +10475,7 @@ async def search_campaign_target(
 ) -> None:
     query = (message.text or "").strip()
     if not 1 <= len(query) <= 120:
-        await message.answer("Отправьте запрос длиной от 1 до 120 символов.")
+        await answer_panel_input(message, state, "Отправьте запрос длиной от 1 до 120 символов.")
         return
     data = await state.get_data()
     kind = str(data.get("campaign_target_search_kind") or "")
@@ -10404,7 +10499,11 @@ async def search_campaign_target(
         ]
     else:
         await state.clear()
-        await message.answer("Поиск устарел. Откройте создание рассылки заново.")
+        await answer_panel_input(
+            message,
+            state,
+            "Поиск устарел. Откройте создание рассылки заново.",
+        )
         return
     await state.set_state(CampaignCreateState.target)
     await _edit_origin(
@@ -10615,7 +10714,7 @@ async def campaign_primary_text(
         try:
             value, html_text, media = await _extract_broadcast_content(message, bot, settings)
         except ContentError as exc:
-            await message.answer(escape(operator_error_message(exc)))
+            await answer_panel_input(message, state, escape(operator_error_message(exc)))
             return
         await state.update_data(
             primary_text=value,
@@ -10629,7 +10728,7 @@ async def campaign_primary_text(
         try:
             value, html_text, media = await _extract_broadcast_content(message, bot, settings)
         except ContentError as exc:
-            await message.answer(escape(operator_error_message(exc)))
+            await answer_panel_input(message, state, escape(operator_error_message(exc)))
             return
         await state.update_data(
             primary_text=value,
@@ -10674,7 +10773,7 @@ async def campaign_reply_text(
     try:
         value, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(
         reply_text=value,
@@ -10708,10 +10807,10 @@ async def campaign_delay(
     try:
         value = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число от 0 до 3600.")
+        await answer_panel_input(message, state, "Введите целое число от 0 до 3600.")
         return
     if not 0 <= value <= 3600:
-        await message.answer("Задержка должна быть от 0 до 3600 секунд.")
+        await answer_panel_input(message, state, "Задержка должна быть от 0 до 3600 секунд.")
         return
     data = await state.get_data()
     steps = [
@@ -10944,7 +11043,7 @@ async def dialogue_chain_text(
     try:
         value, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
@@ -11011,7 +11110,7 @@ async def dialogue_chain_delay(
     except ValueError:
         delay_seconds = -1
     if not 0 <= delay_seconds <= 86400:
-        await message.answer("Введите целое число секунд от 0 до 86400.")
+        await answer_panel_input(message, state, "Введите целое число секунд от 0 до 86400.")
         return
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
@@ -11047,10 +11146,14 @@ async def campaign_spread_hours(message: Message, state: FSMContext, bot: Bot) -
     try:
         value = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число от 0 до 168 (часов).")
+        await answer_panel_input(message, state, "Введите целое число от 0 до 168 (часов).")
         return
     if not 0 <= value <= 168:
-        await message.answer("Окно рассылки должно быть от 0 до 168 часов (7 суток).")
+        await answer_panel_input(
+            message,
+            state,
+            "Окно рассылки должно быть от 0 до 168 часов (7 суток).",
+        )
         return
     await state.update_data(
         spread_hours=value,
@@ -11222,10 +11325,14 @@ async def campaign_smart_duration(
     try:
         hours = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число часов от 1 до 168.")
+        await answer_panel_input(message, state, "Введите целое число часов от 1 до 168.")
         return
     if not 1 <= hours <= 168:
-        await message.answer("Срок активности должен быть от 1 часа до 7 суток.")
+        await answer_panel_input(
+            message,
+            state,
+            "Срок активности должен быть от 1 часа до 7 суток.",
+        )
         return
     await state.update_data(smart_duration_hours=hours, repeat_forever=False)
     await state.set_state(CampaignCreateState.smart_no_timer_interval_minutes)
@@ -11280,10 +11387,10 @@ async def campaign_smart_interval(
     try:
         minutes = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число минут от 1 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 1 до 10080.")
         return
     if not 1 <= minutes <= 10080:
-        await message.answer("Интервал должен быть от 1 минуты до 7 суток.")
+        await answer_panel_input(message, state, "Интервал должен быть от 1 минуты до 7 суток.")
         return
     await state.update_data(smart_no_timer_interval_minutes=minutes)
     await state.set_state(CampaignCreateState.confirm)
@@ -11320,10 +11427,10 @@ async def campaign_repeat_count(
     try:
         count = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число проходов от 2 до 100.")
+        await answer_panel_input(message, state, "Введите целое число проходов от 2 до 100.")
         return
     if not 2 <= count <= 100:
-        await message.answer("Число проходов должно быть от 2 до 100.")
+        await answer_panel_input(message, state, "Число проходов должно быть от 2 до 100.")
         return
     await state.update_data(repeat_count=count)
     await state.set_state(CampaignCreateState.confirm)
@@ -11541,7 +11648,7 @@ async def save_campaign_content_text(
     try:
         value, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     data = await state.get_data()
     campaign_id = int(data["edit_content_campaign_id"])
@@ -11558,7 +11665,7 @@ async def save_campaign_content_text(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await _edit_origin_data(
         bot,
@@ -11942,7 +12049,7 @@ async def search_campaign_edit_target(
 ) -> None:
     query = (message.text or "").strip()
     if not 1 <= len(query) <= 120:
-        await message.answer("Отправьте запрос длиной от 1 до 120 символов.")
+        await answer_panel_input(message, state, "Отправьте запрос длиной от 1 до 120 символов.")
         return
     data = await state.get_data()
     kind = str(data.get("edit_target_search_kind") or "")
@@ -11967,7 +12074,11 @@ async def search_campaign_edit_target(
         ]
     else:
         await state.clear()
-        await message.answer("Поиск устарел. Откройте редактирование аудитории заново.")
+        await answer_panel_input(
+            message,
+            state,
+            "Поиск устарел. Откройте редактирование аудитории заново.",
+        )
         return
     next_state = (
         CampaignEditState.target_selection if kind == "checked" else CampaignEditState.target
@@ -12226,10 +12337,14 @@ async def edit_campaign_smart_duration(
     try:
         hours = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число часов от 1 до 168.")
+        await answer_panel_input(message, state, "Введите целое число часов от 1 до 168.")
         return
     if not 1 <= hours <= 168:
-        await message.answer("Срок активности должен быть от 1 часа до 7 суток.")
+        await answer_panel_input(
+            message,
+            state,
+            "Срок активности должен быть от 1 часа до 7 суток.",
+        )
         return
     await state.update_data(schedule_smart_duration_hours=hours, schedule_repeat_forever=False)
     await state.set_state(CampaignScheduleEditState.smart_no_timer_interval_minutes)
@@ -12303,10 +12418,10 @@ async def save_campaign_smart_schedule(
     try:
         minutes = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число минут от 1 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 1 до 10080.")
         return
     if not 1 <= minutes <= 10080:
-        await message.answer("Интервал должен быть от 1 минуты до 7 суток.")
+        await answer_panel_input(message, state, "Интервал должен быть от 1 минуты до 7 суток.")
         return
     data = await state.get_data()
     try:
@@ -12323,7 +12438,7 @@ async def save_campaign_smart_schedule(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (NotFoundError, ConflictError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -12370,10 +12485,10 @@ async def edit_campaign_schedule_interval(
     try:
         minutes = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число минут от 1 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 1 до 10080.")
         return
     if not 1 <= minutes <= 10080:
-        await message.answer("Интервал должен быть от 1 минуты до 7 суток.")
+        await answer_panel_input(message, state, "Интервал должен быть от 1 минуты до 7 суток.")
         return
     await state.update_data(schedule_interval_minutes=minutes)
     await state.set_state(CampaignScheduleEditState.repeat_count)
@@ -12432,10 +12547,10 @@ async def save_campaign_schedule(
     try:
         count = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число проходов от 2 до 100.")
+        await answer_panel_input(message, state, "Введите целое число проходов от 2 до 100.")
         return
     if not 2 <= count <= 100:
-        await message.answer("Число проходов должно быть от 2 до 100.")
+        await answer_panel_input(message, state, "Число проходов должно быть от 2 до 100.")
         return
     data = await state.get_data()
     try:
@@ -12446,7 +12561,7 @@ async def save_campaign_schedule(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (NotFoundError, ConflictError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     await _edit_origin_data(
@@ -14168,7 +14283,7 @@ async def save_active_launch_text(
 ) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 4096:
-        await message.answer("Текст должен содержать от 1 до 4096 символов.")
+        await answer_panel_input(message, state, "Текст должен содержать от 1 до 4096 символов.")
         return
     data = await state.get_data()
     anchor_run_id = int(data["edit_launch_anchor_id"])
@@ -14176,7 +14291,7 @@ async def save_active_launch_text(
     try:
         validate_spintax(value)
     except ContentError as exc:
-        await message.answer(escape(str(exc)))
+        await answer_panel_input(message, state, escape(str(exc)))
         return
     try:
         count = await run_queue.update_active_launch(
@@ -14186,7 +14301,7 @@ async def save_active_launch_text(
         launch, runs = await repository.get_launch(anchor_run_id)
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await _edit_origin_data(
         bot,
@@ -14252,7 +14367,7 @@ async def save_active_launch_interval(
     except ValueError:
         minutes = 0
     if not 1 <= minutes <= 10080:
-        await message.answer("Введите целое число минут от 1 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 1 до 10080.")
         return
     data = await state.get_data()
     anchor_run_id = int(data["edit_launch_anchor_id"])
@@ -14265,7 +14380,7 @@ async def save_active_launch_interval(
         launch, runs = await repository.get_launch(anchor_run_id)
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await _edit_origin_data(
         bot,
@@ -14328,7 +14443,7 @@ async def save_active_launch_depth(
     except ValueError:
         messages = 0
     if not 1 <= messages <= 100_000:
-        await message.answer("Введите целое число сообщений от 1 до 100000.")
+        await answer_panel_input(message, state, "Введите целое число сообщений от 1 до 100000.")
         return
     data = await state.get_data()
     anchor_run_id = int(data["edit_launch_anchor_id"])
@@ -14341,7 +14456,7 @@ async def save_active_launch_depth(
         launch, runs = await repository.get_launch(anchor_run_id)
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await _edit_origin_data(
         bot,
@@ -14401,7 +14516,7 @@ async def save_active_launch_max_wait(
     except ValueError:
         minutes = -1
     if not 0 <= minutes <= 10080:
-        await message.answer("Введите целое число минут от 0 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 0 до 10080.")
         return
     data = await state.get_data()
     anchor_run_id = int(data["edit_launch_anchor_id"])
@@ -14414,7 +14529,7 @@ async def save_active_launch_max_wait(
         launch, runs = await repository.get_launch(anchor_run_id)
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     mode = "только после порога" if minutes == 0 else f"тайм-аут {minutes} мин."
     await _edit_origin_data(
@@ -14481,7 +14596,7 @@ async def save_active_launch_duration(
     except ValueError:
         hours = -1
     if not 0 <= hours <= 168:
-        await message.answer("Введите целое число часов от 0 до 168.")
+        await answer_panel_input(message, state, "Введите целое число часов от 0 до 168.")
         return
     data = await state.get_data()
     anchor_run_id = int(data["edit_launch_anchor_id"])
@@ -14494,7 +14609,7 @@ async def save_active_launch_duration(
         launch, runs = await repository.get_launch(anchor_run_id)
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await _edit_origin_data(
         bot,
@@ -16909,7 +17024,11 @@ async def jump_to_recipient_report_page(
     context = dict(data.get("recipient_report_page_jump") or {})
     if not context:
         await state.set_state(None)
-        await message.answer("Переход устарел. Откройте список подписчиков заново.")
+        await answer_panel_input(
+            message,
+            state,
+            "Переход устарел. Откройте список подписчиков заново.",
+        )
         return
     # Numbers copied from the counter may contain thousands separators.
     raw_input = (message.text or "").strip()
@@ -16921,7 +17040,11 @@ async def jump_to_recipient_report_page(
         or len(raw_number) > 10
         or int(raw_number) < 1
     ):
-        await message.answer("Введите положительный номер страницы, например <code>25</code>.")
+        await answer_panel_input(
+            message,
+            state,
+            "Введите положительный номер страницы, например <code>25</code>.",
+        )
         return
     context["page"] = int(raw_number) - 1
     try:
@@ -16930,10 +17053,16 @@ async def jump_to_recipient_report_page(
     except (ConflictError, NotFoundError) as exc:
         await state.set_state(None)
         await state.update_data(recipient_report_page_jump=None)
-        await message.answer(escape(str(exc)), reply_markup=_recipient_report_home_menu(context))
+        await answer_panel_input(
+            message,
+            state,
+            escape(str(exc)), reply_markup=_recipient_report_home_menu(context),
+        )
         return
     if context["page"] >= report.pages:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             f"В этом списке <b>{report.pages:,}</b> страниц. "
             f"Введите число от 1 до {report.pages:,}."
         )
@@ -16989,14 +17118,18 @@ async def search_recipient_report(
     context = dict(data.get("recipient_report_search") or {})
     if not context:
         await state.set_state(None)
-        await message.answer("Поиск устарел. Откройте список получателей заново.")
+        await answer_panel_input(
+            message,
+            state,
+            "Поиск устарел. Откройте список получателей заново.",
+        )
         return
     try:
         query = normalize_recipient_query(message.text or "")
         context["page"] = 0
         report = await _load_recipient_report(context, query, direct_messages, subscriber_invites)
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(str(exc)))
+        await answer_panel_input(message, state, escape(str(exc)))
         return
     context["token"] = await _save_recipient_report_query(state, context, query)
     await state.set_state(None)

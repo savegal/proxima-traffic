@@ -2202,7 +2202,11 @@ async def test_account_operations_share_gateway_client_and_lock(tmp_path) -> Non
     await database.dispose()
 
 
-async def test_spambot_check_disconnects_its_cached_account_client(tmp_path) -> None:
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_spambot_check_preserves_only_preexisting_healthy_clients(
+    tmp_path, cached, fails
+) -> None:
     class Conversation:
         async def __aenter__(self):
             return self
@@ -2214,6 +2218,8 @@ async def test_spambot_check_disconnects_its_cached_account_client(tmp_path) -> 
             assert text == "/start"
 
         async def get_response(self):
+            if fails:
+                raise TimeoutError("test response timeout")
             return SimpleNamespace(
                 raw_text="Good news! No limits are currently applied to your account.",
                 reply_markup=None,
@@ -2241,19 +2247,32 @@ async def test_spambot_check_disconnects_its_cached_account_client(tmp_path) -> 
         account_id = int(account.id)
     gateway = TelethonGateway(database.session_factory, settings)
     client = Client()
-    gateway._clients[account_id] = client
+    if cached:
+        gateway._clients[account_id] = client
+        gateway._entity_cache[(account_id, "@chat")] = object()
+        gateway._joined.add((account_id, "@chat"))
 
     async def ensure_client(checked_account_id: int) -> Client:
         assert checked_account_id == account_id
+        gateway._clients[account_id] = client
         return client
 
     gateway._ensure_client = ensure_client  # type: ignore[method-assign]
 
-    result = await gateway.check_spambot_status(account=account)
-
-    assert result.status.value == "free"
-    assert client.disconnected is True
-    assert account_id not in gateway._clients
+    if fails:
+        with pytest.raises(TemporaryGatewayError) as error:
+            await gateway.check_spambot_status(account=account)
+        assert error.value.code == "spambot_unavailable"
+    else:
+        result = await gateway.check_spambot_status(account=account)
+        assert result.status.value == "free"
+    kept = cached and not fails
+    assert client.disconnected is not kept
+    assert (account_id in gateway._clients) is kept
+    if kept:
+        assert (account_id, "@chat") in gateway._entity_cache
+        assert (account_id, "@chat") in gateway._joined
+        await gateway.close()
     await database.dispose()
 
 

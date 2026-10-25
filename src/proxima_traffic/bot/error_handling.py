@@ -70,8 +70,6 @@ def operator_error_message(exception: Exception) -> str:
         return safe_error_message(exception)[:500]
     if isinstance(exception, SubscriberImportError):
         return str(exception)[:500]
-    if isinstance(exception, (ValueError, KeyError, IndexError)):
-        return "Эта кнопка или введённые данные устарели. Обновите экран и повторите действие."
     if isinstance(exception, DomainError):
         return safe_error_message(exception)[:500]
     return (
@@ -107,7 +105,20 @@ async def handle_control_panel_error(event: ErrorEvent) -> bool:
         if source is not None:
             await _answer_message(source, message)
 
-    if isinstance(exception, (DomainError, ValueError, KeyError, IndexError)):
+    if isinstance(
+        exception,
+        (
+            DomainError,
+            AccountImportError,
+            AccountProfileError,
+            AccountOperationError,
+            ChatFolderError,
+            ContentError,
+            ProxyInputError,
+            ProxyRouteUnavailable,
+            SubscriberImportError,
+        ),
+    ):
         logger.info("Control-panel action was rejected safely: %s", safe_error_message(exception))
     else:
         logger.exception("Unexpected control-panel error", exc_info=exception)

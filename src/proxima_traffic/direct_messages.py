@@ -509,23 +509,25 @@ class DirectMessageService:
 
         now = utc_now()
         async with self._session_factory() as session:
+            created_id = await session.scalar(
+                sqlite_insert(SubscriberList)
+                .values(name=PRIMARY_SUBSCRIBER_LIST_NAME, status=SubscriberListStatus.IMPORTING)
+                .on_conflict_do_nothing(index_elements=[SubscriberList.name])
+                .returning(SubscriberList.id)
+            )
             primary = await session.scalar(
                 select(SubscriberList).where(SubscriberList.name == PRIMARY_SUBSCRIBER_LIST_NAME)
             )
             if primary is None:
-                primary = SubscriberList(
-                    name=PRIMARY_SUBSCRIBER_LIST_NAME,
-                    status=SubscriberListStatus.IMPORTING,
-                )
-                session.add(primary)
-                await session.flush()
+                raise RuntimeError("Не удалось создать общую базу подписчиков")
             subscriber_stats = await session.get(SubscriberStats, 1)
             global_count = (
                 int(subscriber_stats.subscriber_count)
                 if subscriber_stats is not None
                 else int(await session.scalar(select(func.count(Subscriber.id))) or 0)
             )
-            changed = False
+            # A new row must commit even while another import keeps it IMPORTING.
+            changed = created_id is not None
             if primary.member_count < global_count and not self._import_lock.locked():
                 legacy_members = select(
                     literal(int(primary.id)).label("subscriber_list_id"),
@@ -2337,7 +2339,6 @@ class DirectMessageService:
                     )
                 )
             )
-            cancelled_task_ids = [int(task.id) for task in cancelled_expired_tasks]
             for task in cancelled_expired_tasks:
                 launch = await session.get(DirectLaunch, task.launch_id)
                 task.status = DirectMessageTaskStatus.FAILED
@@ -2374,6 +2375,9 @@ class DirectMessageService:
                             self._accounting_key(task, launch),
                         )
                     )
+            # Terminal statuses already exclude recovered rows. Flush them
+            # before the bulk update instead of binding every cancelled ID.
+            await session.flush()
             await session.execute(
                 update(DirectMessageTask)
                 .where(
@@ -2381,7 +2385,6 @@ class DirectMessageService:
                     DirectMessageTask.lease_until.is_not(None),
                     DirectMessageTask.lease_until <= now,
                     DirectMessageTask.send_started_at.is_(None),
-                    DirectMessageTask.id.not_in(cancelled_task_ids),
                 )
                 .values(
                     status=DirectMessageTaskStatus.QUEUED,

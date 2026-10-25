@@ -6,13 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from alembic import command
-from alembic.config import Config
 from sqlalchemy import event, inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from proxima_traffic.instance_lock import BotInstanceAlreadyRunning, BotInstanceLock
+from proxima_traffic.migration_config import migration_config
 
 _SQLITE_TRANSIENT_LOCK_MARKERS = (
     "database is locked",
@@ -125,9 +125,7 @@ class Database:
         return database_path.with_name(f"{database_path.name}.schema.lock")
 
     def _upgrade_schema(self, connection: Connection) -> None:
-        project_root = Path(__file__).resolve().parents[2]
-        config = Config(str(project_root / "alembic.ini"))
-        config.set_main_option("script_location", str(project_root / "migrations"))
+        config = migration_config()
         config.set_main_option("sqlalchemy.url", self._url.replace("%", "%%"))
         config.attributes["database_url"] = self._url
         config.attributes["connection"] = connection

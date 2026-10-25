@@ -229,10 +229,16 @@ async def _finish_background_task(
     except TimeoutError:
         logger.warning("%s did not stop within %.0f seconds; cancelling it", name, grace_seconds)
         task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        try:
+            with suppress(asyncio.CancelledError):
+                await task
+        except Exception:
+            logger.exception("%s failed while cancelling it during shutdown", name)
     except asyncio.CancelledError:
-        # A task that was explicitly cancelled during shutdown is already finished.
+        if asyncio.current_task().cancelling():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         return
     except Exception:
         logger.exception("%s stopped with an unexpected error", name)

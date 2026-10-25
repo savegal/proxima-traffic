@@ -12,10 +12,10 @@ from functools import lru_cache
 from pathlib import Path
 
 from alembic import command
-from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 from proxima_traffic.config import get_settings
+from proxima_traffic.migration_config import migration_config
 from proxima_traffic.models import Base
 
 SQLITE_PREFIX = "sqlite+aiosqlite:///"
@@ -109,9 +109,7 @@ def sqlite_path_from_url(database_url: str) -> Path:
 @lru_cache(maxsize=1)
 def expected_migration_revision() -> str:
     """Resolve the single Alembic head bundled with this application checkout."""
-    project_root = Path(__file__).resolve().parents[2]
-    config = Config(str(project_root / "alembic.ini"))
-    config.set_main_option("script_location", str(project_root / "migrations"))
+    config = migration_config()
     heads = ScriptDirectory.from_config(config).get_heads()
     if len(heads) != 1:
         raise RuntimeError(f"expected exactly one Alembic head, found {len(heads)}")
@@ -177,9 +175,7 @@ def create_clean_database(
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    project_root = Path(__file__).resolve().parents[2]
-    config = Config(str(project_root / "alembic.ini"))
-    config.set_main_option("script_location", str(project_root / "migrations"))
+    config = migration_config()
     destination_url = f"sqlite+aiosqlite:///{destination.as_posix()}"
     config.set_main_option("sqlalchemy.url", destination_url.replace("%", "%%"))
     config.attributes["database_url"] = destination_url

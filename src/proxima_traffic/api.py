@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 from secrets import compare_digest
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import delete, func, or_, select
@@ -107,7 +107,9 @@ async def require_admin_key(
     x_admin_key: str | None = Header(default=None),
 ) -> None:
     expected = request.app.state.settings.admin_api_key.get_secret_value()
-    if x_admin_key is None or not compare_digest(x_admin_key, expected):
+    if x_admin_key is None or not compare_digest(
+        x_admin_key.encode("latin-1"), expected.encode("utf-8")
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin key")
 
 
@@ -182,10 +184,15 @@ async def get_worker_status(request: Request, session: SessionDep) -> WorkerStat
     supervisor = getattr(request.app.state, "worker_supervisor", None)
     if supervisor is not None:
         background_workers.update(
-            {item.name: item.state == "running" for item in supervisor.snapshots()}
+            {
+                item.name: item.is_ready(
+                    max_stale_seconds=request.app.state.settings.worker_readiness_max_stale_seconds
+                )
+                for item in supervisor.snapshots()
+            }
         )
     background_healthy = not request.app.state.settings.api_worker_enabled or (
-        bool(background_workers) and all(background_workers.values())
+        snapshot.running and bool(background_workers) and all(background_workers.values())
     )
 
     async def count_runs(status_value: RunStatus) -> int:
@@ -288,8 +295,8 @@ async def import_proxies(payload: ProxyBatchCreate, request: Request) -> ProxyIm
 @router.get("/proxies", response_model=PageRead[ProxyRead])
 async def list_proxies(
     request: Request,
-    proxy_status: ProxyStatus | None = Query(default=None, alias="status"),
-    proxy_filter: ProxyFilter = Query(default=ProxyFilter.ALL, alias="filter"),
+    proxy_status: Annotated[ProxyStatus | None, Query(alias="status")] = None,
+    proxy_filter: Annotated[ProxyFilter, Query(alias="filter")] = ProxyFilter.ALL,
     group_id: int | None = None,
     page: int = Query(default=0, ge=0, le=1_000_000),
     page_size: int = Query(default=100, ge=1, le=500),
@@ -1032,7 +1039,7 @@ async def enqueue_campaign(
 @router.get("/runs", response_model=PageRead[RunRead])
 async def list_runs(
     session: SessionDep,
-    run_status: RunStatus | None = Query(default=None, alias="status"),
+    run_status: Annotated[RunStatus | None, Query(alias="status")] = None,
     page: int = Query(default=0, ge=0, le=1_000_000),
     page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[RunRead]:

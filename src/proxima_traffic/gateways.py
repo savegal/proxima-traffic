@@ -293,6 +293,7 @@ class MessageGateway(Protocol):
         caption: str,
         tagged_subscribers: list[Subscriber],
         idempotency_key: str,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> StoryDelivery: ...
 
     async def view_peer_stories(
@@ -304,6 +305,7 @@ class MessageGateway(Protocol):
         reaction_emoji: str = "🔥",
         excluded_story_ids: tuple[int, ...] = (),
         max_stories: int | None = None,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> StoryViewResult: ...
 
     async def preflight_subscriber_invite(
@@ -958,7 +960,10 @@ class DryRunGateway:
         caption: str,
         tagged_subscribers: list[Subscriber],
         idempotency_key: str,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> StoryDelivery:
+        if before_send is not None:
+            await before_send()
         del media_path, media_kind, caption, idempotency_key
         story_id = 990000 + (account.id or 1)
         story_url = f"https://t.me/c/{account.id}/story/{story_id}"
@@ -978,7 +983,10 @@ class DryRunGateway:
         reaction_emoji: str = "🔥",
         excluded_story_ids: tuple[int, ...] = (),
         max_stories: int | None = None,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> StoryViewResult:
+        if before_send is not None:
+            await before_send()
         del account
         from proxima_traffic.story_content import normalize_story_reactions
 

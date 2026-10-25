@@ -901,7 +901,8 @@ class ProxyService:
                 assigned = None
         if assigned is None:
             raise ProxyRouteUnavailable(
-                f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных прокси в пуле; добавьте рабочий прокси"
+                f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных "
+                "прокси в пуле; добавьте рабочий прокси"
             )
         if await self._assigned_proxy_is_healthy(assigned, actor=actor):
             return await self.require_account_route(account_id)
@@ -920,7 +921,8 @@ class ProxyService:
                     assigned = None
             if assigned is None:
                 raise ProxyRouteUnavailable(
-                    f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных прокси в пуле; добавьте рабочий прокси"
+                    f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных "
+                    "прокси в пуле; добавьте рабочий прокси"
                 )
             current_is_healthy = assigned.proxy.status == ProxyStatus.HEALTHY
             if not current_is_healthy:

@@ -745,8 +745,9 @@ def direct_account_picker_text(
     )
     if restricted_count > 0:
         text += (
-            f"\n\n⚠️ <b>Внимание:</b> {restricted_count} аккаунт(ов) имеют спамблок Telegram для ЛС (отмечены ⛔). "
-            "Холодные сообщения с них будут отклонены Telegram (PeerFloodError). Выбирайте аккаунты без ограничений."
+            f"\n\n⚠️ <b>Внимание:</b> {restricted_count} аккаунт(ов) имеют спамблок Telegram "
+            "для ЛС (отмечены ⛔). Холодные сообщения с них будут отклонены Telegram "
+            "(PeerFloodError). Выбирайте аккаунты без ограничений."
         )
     return text
 

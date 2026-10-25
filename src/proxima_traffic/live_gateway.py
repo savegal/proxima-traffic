@@ -1920,6 +1920,7 @@ class TelethonGateway:
         caption: str,
         tagged_subscribers: list[Subscriber],
         idempotency_key: str,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> StoryDelivery:
         """Publish one public Telegram story tagging the specified subscribers in the caption."""
 
@@ -1951,7 +1952,9 @@ class TelethonGateway:
             try:
                 me = await client.get_me()
                 if me is None:
-                    raise PermanentGatewayError("Сессия не авторизована", code="account_unauthorized")
+                    raise PermanentGatewayError(
+                        "Сессия не авторизована", code="account_unauthorized"
+                    )
                 is_premium = bool(getattr(me, "premium", False))
                 max_caption_length = 2048 if is_premium else 200
 
@@ -1971,7 +1974,7 @@ class TelethonGateway:
                 except Exception as exc:
                     mapped = self._map_rpc_error(exc, context="can_send_story")
                     if isinstance(mapped, GatewayError):
-                        raise mapped
+                        raise mapped from exc
 
                 from proxima_traffic.story_content import story_caption, story_link_url
 
@@ -2030,6 +2033,8 @@ class TelethonGateway:
                 )
 
                 random_id = self._message_random_id(idempotency_key)
+                if before_send is not None:
+                    await before_send()
                 dispatched = True
                 result = await client(
                     functions.stories.SendStoryRequest(
@@ -2090,10 +2095,13 @@ class TelethonGateway:
         reaction_emoji: str = "🔥",
         excluded_story_ids: tuple[int, ...] = (),
         max_stories: int | None = None,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> StoryViewResult:
         """Count confirmed views and preserve them if a later reaction fails."""
         import random
+
         from telethon import functions, types
+
         from proxima_traffic.story_content import STORY_REACTIONS, normalize_story_reactions
 
         if account.id is None:
@@ -2105,19 +2113,26 @@ class TelethonGateway:
         async with self._account_operation(account.id):
             client = await self._ensure_client(account.id)
             viewed = ()
+            views_dispatched = False
             found = 0
             reaction_sent = False
             chosen_emoji = None
             reacted_id = None
             try:
-                entity, _profile = await self._resolve_direct_recipient(client, recipient, for_invite=False)
+                entity, _profile = await self._resolve_direct_recipient(
+                    client, recipient, for_invite=False
+                )
                 await self._ensure_profile_not_blacklisted(_profile)
                 input_peer = await client.get_input_entity(entity)
                 response = await client(functions.stories.GetPeerStoriesRequest(peer=input_peer))
                 raw = getattr(getattr(response, "stories", None), "stories", [])
-                active = [item for item in raw if isinstance(item, types.StoryItem)
-                          and item.id > 0 and (not item.expire_date or ensure_utc(item.expire_date) > utc_now())
-                          and not isinstance(item.media, types.MessageMediaEmpty)]
+                active = [
+                    item for item in raw
+                    if isinstance(item, types.StoryItem)
+                    and item.id > 0
+                    and (not item.expire_date or ensure_utc(item.expire_date) > utc_now())
+                    and not isinstance(item.media, types.MessageMediaEmpty)
+                ]
                 found = len(active)
                 selected = sorted({item.id for item in active if item.id not in excluded_story_ids})
                 selected = selected[:max_stories] if max_stories is not None else selected
@@ -2126,15 +2141,28 @@ class TelethonGateway:
                         telegram_user_id=recipient.telegram_user_id, stories_found=found,
                         stories_viewed=0, has_active_stories=bool(found),
                     )
+                if before_send is not None:
+                    await before_send()
+                views_dispatched = True
                 confirmed = await client(functions.stories.IncrementStoryViewsRequest(
                     peer=input_peer, id=selected,
                 ))
                 if confirmed is not True:
-                    raise TemporaryGatewayError("Telegram не подтвердил просмотры", code="views_unconfirmed")
+                    raise TemporaryGatewayError(
+                        "Telegram не подтвердил просмотры", code="views_unconfirmed"
+                    )
                 viewed = tuple(selected)
-                await client(functions.stories.ReadStoriesRequest(peer=input_peer, max_id=max(selected)))
+                if before_send is not None:
+                    await before_send()
+                await client(functions.stories.ReadStoriesRequest(
+                    peer=input_peer, max_id=max(selected)
+                ))
                 if send_reaction:
-                    chosen_emoji = random.choice(STORY_REACTIONS if choices == "random" else choices.split(","))
+                    if before_send is not None:
+                        await before_send()
+                    chosen_emoji = random.choice(
+                        STORY_REACTIONS if choices == "random" else choices.split(",")
+                    )
                     reacted_id = max(selected)
                     await client(functions.stories.SendReactionRequest(
                         peer=input_peer, story_id=reacted_id,
@@ -2158,6 +2186,11 @@ class TelethonGateway:
                         stories_viewed=len(viewed), has_active_stories=True,
                         viewed_story_ids=viewed, error=mapped,
                     )
+                if views_dispatched and mapped.code in {"network_error", "rpc_error"}:
+                    raise PermanentGatewayError(
+                        "Ответ Telegram после запроса просмотров потерян; повтор отключён",
+                        code="delivery_unconfirmed",
+                    ) from exc
                 raise mapped from exc
 
     async def preflight_subscriber_invite(
@@ -5053,8 +5086,13 @@ class TelethonGateway:
             )
         if context in {"send_story", "can_send_story"}:
             story_flood = re.fullmatch(r"STORY_SEND_FLOOD_(?:WEEKLY|MONTHLY)_(\d+)", rpc_message)
-            if story_flood or rpc_message in {"STORY_SEND_FLOOD_WEEKLY", "STORY_SEND_FLOOD_MONTHLY"}:
-                wait = int(story_flood.group(1)) if story_flood else int(getattr(exc, "seconds", 43200))
+            if story_flood or rpc_message in {
+                "STORY_SEND_FLOOD_WEEKLY", "STORY_SEND_FLOOD_MONTHLY"
+            }:
+                wait = (
+                    int(story_flood.group(1)) if story_flood
+                    else int(getattr(exc, "seconds", 43200))
+                )
                 return TemporaryGatewayError(
                     "Telegram ограничил публикацию историй", retry_after=max(1, wait),
                     code="story_daily_limit_reached",

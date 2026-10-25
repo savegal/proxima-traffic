@@ -45,6 +45,10 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/proxima_traffic"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "proxima_traffic/_migrations"
+"alembic.ini" = "proxima_traffic/_alembic.ini"
+
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"

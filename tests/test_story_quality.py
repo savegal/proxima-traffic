@@ -130,6 +130,40 @@ async def task_for(case, campaign_id):
         return await session.scalar(select(case.Task).where(case.Task.campaign_id == campaign_id))
 
 
+async def test_an_obsolete_story_claim_cannot_dispatch(story_case, monkeypatch):
+    c = story_case
+    await c.create()
+    worker = c.worker()
+    claimed = await worker._claim()
+    async with c.factory() as session:
+        await session.execute(
+            update(c.Task).where(c.Task.id == claimed[0].id).values(lease_token="new-owner")
+        )
+        await session.commit()
+    dispatch = AsyncMock()
+    monkeypatch.setattr(c.gateway, c.method, dispatch)
+    with pytest.raises(TemporaryGatewayError) as error:
+        await worker._execute(*claimed)
+    assert error.value.code == "dispatch_cancelled"
+    dispatch.assert_not_awaited()
+
+
+async def test_story_account_lease_loss_is_not_automatically_replayed(story_case, monkeypatch):
+    c = story_case
+    campaign = await c.create()
+    dispatch = AsyncMock(
+        side_effect=TemporaryGatewayError("lease lost", code="account_operation_lease_lost")
+    )
+    monkeypatch.setattr(c.gateway, c.method, dispatch)
+    worker = c.worker()
+    assert await worker._process_next_task()
+    task = await task_for(c, campaign.id)
+    assert task.status.value == "failed"
+    assert task.error_code == "delivery_unconfirmed"
+    assert not await worker._process_next_task()
+    dispatch.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_competing_workers_execute_each_task_once(story_case, monkeypatch):
     c = story_case
@@ -375,7 +409,7 @@ async def no_account_lock(_):
     yield
 
 
-def live_gateway(tmp_path, *, failure=None, no_update=False):
+def live_gateway(tmp_path, *, failure=None, no_update=False, before_rpc=None):
     """Actual Telethon TL types; no network/session files are used."""
     settings = Settings(dry_run=True, media_storage_path=str(tmp_path / "media"))
     gateway = object.__new__(TelethonGateway)
@@ -399,6 +433,8 @@ def live_gateway(tmp_path, *, failure=None, no_update=False):
 
         async def __call__(self, request):
             requests.append(request)
+            if before_rpc is not None:
+                await before_rpc(request)
             if failure and isinstance(request, failure[0]):
                 raise failure[1]
             if isinstance(request, functions.stories.CanSendStoryRequest):
@@ -427,13 +463,65 @@ def live_gateway(tmp_path, *, failure=None, no_update=False):
     return gateway, account, recipient, requests, settings
 
 
+@pytest.mark.parametrize("change", ["pause", "disable_sender", "exclude_recipient", "lose_lease"])
+async def test_story_changes_during_preparation_prevent_the_actual_mutation(
+    story_case, tmp_path, monkeypatch, change
+):
+    c = story_case
+    campaign = None
+    changed = False
+
+    async def before_rpc(request):
+        nonlocal changed
+        prepare_type = (
+            functions.stories.GetPeerStoriesRequest
+            if c.viewing
+            else functions.stories.CanSendStoryRequest
+        )
+        if not isinstance(request, prepare_type):
+            return
+        changed = True
+        async with c.factory() as session:
+            task = await session.scalar(select(c.Task).where(c.Task.campaign_id == campaign.id))
+            if change == "pause":
+                row = await session.get(c.Campaign, campaign.id)
+                row.status = c.worker().CampaignStatus.PAUSED
+            elif change == "disable_sender":
+                (await session.get(Account, task.account_id)).operator_paused = True
+            elif change == "exclude_recipient":
+                sub = await session.scalar(select(Subscriber).order_by(Subscriber.id))
+                sub.do_not_contact = True
+            else:
+                task.lease_token = "another-owner"
+            await session.commit()
+
+    live, _, _, requests, settings = live_gateway(tmp_path, before_rpc=before_rpc)
+    photo = BytesIO()
+    Image.new("RGB", (720, 1280)).save(photo, "JPEG")
+    media = store_media(settings, photo.getvalue(), kind="photo", original_name="story.jpg")
+    campaign = await c.create(**({} if c.viewing else {"media_path": media.path}))
+    monkeypatch.setattr(c.gateway, c.method, getattr(live, c.method))
+    assert await c.worker()._process_next_task()
+    assert changed
+    assert not any(
+        isinstance(
+            r, (functions.stories.SendStoryRequest, functions.stories.IncrementStoryViewsRequest)
+        )
+        for r in requests
+    )
+    assert (await task_for(c, campaign.id)).status.value != "succeeded"
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("caption,expected_url", [
-    ("🔥 literal <b>", None),
-    ("Канал: https://t.me/example_channel.", "https://t.me/example_channel"),
-    ("(https://example.org/route_(one)).", "https://example.org/route_(one)"),
-    ("[https://label.example](https://target.example/path).", "https://target.example/path"),
-])
+@pytest.mark.parametrize(
+    "caption,expected_url",
+    [
+        ("🔥 literal <b>", None),
+        ("Канал: https://t.me/example_channel.", "https://t.me/example_channel"),
+        ("(https://example.org/route_(one)).", "https://example.org/route_(one)"),
+        ("[https://label.example](https://target.example/path).", "https://target.example/path"),
+    ],
+)
 async def test_real_request_contains_explicit_mentions_and_matching_story_id(
     tmp_path, caption, expected_url
 ):
@@ -489,6 +577,18 @@ async def test_increment_failure_never_reports_successful_views(tmp_path):
     )
     with pytest.raises(TemporaryGatewayError):
         await gateway.view_peer_stories(account=account, recipient=recipient)
+    assert not any(isinstance(r, functions.stories.SendReactionRequest) for r in requests)
+
+
+async def test_lost_view_acknowledgement_is_not_retryable(tmp_path):
+    gateway, account, recipient, requests, _ = live_gateway(
+        tmp_path,
+        failure=(functions.stories.IncrementStoryViewsRequest, ConnectionError("reply lost")),
+    )
+    with pytest.raises(PermanentGatewayError) as error:
+        await gateway.view_peer_stories(account=account, recipient=recipient)
+    assert error.value.code == "delivery_unconfirmed"
+    assert sum(isinstance(r, functions.stories.IncrementStoryViewsRequest) for r in requests) == 1
     assert not any(isinstance(r, functions.stories.SendReactionRequest) for r in requests)
 
 

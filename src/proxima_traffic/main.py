@@ -40,9 +40,16 @@ async def _finish_background_task(
     except TimeoutError:
         logger.warning("%s did not stop within %.0f seconds; cancelling it", name, grace_seconds)
         task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        try:
+            with suppress(asyncio.CancelledError):
+                await task
+        except Exception:
+            logger.exception("%s failed while cancelling it during shutdown", name)
     except asyncio.CancelledError:
+        if asyncio.current_task().cancelling():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         return
     except Exception:
         logger.exception("%s stopped with an unexpected error", name)
@@ -228,9 +235,11 @@ def create_app(
                 grace_seconds=resolved_settings.shutdown_grace_seconds,
             )
             close = getattr(resolved_gateway, "close", None)
-            if close is not None:
-                await close()
-            await database.dispose()
+            try:
+                if close is not None:
+                    await close()
+            finally:
+                await database.dispose()
 
     app = FastAPI(
         title=resolved_settings.app_name,

@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 
+from proxima_traffic.account_state import session_fingerprint
 from proxima_traffic.blacklist_import import subscriber_blacklisted_condition
 from proxima_traffic.db import is_transient_sqlite_lock
 from proxima_traffic.gateways import (
@@ -372,10 +373,16 @@ class StoryWorker:
             subscribers = await self._audience(session, campaign, ids)
             # Recheck pause/delete/account toggles immediately before dispatch.
             current = await session.get(self.Campaign, campaign.id)
+            current_task = await session.get(self.Task, task.id)
             sender = await session.get(Account, account.id)
             assignment = await session.get(self.Link, link.id)
             if (
-                not current
+                not current_task
+                or current_task.status != self.Status.RUNNING
+                or current_task.lease_token != task.lease_token
+                or ensure_utc(current_task.lease_until) is None
+                or ensure_utc(current_task.lease_until) <= utc_now()
+                or not current
                 or current.status != self.CampaignStatus.ACTIVE
                 or not current.enabled
                 or not assignment
@@ -417,6 +424,10 @@ class StoryWorker:
                     raise PermanentGatewayError(
                         "Нет пользователей с username", code="recipient_excluded"
                     )
+
+        async def before_send():
+            await self._before_dispatch(task, campaign, link, account, [s.id for s in subscribers])
+
         if self._viewing:
             return await self._gateway.view_peer_stories(
                 account=account,
@@ -425,6 +436,7 @@ class StoryWorker:
                 reaction_emoji=campaign.reaction_emoji,
                 excluded_story_ids=excluded,
                 max_stories=max(1, campaign.daily_limit_per_account - daily),
+                before_send=before_send,
             ), subscribers
         return await self._gateway.publish_story(
             account=account,
@@ -433,7 +445,48 @@ class StoryWorker:
             caption=campaign.caption,
             tagged_subscribers=subscribers,
             idempotency_key=f"story:{campaign.created_at.isoformat()}:{task.id}",
+            before_send=before_send,
         ), subscribers
+
+    async def _before_dispatch(self, claimed, campaign, link, account, subscriber_ids):
+        """Recheck ownership and operator changes after uploads/resolution, before each RPC."""
+        async with self._session_factory() as session:
+            await lock_story_queue(session)
+            task = await session.get(self.Task, claimed.id)
+            current = await session.get(self.Campaign, campaign.id)
+            assignment = await session.get(self.Link, link.id)
+            sender = await session.get(Account, account.id)
+            now = utc_now()
+            if (
+                not task
+                or task.status != self.Status.RUNNING
+                or task.lease_token != claimed.lease_token
+                or task.account_id != account.id
+                or ensure_utc(task.lease_until) is None
+                or ensure_utc(task.lease_until) <= now
+                or not current
+                or current.status != self.CampaignStatus.ACTIVE
+                or not current.enabled
+                or not assignment
+                or not assignment.enabled
+                or not sender
+                or sender.status != AccountStatus.ACTIVE
+                or sender.operator_paused
+                or session_fingerprint(sender) != session_fingerprint(account)
+            ):
+                raise TemporaryGatewayError("Запуск отменён до отправки", code="dispatch_cancelled")
+            cooldown = ensure_utc(sender.cooldown_until)
+            if cooldown and cooldown > now:
+                raise TemporaryGatewayError(
+                    "Аккаунт на паузе",
+                    code="account_pacing",
+                    retry_after=max(1, int((cooldown - now).total_seconds())),
+                )
+            audience = await self._audience(session, campaign, subscriber_ids)
+            if {s.id for s in audience} != set(subscriber_ids):
+                raise PermanentGatewayError(
+                    "Получатель исключён перед отправкой", code="recipient_excluded"
+                )
 
     async def _process_next_task(self):
         claimed = await self._claim()
@@ -454,7 +507,14 @@ class StoryWorker:
                 "Выполнение прервано; результат неизвестен", code="delivery_unconfirmed"
             )
         except GatewayError as exc:
-            error = exc
+            error = (
+                PermanentGatewayError(
+                    "Право выполнения потеряно; результат Telegram неизвестен",
+                    code="delivery_unconfirmed",
+                )
+                if exc.code == "account_operation_lease_lost"
+                else exc
+            )
         except Exception:
             logger.exception("Story task %s execution failed", task.id)
             error = PermanentGatewayError(

@@ -374,6 +374,8 @@ from proxima_traffic.bot.states import (
     TemplateCreateState,
     TemplateEditState,
 )
+from proxima_traffic.bot.story_tagging_ui import story_router
+from proxima_traffic.bot.story_viewer_ui import story_viewer_router
 from proxima_traffic.bot.subscriber_invite_ui import (
     invite_account_picker,
     invite_account_picker_text,
@@ -17997,8 +17999,6 @@ async def confirm_cancel_subscriber_invite_launch(
     )
 
 
-from proxima_traffic.bot.story_tagging_ui import story_router
-from proxima_traffic.bot.story_viewer_ui import story_viewer_router
 
 router.callback_query.handlers.extend(story_router.callback_query.handlers)
 router.message.handlers.extend(story_router.message.handlers)

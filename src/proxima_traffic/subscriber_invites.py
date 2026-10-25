@@ -1230,6 +1230,16 @@ class SubscriberInviteService:
         recovered_launch_ids: set[int] = set()
         recovered_send_attempts: list[tuple[int, int]] = []
         async with self._session_factory() as session:
+            # Serialize recovery with result writes and lease renewal BEFORE
+            # observing expired rows, just as the direct-message queue does.
+            await session.execute(
+                update(SubscriberInviteTask)
+                .where(
+                    SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
+                    SubscriberInviteTask.lease_until <= now,
+                )
+                .values(updated_at=SubscriberInviteTask.updated_at)
+            )
             # These tasks have not reached the non-idempotent Telegram RPC yet,
             # so a cancelled launch can safely terminalise them.  Without this
             # branch the generic lease recovery makes them QUEUED while the
@@ -1250,7 +1260,6 @@ class SubscriberInviteService:
                     )
                 )
             )
-            cancelled_task_ids = [int(task.id) for task in cancelled_pre_rpc_tasks]
             for task in cancelled_pre_rpc_tasks:
                 task.status = DirectMessageTaskStatus.CANCELLED
                 task.error_code = "invite_launch_cancelled"
@@ -1309,6 +1318,9 @@ class SubscriberInviteService:
                     recovered_send_attempts.append(
                         (int(uncertain.sender_account_id), int(uncertain.id))
                     )
+            # Flushed terminal statuses exclude these rows without an
+            # unbounded NOT IN list when a large cancelled batch is recovered.
+            await session.flush()
             await session.execute(
                 update(SubscriberInviteTask)
                 .where(
@@ -1316,7 +1328,6 @@ class SubscriberInviteService:
                     SubscriberInviteTask.lease_until.is_not(None),
                     SubscriberInviteTask.lease_until <= now,
                     SubscriberInviteTask.delivery_attempted_at.is_(None),
-                    SubscriberInviteTask.id.not_in(cancelled_task_ids),
                 )
                 .values(
                     status=DirectMessageTaskStatus.QUEUED,

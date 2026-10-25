@@ -2940,6 +2940,14 @@ class DirectMessageService:
             dispatch_started = task.send_started_at is not None
             account = await session.get(Account, account_id)
             account_resume = self._sender_ready_at(account) if account is not None else None
+        if dispatch_started and code == "account_operation_lease_lost":
+            # Losing the account lease can interrupt the RPC or its read-back
+            # after Telegram already changed the setting. Never replay it.
+            code = "delivery_unconfirmed"
+            message = (
+                "право выполнения потеряно после начала изменения настройки; "
+                "результат Telegram неизвестен, автоматический повтор запрещён"
+            )
         if code in DIRECT_UNCERTAIN_CODES and (
             code != "recipient_identity_mismatch" or dispatch_started
         ):

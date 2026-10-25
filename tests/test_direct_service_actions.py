@@ -758,6 +758,46 @@ async def test_live_unchanged_setting_does_not_mutate_or_claim_a_notification(mo
     boundary.assert_not_awaited()
 
 
+@pytest.mark.parametrize("period", [0, 86400, 604800, 2592000])
+async def test_auto_delete_sets_and_confirms_every_supported_period(monkeypatch, period):
+    gateway, _, state = _live_gateway(
+        monkeypatch, old_ttl=86400 if period == 0 else 0, new_ttl=period
+    )
+    result = await _live_action(gateway, auto_delete_seconds=period)
+    assert result.changed
+    assert len(state["writes"]) == 1
+    request = state["writes"][0]
+    assert isinstance(request, functions.messages.SetHistoryTTLRequest)
+    assert request.period == period
+    assert state["full_reads"] == 2
+
+
+@pytest.mark.parametrize("dispatched", [False, True])
+async def test_auto_delete_lost_account_lease_after_dispatch_is_not_replayed(
+    service_context, dispatched
+):
+    ctx = service_context
+    campaign = await _campaign(ctx)
+    launch = await ctx.service.launch_campaign(campaign.id, consent_confirmed=True)
+    await _make_due(ctx, launch.id)
+
+    async def perform(**kwargs):
+        if dispatched:
+            await kwargs["before_action"]()
+        raise TemporaryGatewayError("account lease lost", code="account_operation_lease_lost")
+
+    ctx.gateway.perform_direct_service_action = perform
+    task = await ctx.service.process_next()
+    if dispatched:
+        assert task.status == DirectMessageTaskStatus.FAILED
+        assert task.error_code == "delivery_unconfirmed"
+        assert await ctx.service.process_next() is None
+        assert (await ctx.service.get_launch_view(launch.id)).uncertain == 1
+    else:
+        assert task.status == DirectMessageTaskStatus.QUEUED
+        assert task.error_code == "account_operation_lease_lost"
+
+
 async def test_live_protection_uses_sender_premium_and_validates_service_action(monkeypatch):
     gateway, _, state = _live_gateway(monkeypatch, premium=False, sender_premium=True)
     result = await _live_action(gateway, operation_kind="protect_content", auto_delete_seconds=None)

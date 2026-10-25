@@ -161,8 +161,10 @@ async def test_finite_launch_emits_one_summary_after_all_tasks_finish(app: FastA
     assert await notifier.process_pending() == 1
     assert len(messages) == 1
     assert "Рассылка завершена" in messages[0]
-    assert "Отправлено: <b>1</b>" in messages[0]
-    assert "Ошибок: <b>1</b>" in messages[0]
+    assert "Успешных задач: <b>1</b>" in messages[0]
+    assert "Режим и доставка старых шагов не подтверждены журналом" in messages[0]
+    assert "Отправлено и подтверждено: <b>0</b>" in messages[0]
+    assert "Задач с ошибкой: <b>1</b>" in messages[0]
 
     async with app.state.database.session_factory() as session:
         stored = [await session.get(CampaignRun, run_id) for run_id in run_ids]
@@ -409,6 +411,9 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
     direct_snapshot_media = storage / "direct-snapshot.bin"
     comment_media = storage / "comment.bin"
     comment_dialogue_media = storage / "comment-dialogue.bin"
+    campaign_dialogue_media = storage / "campaign-dialogue.bin"
+    dialogue_snapshot_media = storage / "dialogue-snapshot.bin"
+    draft_media = storage / "draft.bin"
     orphan = storage / "orphan.bin"
     recent = storage / "recent.bin"
     for media_path in (
@@ -419,12 +424,17 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
         direct_snapshot_media,
         comment_media,
         comment_dialogue_media,
+        campaign_dialogue_media,
+        dialogue_snapshot_media,
+        draft_media,
         orphan,
         recent,
     ):
         media_path.write_bytes(b"media")
     old_timestamp = time.time() - 48 * 3600
-    os.utime(orphan, (old_timestamp, old_timestamp))
+    for media_path in storage.iterdir():
+        if media_path != recent:
+            os.utime(media_path, (old_timestamp, old_timestamp))
 
     async with app.state.database.session_factory() as session:
         account = Account(label="media-gc", ownership_confirmed=True)
@@ -441,6 +451,7 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
             reply_text="",
             primary_media_path=str(campaign_media),
             content_variants_json=json.dumps({"media": [{"path": str(variant_media)}]}),
+            dialogue_steps_json=json.dumps([{"media_path": str(campaign_dialogue_media)}]),
         )
         session.add(campaign)
         await session.flush()
@@ -452,6 +463,9 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
                 status=RunStatus.SUCCEEDED,
                 next_step=RunStep.PRIMARY,
                 primary_media_path_snapshot=str(snapshot_media),
+                dialogue_steps_snapshot_json=json.dumps(
+                    [{"media_path": str(dialogue_snapshot_media)}]
+                ),
             )
         )
         subscriber_list = SubscriberList(
@@ -494,6 +508,15 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
         )
         await session.commit()
 
+    from aiogram.fsm.storage.base import StorageKey
+
+    from proxima_traffic.bot.storage import DatabaseFsmStorage
+
+    storage_backend = DatabaseFsmStorage(app.state.database.session_factory)
+    await storage_backend.set_data(
+        StorageKey(bot_id=1, chat_id=1, user_id=1),
+        {"primary_media_path": str(draft_media)},
+    )
     database_url = app.state.settings.database_url
     preview = cleanup_media_orphans(database_url, storage, min_age_hours=24)
     assert preview.candidate_files == [str(orphan.resolve())]
@@ -511,6 +534,9 @@ async def test_media_gc_preserves_referenced_files_and_requires_explicit_apply(
     assert direct_snapshot_media.exists()
     assert comment_media.exists()
     assert comment_dialogue_media.exists()
+    assert campaign_dialogue_media.exists()
+    assert dialogue_snapshot_media.exists()
+    assert draft_media.exists()
     assert recent.exists()
 
 

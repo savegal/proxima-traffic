@@ -6,6 +6,7 @@ import gzip
 import json
 import re
 import zipfile
+import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,23 +89,18 @@ def iter_subscriber_records(
     path: str | Path,
     *,
     stats: SubscriberParseStats | None = None,
-) -> Iterator[SubscriberRecord]:
+    progress_interval_lines: int | None = None,
+) -> Iterator[SubscriberRecord | None]:
     """Yield normalized records without retaining the whole source file in memory."""
 
     import_stats = stats if stats is not None else SubscriberParseStats()
     seen_ids: set[int] = set()
     for source_name, stream in _subscriber_streams(Path(path)):
-        for line_number, raw_line in enumerate(stream, start=1):
-            import_stats.total_lines += 1
-            if import_stats.total_lines > MAX_SUBSCRIBER_IMPORT_RECORDS:
-                raise SubscriberImportError(
-                    f"в одном импорте допускается не больше {MAX_SUBSCRIBER_IMPORT_RECORDS:,} строк"
-                )
-            line_size = len(raw_line)
-            import_stats.decoded_bytes += line_size
-            if import_stats.decoded_bytes > MAX_SUBSCRIBER_IMPORT_BYTES:
-                raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
-            if line_size > MAX_SUBSCRIBER_LINE_BYTES:
+        for line_number, raw_line in _bounded_subscriber_lines(stream, import_stats):
+            if progress_interval_lines and import_stats.total_lines % progress_interval_lines == 0:
+                # A mostly invalid export must still yield control to the bot.
+                yield None
+            if raw_line is None:
                 import_stats.add_issue(source_name, line_number, "строка больше 64 КБ")
                 continue
             raw_line = raw_line.strip()
@@ -136,6 +132,39 @@ def iter_subscriber_records(
             seen_ids.add(record.telegram_user_id)
             import_stats.valid_records += 1
             yield record
+
+
+def _bounded_subscriber_lines(
+    stream: BinaryIO, stats: SubscriberParseStats
+) -> Iterator[tuple[int, bytes | None]]:
+    """Read and discard oversized lines without allocating their expanded size."""
+    line_number = 0
+
+    def read_chunk() -> bytes:
+        try:
+            return stream.readline(MAX_SUBSCRIBER_LINE_BYTES + 1)
+        except (OSError, EOFError, zipfile.BadZipFile, zlib.error) as exc:
+            raise SubscriberImportError("файл импорта повреждён или не читается") from exc
+
+    while raw_line := read_chunk():
+        line_number += 1
+        stats.total_lines += 1
+        if stats.total_lines > MAX_SUBSCRIBER_IMPORT_RECORDS:
+            raise SubscriberImportError(
+                f"в одном импорте допускается не больше {MAX_SUBSCRIBER_IMPORT_RECORDS:,} строк"
+            )
+        oversized = len(raw_line) > MAX_SUBSCRIBER_LINE_BYTES
+        while True:
+            stats.decoded_bytes += len(raw_line)
+            if stats.decoded_bytes > MAX_SUBSCRIBER_IMPORT_BYTES:
+                raise SubscriberImportError("распакованный файл превышает безопасный лимит 256 МБ")
+            if not oversized:
+                yield line_number, raw_line
+                break
+            if not raw_line or raw_line.endswith(b"\n"):
+                yield line_number, None
+                break
+            raw_line = read_chunk()
 
 
 def _normalize_record(value: object) -> SubscriberRecord:

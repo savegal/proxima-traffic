@@ -61,6 +61,8 @@ async def test_membership_gate_defers_exactly_one_retry_and_quarantines_a_second
         dry_run=True,
         worker_enabled=False,
         membership_gate_retry_delay_seconds=300,
+        account_pace_min_seconds=0,
+        account_pace_max_seconds=0,
     )
     app = create_app(settings=settings, gateway=gateway)
     await app.state.database.create_schema()

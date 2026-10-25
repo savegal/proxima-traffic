@@ -129,6 +129,7 @@ def create_app(
         ),
         preflight_max_age_seconds=resolved_settings.preflight_max_age_seconds,
         proxy_service=proxy_service,
+        delivery_mode=getattr(resolved_gateway, "simulated", None),
     )
     queue_worker = QueueWorker(
         run_queue,

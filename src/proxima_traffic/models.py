@@ -149,6 +149,38 @@ class DirectMessageTaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class StoryCampaignStatus(StrEnum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
+class StoryTaskStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+
+
+class StoryViewerCampaignStatus(StrEnum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
+class StoryViewerTaskStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class ActionKind(StrEnum):
     PRIMARY_MESSAGE = "primary_message"
     REPLY_MESSAGE = "reply_message"
@@ -190,6 +222,7 @@ class Account(Base):
     status: Mapped[AccountStatus] = mapped_column(
         Enum(AccountStatus, native_enum=False), default=AccountStatus.ACTIVE
     )
+    operator_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     session_source: Mapped[AccountSessionSource] = mapped_column(
         Enum(AccountSessionSource, native_enum=False), default=AccountSessionSource.NONE
     )
@@ -287,6 +320,16 @@ class MentionBlacklistEntry(Base):
     __tablename__ = "mention_blacklist_entries"
 
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source: Mapped[str] = mapped_column(String(100), default="manual")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MentionBlacklistUsernameEntry(Base):
+    """A username excluded even before its owner appears in a subscriber database."""
+
+    __tablename__ = "mention_blacklist_usernames"
+
+    username: Mapped[str] = mapped_column(String(32), primary_key=True)
     source: Mapped[str] = mapped_column(String(100), default="manual")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -586,6 +629,12 @@ class CampaignRun(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    dispatch_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    dispatch_account_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dispatch_idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    simulated_snapshot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     primary_text_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     primary_html_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     hidden_mentions_enabled_snapshot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -745,6 +794,11 @@ class DirectCampaign(Base):
     )
     recipient_limit: Mapped[int] = mapped_column(Integer, default=10)
     contact_cooldown_days: Mapped[int] = mapped_column(Integer, default=30)
+    operation_kind: Mapped[str] = mapped_column(
+        String(24), default="message", server_default="message"
+    )
+    auto_delete_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    service_account_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     primary_text: Mapped[str] = mapped_column(Text)
     primary_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     primary_media_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -763,11 +817,13 @@ class DirectLaunch(Base):
 
     __tablename__ = "direct_launches"
     __table_args__ = (
+        Index("uq_direct_launch_request_key", "request_key", unique=True),
         Index("ix_direct_launches_status", "status", "created_at"),
         Index("ix_direct_launches_campaign", "campaign_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    request_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("direct_campaigns.id", ondelete="RESTRICT"))
     subscriber_list_id: Mapped[int] = mapped_column(
         ForeignKey("subscriber_lists.id", ondelete="RESTRICT")
@@ -782,6 +838,11 @@ class DirectLaunch(Base):
     recipient_limit_snapshot: Mapped[int] = mapped_column(Integer)
     contact_cooldown_days_snapshot: Mapped[int] = mapped_column(Integer)
     account_ids_snapshot_json: Mapped[str] = mapped_column(Text)
+    simulated_snapshot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    operation_kind_snapshot: Mapped[str] = mapped_column(
+        String(24), default="message", server_default="message"
+    )
+    auto_delete_seconds_snapshot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     primary_text_snapshot: Mapped[str] = mapped_column(Text)
     primary_html_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     primary_media_path_snapshot: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -812,6 +873,7 @@ class Subscriber(Base):
         Index("ix_subscribers_contacted", "last_contacted_at"),
         Index("ix_subscribers_delivery_uncertain", "last_delivery_uncertain_at"),
         Index("ix_subscribers_reservation", "reserved_direct_launch_id"),
+        Index("ix_subscribers_direct_quarantine", "direct_quarantine_code", "id"),
         Index("ix_subscribers_invite_reservation", "reserved_invite_launch_id"),
         Index("ix_subscribers_invited", "last_invite_attempt_at"),
     )
@@ -825,6 +887,18 @@ class Subscriber(Base):
     )
     do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False)
     do_not_contact_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Telegram refusals are distinct from an operator/recipient opt-out. Imports,
+    # cooldown expiry and successful invitations must never reset this state.
+    direct_quarantine_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    direct_quarantine_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    direct_quarantine_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    direct_quarantine_account_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    direct_quarantine_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    direct_quarantine_check_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
     last_contacted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -852,6 +926,17 @@ class Subscriber(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
+
+
+class SubscriberStats(Base):
+    """Transactionally maintained counters for the globally deduplicated audience."""
+
+    __tablename__ = "subscriber_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscriber_count: Mapped[int] = mapped_column(Integer, default=0)
+    premium_count: Mapped[int] = mapped_column(Integer, default=0)
+    username_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SubscriberListMember(Base):
@@ -911,6 +996,8 @@ class DirectMessageTask(Base):
         UniqueConstraint("launch_id", "subscriber_id", name="uq_direct_message_recipient"),
         Index("ix_direct_message_tasks_due", "status", "scheduled_for"),
         Index("ix_direct_message_tasks_launch", "launch_id", "status"),
+        Index("ix_direct_message_tasks_recipient", "subscriber_id", "status", "id"),
+        Index("ix_direct_message_tasks_result", "status", "id"),
         Index("ix_direct_message_tasks_lease", "status", "lease_until"),
     )
 
@@ -931,6 +1018,8 @@ class DirectMessageTask(Base):
     lease_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     external_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    send_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -1013,12 +1102,16 @@ class SubscriberInviteLaunch(Base):
     destination_ref_snapshot: Mapped[str] = mapped_column(String(255))
     destination_key_snapshot: Mapped[str] = mapped_column(String(255))
     destination_title_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    destination_telegram_id_snapshot: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     segment_snapshot: Mapped[SubscriberSegment] = mapped_column(
         Enum(SubscriberSegment, native_enum=False, length=16)
     )
     recipient_limit_snapshot: Mapped[int] = mapped_column(Integer)
     contact_cooldown_days_snapshot: Mapped[int] = mapped_column(Integer)
     account_ids_snapshot_json: Mapped[str] = mapped_column(Text)
+    selected_account_ids_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preflight_failures_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    simulated_snapshot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     total_tasks: Mapped[int] = mapped_column(Integer, default=0)
     excluded_recent: Mapped[int] = mapped_column(Integer, default=0)
     excluded_reserved: Mapped[int] = mapped_column(Integer, default=0)
@@ -1087,6 +1180,8 @@ class SubscriberInviteTask(Base):
         UniqueConstraint("launch_id", "subscriber_id", name="uq_subscriber_invite_recipient"),
         Index("ix_subscriber_invite_tasks_due", "status", "scheduled_for"),
         Index("ix_subscriber_invite_tasks_launch", "launch_id", "status"),
+        Index("ix_subscriber_invite_tasks_recipient", "subscriber_id", "status", "id"),
+        Index("ix_subscriber_invite_tasks_result", "status", "id"),
         Index("ix_subscriber_invite_tasks_lease", "status", "lease_until"),
     )
 
@@ -1125,6 +1220,7 @@ class SubscriberInviteTask(Base):
 class ActionLog(Base):
     __tablename__ = "action_logs"
     __table_args__ = (
+        Index("ix_action_logs_created", "created_at"),
         Index("ix_action_logs_run_created", "run_id", "created_at"),
         Index(
             "ix_action_logs_delayed_delivery",
@@ -1147,7 +1243,15 @@ class ActionLog(Base):
     target_id: Mapped[int] = mapped_column(ForeignKey("targets.id"))
     kind: Mapped[ActionKind] = mapped_column(Enum(ActionKind, native_enum=False))
     status: Mapped[ActionStatus] = mapped_column(Enum(ActionStatus, native_enum=False))
+    simulated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     external_message_id: Mapped[int | None] = mapped_column(nullable=True)
+    external_message_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delayed_delivery_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    delayed_delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delayed_delivery_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    delayed_delivery_attempt_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
     reply_to_message_id: Mapped[int | None] = mapped_column(nullable=True)
     text: Mapped[str] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1235,7 +1339,10 @@ class ReactionTask(Base):
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
-    __table_args__ = (Index("ix_audit_events_created", "created_at"),)
+    __table_args__ = (
+        Index("ix_audit_events_created", "created_at"),
+        Index("ix_audit_events_entity", "entity_type", "entity_id", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     actor: Mapped[str] = mapped_column(String(100), default="admin-api")
@@ -1313,6 +1420,7 @@ class ChannelCommentRule(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     armed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     last_seen_post_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_seen_grouped_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -1345,6 +1453,11 @@ class ChannelCommentRun(Base):
     )
     step_index: Mapped[int] = mapped_column(Integer, default=0)
     sent_steps: Mapped[int] = mapped_column(Integer, default=0)
+    dispatch_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    dispatch_account_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     hidden_mentions_enabled_snapshot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     mention_cooldown_days_snapshot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hidden_mention_user_ids_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1369,6 +1482,43 @@ class ChannelCommentRun(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
+
+
+class ChannelCommentMessage(Base):
+    """One confirmed physical comment and its durable, read-only observations."""
+
+    __tablename__ = "channel_comment_messages"
+    __table_args__ = (
+        UniqueConstraint("run_id", "step_index", name="uq_channel_comment_message_step"),
+        Index("ix_channel_comment_messages_due", "next_check_at", "lease_until"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("channel_comment_runs.id", ondelete="CASCADE"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    step_index: Mapped[int] = mapped_column(Integer)
+    channel_ref: Mapped[str] = mapped_column(String(255))
+    source_post_id: Mapped[int] = mapped_column(Integer)
+    message_id: Mapped[int] = mapped_column(Integer)
+    discussion_peer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    discussion_access_hash: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Stage 0: first check; stage 1: final check; stage 2: complete.
+    check_stage: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    first_check_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    first_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ChannelCommentMentionState(Base):
@@ -1598,3 +1748,252 @@ class ProxyAssignment(Base):
     assignment_key: Mapped[str] = mapped_column(String(150))
     purpose: Mapped[str] = mapped_column(String(250), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class StoryTaggingCampaign(Base):
+    """Campaign settings for tagging subscribers in Telegram stories."""
+
+    __tablename__ = "story_tagging_campaigns"
+    __table_args__ = (
+        CheckConstraint(
+            "tags_per_story >= 1 AND tags_per_story <= 50",
+            name="valid_story_tags_per_story",
+        ),
+        CheckConstraint(
+            "total_target_tags >= 1 AND total_target_tags <= 1000000",
+            name="valid_story_total_target_tags",
+        ),
+        Index("ix_story_tagging_campaigns_status", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(150), unique=True)
+    subscriber_list_id: Mapped[int] = mapped_column(
+        ForeignKey("subscriber_lists.id", ondelete="RESTRICT")
+    )
+    media_path: Mapped[str] = mapped_column(String(500))
+    media_kind: Mapped[str] = mapped_column(String(20), default="photo")
+    media_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    media_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    caption: Mapped[str] = mapped_column(Text, default="")
+    tags_per_story: Mapped[int] = mapped_column(Integer, default=5)
+    total_target_tags: Mapped[int] = mapped_column(Integer, default=50)
+    daily_limit_per_account: Mapped[int] = mapped_column(Integer, default=3)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, default=180)
+    status: Mapped[StoryCampaignStatus] = mapped_column(
+        Enum(StoryCampaignStatus, native_enum=False, length=16),
+        default=StoryCampaignStatus.DRAFT,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    simulated: Mapped[bool | None] = mapped_column(Boolean, default=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class StoryTaggingAccount(Base):
+    """Association of sender accounts dedicated to a story tagging campaign."""
+
+    __tablename__ = "story_tagging_accounts"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "account_id", name="uq_story_tagging_campaign_account"),
+        Index("ix_story_tagging_accounts_campaign", "campaign_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("story_tagging_campaigns.id", ondelete="CASCADE")
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE")
+    )
+    stories_today: Mapped[int] = mapped_column(Integer, default=0)
+    last_story_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class StoryTaggingTask(Base):
+    """One scheduled or executed story publication with tagged subscribers."""
+
+    __tablename__ = "story_tagging_tasks"
+    __table_args__ = (
+        Index("ix_story_tagging_tasks_poll", "status", "scheduled_for"),
+        Index("ix_story_tagging_tasks_campaign", "campaign_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("story_tagging_campaigns.id", ondelete="CASCADE")
+    )
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    story_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    story_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tagged_subscriber_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    tagged_usernames_json: Mapped[str] = mapped_column(Text, default="[]")
+    status: Mapped[StoryTaskStatus] = mapped_column(
+        Enum(StoryTaskStatus, native_enum=False, length=16),
+        default=StoryTaskStatus.QUEUED,
+    )
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    lease_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class StoryTaggingMentionState(Base):
+    """Tracks tagged recipients so people are not tagged repeatedly in stories."""
+
+    __tablename__ = "story_tagging_mention_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "subscriber_id", name="uq_story_mention_campaign_subscriber"
+        ),
+        Index("ix_story_mention_subscriber", "subscriber_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("story_tagging_campaigns.id", ondelete="CASCADE")
+    )
+    subscriber_id: Mapped[int] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="CASCADE")
+    )
+    tagged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    story_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class StoryViewerCampaign(Base):
+    """Campaign settings for mass viewing and reacting to stories of subscribers."""
+
+    __tablename__ = "story_viewer_campaigns"
+    __table_args__ = (
+        Index("ix_story_viewer_campaigns_status", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(150), unique=True)
+    subscriber_list_id: Mapped[int] = mapped_column(
+        ForeignKey("subscriber_lists.id", ondelete="RESTRICT")
+    )
+    send_reaction: Mapped[bool] = mapped_column(Boolean, default=True)
+    reaction_emoji: Mapped[str] = mapped_column(String(50), default="🔥")
+    delay_min_seconds: Mapped[int] = mapped_column(Integer, default=5)
+    delay_max_seconds: Mapped[int] = mapped_column(Integer, default=15)
+    daily_limit_per_account: Mapped[int] = mapped_column(Integer, default=100)
+    max_targets: Mapped[int] = mapped_column(Integer, default=500)
+    status: Mapped[StoryViewerCampaignStatus] = mapped_column(
+        Enum(StoryViewerCampaignStatus, native_enum=False, length=16),
+        default=StoryViewerCampaignStatus.DRAFT,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    simulated: Mapped[bool | None] = mapped_column(Boolean, default=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class StoryViewerAccount(Base):
+    """Association of sender accounts dedicated to a story viewing/reaction campaign."""
+
+    __tablename__ = "story_viewer_accounts"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "account_id", name="uq_story_viewer_campaign_account"),
+        Index("ix_story_viewer_accounts_campaign", "campaign_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("story_viewer_campaigns.id", ondelete="CASCADE")
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE")
+    )
+    views_today: Mapped[int] = mapped_column(Integer, default=0)
+    reactions_today: Mapped[int] = mapped_column(Integer, default=0)
+    last_view_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class StoryViewerTask(Base):
+    """One scheduled or executed story check/view/reaction task for one subscriber."""
+
+    __tablename__ = "story_viewer_tasks"
+    __table_args__ = (
+        Index("ix_story_viewer_tasks_poll", "status", "scheduled_for"),
+        Index("ix_story_viewer_tasks_campaign", "campaign_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("story_viewer_campaigns.id", ondelete="CASCADE")
+    )
+    subscriber_id: Mapped[int] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="CASCADE")
+    )
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    stories_found: Mapped[int] = mapped_column(Integer, default=0)
+    stories_viewed: Mapped[int] = mapped_column(Integer, default=0)
+    reaction_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    reaction_emoji: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    status: Mapped[StoryViewerTaskStatus] = mapped_column(
+        Enum(StoryViewerTaskStatus, native_enum=False, length=16),
+        default=StoryViewerTaskStatus.QUEUED,
+    )
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    lease_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class StoryViewerRecord(Base):
+    """Deduplication and audit log of viewed stories per account and subscriber."""
+
+    __tablename__ = "story_viewer_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "subscriber_id", "story_id", name="uq_story_viewer_acc_sub_story"
+        ),
+        Index("ix_story_viewer_records_subscriber", "subscriber_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("story_viewer_campaigns.id", ondelete="CASCADE")
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE")
+    )
+    subscriber_id: Mapped[int] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="CASCADE")
+    )
+    story_id: Mapped[int] = mapped_column(Integer)
+    reacted: Mapped[bool] = mapped_column(Boolean, default=False)
+    emoji: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    viewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

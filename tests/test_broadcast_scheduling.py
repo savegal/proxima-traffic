@@ -1326,7 +1326,8 @@ async def test_flood_wait_cools_down_account_not_only_current_run(tmp_path) -> N
             cooldown_until = account.cooldown_until
             if cooldown_until.tzinfo is None:
                 cooldown_until = cooldown_until.replace(tzinfo=UTC)
-            assert cooldown_until > utc_now()
+            remaining = (cooldown_until - utc_now()).total_seconds()
+            assert 480 <= remaining <= 500
 
     await app.state.database.dispose()
 

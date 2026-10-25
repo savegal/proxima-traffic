@@ -74,8 +74,11 @@ class Settings(BaseSettings):
     delayed_delivery_verify_batch_size: int = 20
     delayed_delivery_verify_retry_seconds: int = 300
     delayed_delivery_verify_timeout_seconds: float = 30.0
-    account_pace_min_seconds: float = 0.0
-    account_pace_max_seconds: float = 0.0
+    delayed_delivery_verify_max_attempts: int = 3
+    channel_comments_verify_final_delay_seconds: int = 86400
+    channel_comments_verify_max_attempts: int = 3
+    account_pace_min_seconds: float = 60.0
+    account_pace_max_seconds: float = 600.0
     account_typing_enabled: bool = True
     account_typing_min_seconds: float = 1.0
     account_typing_max_seconds: float = 6.0
@@ -88,10 +91,12 @@ class Settings(BaseSettings):
     account_join_daily_limit: int = 0
     account_join_min_interval_seconds: float = 0.0
     flood_buffer_multiplier: float = 1.2
+    flood_min_pause_seconds: int = 500
     flood_escalation_threshold: int = 3
     flood_window_hours: float = 12.0
     flood_cooldown_hours: float = 24.0
-    account_restriction_cooldown_hours: float = 24.0
+    # Optional operator pause, not a duration provided by PeerFlood/UserRestricted.
+    account_restriction_cooldown_hours: float = 0.0
     max_flood_wait_seconds: float = 86400.0
     spambot_enabled: bool = True
     spambot_timeout_seconds: float = 15.0
@@ -321,6 +326,23 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PROXIMA_DELAYED_DELIVERY_VERIFY_TIMEOUT_SECONDS must be between 1 and 300"
             )
+        if not 1 <= self.delayed_delivery_verify_max_attempts <= 10:
+            raise ValueError(
+                "PROXIMA_DELAYED_DELIVERY_VERIFY_MAX_ATTEMPTS must be between 1 and 10"
+            )
+        if not (
+            self.delayed_delivery_verify_delay_seconds
+            <= self.channel_comments_verify_final_delay_seconds
+            <= 7 * 86400
+        ):
+            raise ValueError(
+                "PROXIMA_CHANNEL_COMMENTS_VERIFY_FINAL_DELAY_SECONDS must be between "
+                "PROXIMA_DELAYED_DELIVERY_VERIFY_DELAY_SECONDS and 604800"
+            )
+        if not 1 <= self.channel_comments_verify_max_attempts <= 10:
+            raise ValueError(
+                "PROXIMA_CHANNEL_COMMENTS_VERIFY_MAX_ATTEMPTS must be between 1 and 10"
+            )
         if self.account_pace_min_seconds < 0 or self.account_pace_max_seconds < 0:
             raise ValueError("PROXIMA_ACCOUNT_PACE_*_SECONDS must not be negative")
         if self.account_pace_max_seconds < self.account_pace_min_seconds:
@@ -365,12 +387,14 @@ class Settings(BaseSettings):
                 )
         if self.flood_buffer_multiplier < 1:
             raise ValueError("PROXIMA_FLOOD_BUFFER_MULTIPLIER must be >= 1")
+        if self.flood_min_pause_seconds < 1:
+            raise ValueError("PROXIMA_FLOOD_MIN_PAUSE_SECONDS must be positive")
         if self.flood_escalation_threshold < 1:
             raise ValueError("PROXIMA_FLOOD_ESCALATION_THRESHOLD must be >= 1")
         if self.flood_window_hours <= 0 or self.flood_cooldown_hours <= 0:
             raise ValueError("PROXIMA_FLOOD_WINDOW_HOURS/COOLDOWN_HOURS must be positive")
-        if self.account_restriction_cooldown_hours <= 0:
-            raise ValueError("PROXIMA_ACCOUNT_RESTRICTION_COOLDOWN_HOURS must be positive")
+        if self.account_restriction_cooldown_hours < 0:
+            raise ValueError("PROXIMA_ACCOUNT_RESTRICTION_COOLDOWN_HOURS must be >= 0")
         if self.max_flood_wait_seconds <= 0:
             raise ValueError("PROXIMA_MAX_FLOOD_WAIT_SECONDS must be positive")
         if self.spambot_timeout_seconds <= 0:

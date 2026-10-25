@@ -28,6 +28,36 @@ def test_all_supervised_workers_accept_an_iteration_reporter() -> None:
         assert "reporter" in signature(worker.run_forever).parameters
 
 
+@pytest.mark.parametrize("hang", [False, True])
+async def test_health_alert_cannot_break_or_block_a_worker(hang) -> None:
+    alerts = []
+    recovered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def send_alert(text):
+        alerts.append(text)
+        if hang:
+            await asyncio.Event().wait()
+
+    async def runner(report):
+        await report(RuntimeError("upstream <response> & unavailable"))
+        await report()
+        recovered.set()
+        await release.wait()
+
+    supervisor = WorkerSupervisor(alert_sender=send_alert, alert_timeout_seconds=0.02)
+    task = supervisor.start("campaigns", runner)
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+        assert supervisor.snapshots()[0].state == "running"
+        assert len(alerts) == 1
+        assert "&lt;response&gt; &amp; unavailable" in alerts[0]
+    finally:
+        supervisor.stop()
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+
 @pytest.mark.asyncio
 async def test_supervisor_alerts_on_iteration_failure_and_recovers_after_a_healthy_pass() -> None:
     alerts: list[str] = []

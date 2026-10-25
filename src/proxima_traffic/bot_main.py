@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from aiogram.types import BotCommand
 
 from proxima_traffic.accounts import AccountService
+from proxima_traffic.blacklist_parser import ChatBlacklistParser
 from proxima_traffic.bot.app import create_bot, create_dispatcher
 from proxima_traffic.bot.repository import AdminRepository
 from proxima_traffic.bot.storage import DatabaseFsmStorage
@@ -32,6 +33,8 @@ from proxima_traffic.proxies import ProxyService
 from proxima_traffic.reactions import ReactionWorker
 from proxima_traffic.services import CampaignRunner, QueueWorker, RunQueue
 from proxima_traffic.spambot_checks import SpamBotCheckService, SpamBotMaintenanceWorker
+from proxima_traffic.story_tagging import StoryTaggingService
+from proxima_traffic.story_viewer import StoryViewerService
 from proxima_traffic.subscriber_invites import SubscriberInviteService
 from proxima_traffic.worker_supervision import WorkerSupervisor
 
@@ -43,54 +46,10 @@ _CONTROL_BOT_POLL_RETRY_MAX_SECONDS = 30.0
 _CONTROL_BOT_READY_RETRY_INITIAL_SECONDS = 30.0
 _CONTROL_BOT_READY_RETRY_MAX_SECONDS = 300.0
 _RESTART_UPDATE_NOTICE = (
-    "<b>В этом обновлении</b>\n"
-    "• Ошибки доступа Telegram разделены: подтверждённый бан, отсутствие права писать, "
-    "потеря доступа и права публикации больше не смешиваются.\n"
-    "• Удалённые и переименованные публичные @чаты теперь помечаются как недоступная цель, "
-    "а не неясная системная ошибка.\n"
-    "• Публичные чаты из папок вступают напрямую, без лишнего расхода слотов папок.\n"
-    "• Ошибка папки Telegram от замороженного аккаунта теперь определяется как ограничение "
-    "аккаунта, а не выводится сырым кодом 420 или ошибкой отдельной пары.\n"
-    "• В независимой рассылке сбой одной пары отменяет только её поток.\n"
-    "• Предзапуск теперь отдельно проверяет, может ли аккаунт отправлять именно сейчас: "
-    "пары с FloodWait, суточным лимитом или другой защитной паузой не попадут в скрытую "
-    "очередь на завтра. Панель покажет число таких пар и ближайшее время готовности.\n"
-    "• Проверка перед стартом показывает, сколько вступлений понадобится; само вступление "
-    "остаётся ленивым, с дневным лимитом и паузой между вступлениями. Если все доступные "
-    "аккаунты временно на паузе, можно безопасно запланировать запуск на ближайшее время, "
-    "а не получать тупиковый отказ.\n"
-    "• Повторное подтверждение запуска не запускает второй тяжёлый Telegram-предзапуск: "
-    "используется только что сохранённый результат, а очередь всё равно проверяет его "
-    "свежесть. Большие проверки ограничены матрицей 5000 пар и 4 одновременными аккаунтами.\n"
-    "• Active-рассылка больше не может формально стартовать пустой: если планировщик не "
-    "нашёл хотя бы одной публикации, которая успевает до конца активного окна, запуск "
-    "не создаётся и панель сразу объясняет причину.\n"
-    "• Перед запуском видно три разных состояния: маршрут к чату, возможность отправить "
-    "сейчас и безопасная отложенная готовность. Прогноз capacity заранее показывает, "
-    "какие публикации не успеют в конечное окно, а не скрывает это в финальном отчёте.\n"
-    "• Новые рассылки по умолчанию создаются с умным распределением: один пост на чат; "
-    "режим «каждый аккаунт в каждый чат» остаётся отдельным явным выбором.\n"
-    "• Новая рассылка теперь сразу создаётся активной на 24 часа: она ждёт новые сообщения "
-    "после своего поста и ясно объясняет это в отчёте; «один проход» остаётся доступным "
-    "в настройках.\n"
-    "• Реакции могут использовать безопасное автовступление и показывают понятный статус в отчёте."
-    " В независимой рассылке для реакций теперь берётся полный выбранный пул, а не только "
-    "автор поста; пропущенные реакции можно безопасно восстановить без дублей. "
-    "Успешная реакция теперь подтверждается обратным чтением сообщения из Telegram; в отчёте "
-    "видны причины пропусков и подсказка, что делать дальше. Если Telegram не принимает "
-    "выбранный emoji, сервис переберёт безопасные варианты из панели и покажет фактически "
-    "поставленную реакцию.\n"
-    "• Для точечного восстановления worker можно ограничить одной рассылкой: старые очереди, "
-    "комментарии и личные сообщения при этом не запускаются. Просроченная аренда "
-    "остановленного старого запуска больше не удерживает тот же аккаунт в такой очереди."
-    "\n• Если для worker включено временное ограничение рассылок, панель теперь явно "
-    "показывает его и не даёт молча поставить другую рассылку в неисполняемую очередь."
-    "\n• В разделе «Рассылки» добавлена отдельная кнопка остановки текущих публикаций "
-    "по чатам и их реакций: она не трогает ЛС, приглашения, комментарии и сохранённые сценарии."
-    "\n• Проверка сессий теперь умеет одной подтверждённой командой очистить только "
-    "доступы, которые Telegram повторно признал недействительными; ошибки сети и прокси "
-    "не удаляются."
+    "Откройте /admin, чтобы посмотреть текущие задания и состояние сервисов. "
+    "Сохранённые очереди и черновики доступны после перезапуска."
 )
+
 
 
 async def _notify_control_bot_ready(
@@ -121,7 +80,7 @@ async def _notify_control_bot_ready(
             f"#{campaign_labels}; остальные накопленные задания не затрагиваются."
         )
     message = (
-        "🟢 <b>Proxima перезапущен и готов к работе.</b>\n\n"
+        "✓ <b>Proxima перезапущен.</b>\n\n"
         "Панель управления запущена. "
         + worker_status
         + "\n\n"
@@ -194,6 +153,30 @@ async def _retry_control_bot_ready_notification(
                 len(pending_admin_ids),
             )
             delay = min(delay * 2, _CONTROL_BOT_READY_RETRY_MAX_SECONDS)
+
+
+async def _set_control_bot_commands(bot: Bot) -> None:
+    """Update optional command hints without delaying control-panel startup."""
+
+    try:
+        await asyncio.wait_for(
+            bot.set_my_commands(
+                [
+                    BotCommand(command="admin", description="Открыть панель управления"),
+                    BotCommand(command="proxies", description="Открыть пул прокси"),
+                    BotCommand(command="help", description="Краткая справка"),
+                    BotCommand(command="cancel", description="Отменить текущий ввод"),
+                ]
+            ),
+            timeout=_CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Updating control-bot commands timed out after %.0f seconds",
+            _CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+    except TelegramAPIError as exc:
+        logger.warning("Could not update control-bot commands: %s", exc)
 
 
 async def _start_polling_with_network_retries(
@@ -319,6 +302,12 @@ async def _run_control_bot(
             scheduled_unknown_rechecks,
         )
     logger.info("Gateway mode: %s", "DRY RUN" if settings.dry_run else "LIVE (Telethon)")
+    try:
+        auto_assigned = await proxy_service.auto_assign_healthy_proxies(actor="startup")
+        if auto_assigned:
+            logger.info("Auto-assigned healthy proxies to %d account(s)", auto_assigned)
+    except Exception as exc:
+        logger.warning("Proxy auto-assignment encountered an issue: %s", exc)
     runner = CampaignRunner(
         database.session_factory,
         gateway,
@@ -378,6 +367,20 @@ async def _run_control_bot(
         settings,
         worker_id=f"bot-subscriber-invites-{uuid4().hex[:10]}",
     )
+    story_tagging = StoryTaggingService(
+        database.session_factory,
+        gateway,
+        settings,
+    )
+    story_viewer = StoryViewerService(
+        database.session_factory,
+        gateway,
+        settings,
+    )
+    if settings.worker_enabled:
+        story_tagging.start()
+        story_viewer.start()
+    blacklist_parser = ChatBlacklistParser(database.session_factory, gateway, settings)
     run_queue = RunQueue(
         database.session_factory,
         lease_seconds=settings.worker_lease_seconds,
@@ -396,6 +399,7 @@ async def _run_control_bot(
         preflight_max_age_seconds=settings.preflight_max_age_seconds,
         proxy_service=proxy_service,
         campaign_id_scope=campaign_id_scope,
+        delivery_mode=getattr(gateway, "simulated", None),
     )
     spambot_maintenance = SpamBotMaintenanceWorker(spambot_checks, settings)
     queue_worker = QueueWorker(
@@ -419,25 +423,7 @@ async def _run_control_bot(
     worker_supervisor = WorkerSupervisor(
         alert_sender=send_worker_health_alert if settings.bot_log_chat_id is not None else None
     )
-    try:
-        await asyncio.wait_for(
-            bot.set_my_commands(
-                [
-                    BotCommand(command="admin", description="Открыть панель управления"),
-                    BotCommand(command="proxies", description="Открыть пул прокси"),
-                    BotCommand(command="help", description="Краткая справка"),
-                    BotCommand(command="cancel", description="Отменить текущий ввод"),
-                ]
-            ),
-            timeout=_CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
-        )
-    except TimeoutError:
-        logger.warning(
-            "Updating control-bot commands timed out after %.0f seconds; continuing startup",
-            _CONTROL_BOT_BOOTSTRAP_TIMEOUT_SECONDS,
-        )
-    except TelegramAPIError as exc:
-        logger.warning("Could not update control-bot commands; continuing startup: %s", exc)
+    commands_task = asyncio.create_task(_set_control_bot_commands(bot), name="control-bot-commands")
     dispatcher = create_dispatcher(
         admin_ids,
         storage=DatabaseFsmStorage(database.session_factory),
@@ -505,22 +491,25 @@ async def _run_control_bot(
         scoped_worker_concurrency,
         settings.shutdown_grace_seconds,
     )
-    failed_ready_notification_ids = await _notify_control_bot_ready(
-        bot,
-        admin_ids,
-        worker_enabled=settings.worker_enabled,
-        campaign_id_scope=campaign_id_scope,
-    )
-    if failed_ready_notification_ids:
-        ready_notification_task = asyncio.create_task(
-            _retry_control_bot_ready_notification(
+
+    async def notify_ready() -> None:
+        failed_ids = await _notify_control_bot_ready(
+            bot,
+            admin_ids,
+            worker_enabled=settings.worker_enabled,
+            campaign_id_scope=campaign_id_scope,
+        )
+        if failed_ids:
+            await _retry_control_bot_ready_notification(
                 bot,
-                failed_ready_notification_ids,
+                failed_ids,
                 worker_enabled=settings.worker_enabled,
                 campaign_id_scope=campaign_id_scope,
-            ),
-            name="control-bot-ready-notification",
-        )
+            )
+
+    ready_notification_task = asyncio.create_task(
+        notify_ready(), name="control-bot-ready-notification"
+    )
     logger.info("Starting Proxima control bot for %d administrator(s)", len(admin_ids))
     try:
         await _start_polling_with_network_retries(
@@ -540,6 +529,9 @@ async def _run_control_bot(
             participant_reactions=participant_reactions,
             direct_messages=direct_messages,
             subscriber_invites=subscriber_invites,
+            story_tagging=story_tagging,
+            story_viewer=story_viewer,
+            blacklist_parser=blacklist_parser,
         )
     except asyncio.CancelledError:
         # Windows sends Ctrl+C as a cancellation. Do not let it become a traceback.
@@ -552,6 +544,9 @@ async def _run_control_bot(
         participant_reactions.stop()
         direct_messages.stop()
         subscriber_invites.stop()
+        story_tagging.stop()
+        story_viewer.stop()
+        await asyncio.gather(story_tagging.wait_stopped(), story_viewer.wait_stopped())
         delayed_delivery_monitor.stop()
         spambot_maintenance.stop()
         if notifier is not None:
@@ -605,6 +600,11 @@ async def _run_control_bot(
         await _finish_background_task(
             ready_notification_task,
             name="Restart notification retry",
+            grace_seconds=settings.shutdown_grace_seconds,
+        )
+        await _finish_background_task(
+            commands_task,
+            name="Command-menu update",
             grace_seconds=settings.shutdown_grace_seconds,
         )
         close = getattr(gateway, "close", None)

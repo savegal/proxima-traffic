@@ -14,6 +14,7 @@ from proxima_traffic.account_groups import (
     PREMIUM_ACCOUNT_GROUP_NAME,
     sync_premium_account_group,
 )
+from proxima_traffic.account_state import ACCOUNT_PROTECTED_PAUSE_REASONS, locked_account
 from proxima_traffic.content import (
     MAX_ALBUM_ITEMS,
     MAX_CONTENT_VARIANTS,
@@ -31,6 +32,11 @@ from proxima_traffic.dialogues import (
     parse_dialogue_steps,
     serialize_dialogue_steps,
     validate_dialogue_steps,
+)
+from proxima_traffic.failure_policy import (
+    ACCEPTED_CAMPAIGN_ACTION_CODES,
+    CAMPAIGN_NON_RETRYABLE_CODES,
+    CAMPAIGN_UNCERTAIN_CODES,
 )
 from proxima_traffic.models import (
     Account,
@@ -102,6 +108,11 @@ class DashboardStats:
     smart_active_chats: int = 0
     sent_messages_24h: int = 0
     failed_messages_24h: int = 0
+    simulated_messages_24h: int = 0
+    unknown_mode_messages_24h: int = 0
+    uncertain_messages_24h: int = 0
+    available_targets_total: int | None = None
+    available_targets_enabled: int | None = None
     blocked_pairs: int = 0
     next_scheduled_at: datetime | None = None
     standalone_targets_total: int = 0
@@ -149,22 +160,7 @@ class AccountListFilter(StrEnum):
     NO_SESSION = "no_session"
 
 
-# These are state changes made by Telegram safety checks or the sender, not a
-# voluntary operator pause.  A generic "Enable" button must not bypass them.
-_ACCOUNT_PROTECTED_PAUSE_REASONS = frozenset(
-    {
-        "account_dead",
-        "account_unauthorized",
-        "account_restricted",
-        "flood_escalation",
-        "flood_wait",
-        "peer_flood",
-        "spambot_temp_ban",
-        "spambot_restriction_no_expiry",
-        "spambot_restriction_unclear",
-        "spambot_permanent_ban",
-    }
-)
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +277,16 @@ class LaunchView:
     reactions_enabled: bool = False
     reaction_requested_count: int = 0
     reaction_emoji: str = "👍"
+    uncertain_runs: int = 0
+    retryable_failed_count: int | None = None
+
+    @property
+    def retryable_failed(self) -> int:
+        return (
+            self.retryable_failed_count
+            if self.retryable_failed_count is not None
+            else max(0, self.failed - self.uncertain_runs)
+        )
 
     @property
     def active(self) -> int:
@@ -333,223 +339,402 @@ class AdminRepository:
             await session.commit()
 
     async def dashboard(self) -> DashboardStats:
+        """Return the control-panel counters with bounded database round-trips.
+
+        The dashboard is opened after most actions.  Keeping every counter as a
+        separate ``SELECT COUNT`` made a refresh noticeably slow on a busy
+        SQLite database and multiplied the chance of colliding with a worker
+        write.  Related counters are deliberately collected together below;
+        the values stay live, but a screen update now needs a small, fixed set
+        of aggregate requests instead of several dozen sequential requests.
+        """
+
         async with self._session_factory() as session:
             now = utc_now()
             since = now - timedelta(hours=24)
-            active_launch_groups = (
-                select(
-                    CampaignRun.launch_key,
-                    case(
-                        (CampaignRun.launch_key.is_(None), CampaignRun.request_key),
-                        else_=None,
-                    ).label("legacy_request_key"),
-                )
-                .where(CampaignRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]))
-                .group_by(CampaignRun.launch_key, "legacy_request_key")
-                .subquery()
-            )
-            ready_conditions = [
-                Account.status == AccountStatus.ACTIVE,
-                Account.ownership_confirmed.is_(True),
-                Account.session_source != AccountSessionSource.NONE,
-                Account.session_encrypted.is_not(None),
-                Account.api_id.is_not(None),
-                Account.api_hash_encrypted.is_not(None),
-                Account.authorized.is_(True),
-            ]
-            ready_account_ids = list(
-                await session.scalars(select(Account.id).where(*ready_conditions))
-            )
-            healthy_route_count = 0
-            if ready_account_ids:
-                healthy_route_count = int(
-                    await session.scalar(
-                        select(func.count())
-                        .select_from(ProxyAssignment)
-                        .join(ProxyEndpoint, ProxyEndpoint.id == ProxyAssignment.proxy_id)
-                        .where(
-                            ProxyAssignment.assignment_key.in_(
-                                [f"account:{account_id}" for account_id in ready_account_ids]
-                            ),
-                            ProxyEndpoint.enabled.is_(True),
-                            ProxyEndpoint.status == ProxyStatus.HEALTHY,
-                        )
+            ready_conditions = self._account_ready_conditions()
+
+            def count_when(condition: object) -> object:
+                return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
+
+            def count_subquery(model: type[object], condition: object | None = None) -> object:
+                statement = select(func.count()).select_from(model)
+                if condition is not None:
+                    statement = statement.where(condition)
+                return statement.scalar_subquery()
+
+            account_metrics = (
+                await session.execute(
+                    select(
+                        func.count(Account.id).label("total"),
+                        count_when(Account.status == AccountStatus.ACTIVE).label("active"),
+                        count_when(and_(*ready_conditions)).label("ready"),
                     )
-                    or 0
                 )
-            return DashboardStats(
-                accounts_total=await self._count(session, Account),
-                accounts_active=await self._count(
-                    session, Account, Account.status == AccountStatus.ACTIVE
-                ),
-                targets_total=await self._count(session, Target),
-                targets_approved=await self._count(
-                    session, Target, Target.approved_by_operator.is_(True)
-                ),
-                target_lists_total=await self._count(session, TargetList),
-                templates_total=await self._count(session, MessageTemplate),
-                campaigns_total=await self._count(session, Campaign),
-                queued_runs=await self._count(
-                    session, CampaignRun, CampaignRun.status == RunStatus.QUEUED
-                ),
-                running_runs=await self._count(
-                    session, CampaignRun, CampaignRun.status == RunStatus.RUNNING
-                ),
-                succeeded_runs=await self._count(
-                    session, CampaignRun, CampaignRun.status == RunStatus.SUCCEEDED
-                ),
-                failed_runs=await self._count(
-                    session, CampaignRun, CampaignRun.status == RunStatus.FAILED
-                ),
-                accounts_ready=len(ready_account_ids),
-                accounts_with_healthy_proxy=healthy_route_count,
-                proxies_total=await self._count(session, ProxyEndpoint),
-                proxies_healthy=await self._count(
-                    session, ProxyEndpoint, ProxyEndpoint.status == ProxyStatus.HEALTHY
-                ),
-                proxies_quarantined=await self._count(
-                    session, ProxyEndpoint, ProxyEndpoint.status == ProxyStatus.QUARANTINED
-                ),
-                proxies_assigned=await self._count(session, ProxyAssignment),
-                active_launches=int(
-                    await session.scalar(select(func.count()).select_from(active_launch_groups))
-                    or 0
-                ),
-                smart_active_chats=int(
-                    await session.scalar(
-                        select(func.count(func.distinct(CampaignRun.target_id))).where(
+            ).one()
+            target_metrics = (
+                await session.execute(
+                    select(
+                        func.count(Target.id).label("total"),
+                        count_when(Target.approved_by_operator.is_(True)).label("approved"),
+                        count_when(Target.is_standalone.is_(True)).label("standalone_total"),
+                        count_when(
+                            and_(
+                                Target.is_standalone.is_(True),
+                                Target.approved_by_operator.is_(True),
+                                Target.quality_status != TARGET_QUALITY_BAD,
+                            )
+                        ).label("standalone_approved"),
+                        count_when(Target.quality_status == TARGET_QUALITY_BAD).label("bad"),
+                        count_when(
                             or_(
-                                CampaignRun.repeat_until.is_not(None),
-                                CampaignRun.repeat_forever_snapshot.is_(True),
+                                Target.is_standalone.is_(True),
+                                Target.id.in_(select(TargetListItem.target_id)),
+                            )
+                        ).label("available_total"),
+                        count_when(
+                            and_(
+                                Target.quality_status != TARGET_QUALITY_BAD,
+                                or_(
+                                    and_(
+                                        Target.is_standalone.is_(True),
+                                        Target.approved_by_operator.is_(True),
+                                    ),
+                                    Target.id.in_(
+                                        select(TargetListItem.target_id).where(
+                                            TargetListItem.enabled.is_(True),
+                                        )
+                                    ),
+                                ),
+                            )
+                        ).label("available_enabled"),
+                    )
+                )
+            ).one()
+            catalog_metrics = (
+                await session.execute(
+                    select(
+                        count_subquery(TargetList).label("target_lists"),
+                        count_subquery(MessageTemplate).label("templates"),
+                        count_subquery(Campaign).label("campaigns"),
+                    )
+                )
+            ).one()
+
+            active_run_condition = CampaignRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING])
+            smart_run_condition = and_(
+                active_run_condition,
+                or_(
+                    CampaignRun.repeat_until.is_not(None),
+                    CampaignRun.repeat_forever_snapshot.is_(True),
+                ),
+            )
+            run_metrics = (
+                await session.execute(
+                    select(
+                        count_when(CampaignRun.status == RunStatus.QUEUED).label("queued"),
+                        count_when(CampaignRun.status == RunStatus.RUNNING).label("running"),
+                        count_when(CampaignRun.status == RunStatus.SUCCEEDED).label("succeeded"),
+                        count_when(CampaignRun.status == RunStatus.FAILED).label("failed"),
+                        # A modern launch key and a legacy request key can
+                        # legitimately have the same text.  Count their two
+                        # namespaces independently so such launches never
+                        # merge in the operator dashboard.
+                        (
+                            func.count(
+                                func.distinct(
+                                    case(
+                                        (
+                                            and_(
+                                                active_run_condition,
+                                                CampaignRun.launch_key.is_(None),
+                                            ),
+                                            CampaignRun.request_key,
+                                        ),
+                                        else_=None,
+                                    )
+                                )
+                            )
+                            + func.count(
+                                func.distinct(
+                                    case(
+                                        (
+                                            and_(
+                                                active_run_condition,
+                                                CampaignRun.launch_key.is_not(None),
+                                            ),
+                                            CampaignRun.launch_key,
+                                        ),
+                                        else_=None,
+                                    )
+                                )
+                            )
+                        ).label("active_launches"),
+                        func.count(
+                            func.distinct(
+                                case(
+                                    (smart_run_condition, CampaignRun.target_id),
+                                    else_=None,
+                                )
+                            )
+                        ).label("smart_active_chats"),
+                        func.min(
+                            case(
+                                (CampaignRun.status == RunStatus.QUEUED, CampaignRun.scheduled_for),
+                                else_=None,
+                            )
+                        ).label("next_scheduled_at"),
+                    )
+                )
+            ).one()
+            action_metrics = (
+                await session.execute(
+                    select(
+                        count_when(
+                            and_(
+                                or_(
+                                    ActionLog.status == ActionStatus.SUCCEEDED,
+                                    and_(
+                                        ActionLog.external_message_id.is_not(None),
+                                        ActionLog.error_code.in_(ACCEPTED_CAMPAIGN_ACTION_CODES),
+                                    ),
+                                ),
+                                ActionLog.simulated.is_(False),
+                                ActionLog.external_message_id.is_not(None),
+                            )
+                        ).label("succeeded"),
+                        count_when(
+                            and_(
+                                or_(
+                                    ActionLog.status == ActionStatus.SUCCEEDED,
+                                    and_(
+                                        ActionLog.external_message_id.is_not(None),
+                                        ActionLog.error_code.in_(ACCEPTED_CAMPAIGN_ACTION_CODES),
+                                    ),
+                                ),
+                                ActionLog.simulated.is_(True),
+                            )
+                        ).label("simulated"),
+                        count_when(
+                            and_(
+                                or_(
+                                    ActionLog.status == ActionStatus.SUCCEEDED,
+                                    and_(
+                                        ActionLog.external_message_id.is_not(None),
+                                        ActionLog.error_code.in_(ACCEPTED_CAMPAIGN_ACTION_CODES),
+                                    ),
+                                ),
+                                or_(
+                                    ActionLog.simulated.is_(None),
+                                    and_(
+                                        ActionLog.simulated.is_(False),
+                                        ActionLog.external_message_id.is_(None),
+                                    ),
+                                ),
+                            )
+                        ).label("unknown"),
+                        count_when(
+                            and_(
+                                ActionLog.status == ActionStatus.FAILED,
+                                ActionLog.error_code.in_(CAMPAIGN_UNCERTAIN_CODES),
+                            )
+                        ).label("uncertain"),
+                        count_when(
+                            and_(
+                                ActionLog.status == ActionStatus.FAILED,
+                                or_(
+                                    ActionLog.error_code.is_(None),
+                                    ActionLog.error_code.not_in(ACCEPTED_CAMPAIGN_ACTION_CODES),
+                                    ActionLog.external_message_id.is_(None),
+                                ),
+                            )
+                        ).label("failed"),
+                    ).where(ActionLog.created_at >= since)
+                )
+            ).one()
+            account_assignment_key = "account:" + cast(Account.id, String)
+            healthy_route_count = (
+                select(func.count(ProxyAssignment.id))
+                .select_from(ProxyAssignment)
+                .join(ProxyEndpoint, ProxyEndpoint.id == ProxyAssignment.proxy_id)
+                .join(Account, ProxyAssignment.assignment_key == account_assignment_key)
+                .where(
+                    *ready_conditions,
+                    ProxyEndpoint.enabled.is_(True),
+                    ProxyEndpoint.status == ProxyStatus.HEALTHY,
+                )
+                .scalar_subquery()
+            )
+            proxy_metrics = (
+                await session.execute(
+                    select(
+                        func.count(ProxyEndpoint.id).label("total"),
+                        count_when(ProxyEndpoint.status == ProxyStatus.HEALTHY).label("healthy"),
+                        count_when(ProxyEndpoint.status == ProxyStatus.QUARANTINED).label(
+                            "quarantined"
+                        ),
+                        count_subquery(ProxyAssignment).label("assigned"),
+                        healthy_route_count.label("healthy_routes"),
+                    )
+                )
+            ).one()
+            audience_metrics = (
+                await session.execute(
+                    select(
+                        func.count(func.distinct(TargetListItem.target_id)).label("members"),
+                        func.count(
+                            func.distinct(
+                                case(
+                                    (
+                                        and_(
+                                            TargetListItem.enabled.is_(True),
+                                            Target.quality_status != TARGET_QUALITY_BAD,
+                                        ),
+                                        TargetListItem.target_id,
+                                    ),
+                                    else_=None,
+                                )
+                            )
+                        ).label("enabled"),
+                    )
+                    .select_from(TargetListItem)
+                    .join(Target, Target.id == TargetListItem.target_id)
+                )
+            ).one()
+            direct_metrics = (
+                await session.execute(
+                    select(
+                        count_subquery(
+                            DirectLaunch,
+                            DirectLaunch.status.in_(
+                                [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
                             ),
-                            CampaignRun.status.in_([RunStatus.QUEUED, RunStatus.RUNNING]),
-                        )
+                        ).label("active_launches"),
+                        count_subquery(
+                            DirectMessageTask,
+                            DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
+                        ).label("queued"),
+                        count_subquery(
+                            DirectMessageTask,
+                            DirectMessageTask.status == DirectMessageTaskStatus.RUNNING,
+                        ).label("running"),
                     )
-                    or 0
-                ),
-                sent_messages_24h=await self._count(
-                    session,
-                    ActionLog,
-                    (
-                        (ActionLog.status == ActionStatus.SUCCEEDED)
-                        & (ActionLog.created_at >= since)
-                    ),
-                ),
-                failed_messages_24h=await self._count(
-                    session,
-                    ActionLog,
-                    ((ActionLog.status == ActionStatus.FAILED) & (ActionLog.created_at >= since)),
-                ),
-                blocked_pairs=await self._count(
-                    session,
-                    TargetAccountState,
-                    TargetAccountState.send_blocked.is_(True),
-                ),
-                next_scheduled_at=await session.scalar(
-                    select(func.min(CampaignRun.scheduled_for)).where(
-                        CampaignRun.status == RunStatus.QUEUED
+                )
+            ).one()
+            invite_metrics = (
+                await session.execute(
+                    select(
+                        count_subquery(
+                            SubscriberInviteLaunch,
+                            SubscriberInviteLaunch.status.in_(
+                                [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
+                            ),
+                        ).label("active_launches"),
+                        count_subquery(
+                            SubscriberInviteTask,
+                            SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                        ).label("queued"),
+                        count_subquery(
+                            SubscriberInviteTask,
+                            SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
+                        ).label("running"),
                     )
-                ),
-                standalone_targets_total=await self._count(
-                    session,
-                    Target,
-                    Target.is_standalone.is_(True),
-                ),
-                standalone_targets_approved=await self._count(
-                    session,
-                    Target,
-                    (
-                        Target.is_standalone.is_(True)
-                        & Target.approved_by_operator.is_(True)
-                        & (Target.quality_status != TARGET_QUALITY_BAD)
-                    ),
-                ),
-                audience_member_count=int(
-                    await session.scalar(
-                        select(func.count(func.distinct(TargetListItem.target_id)))
+                )
+            ).one()
+            reaction_metrics = (
+                await session.execute(
+                    select(
+                        count_when(ReactionTask.status == ReactionTaskStatus.QUEUED).label(
+                            "queued"
+                        ),
+                        count_when(ReactionTask.status == ReactionTaskStatus.RUNNING).label(
+                            "running"
+                        ),
                     )
-                    or 0
-                ),
-                audience_enabled_count=int(
-                    await session.scalar(
-                        select(func.count(func.distinct(TargetListItem.target_id)))
-                        .join(Target, Target.id == TargetListItem.target_id)
-                        .where(
-                            TargetListItem.enabled.is_(True),
-                            Target.quality_status != TARGET_QUALITY_BAD,
-                        )
+                )
+            ).one()
+            comment_metrics = (
+                await session.execute(
+                    select(
+                        count_when(
+                            ChannelCommentRun.status == ChannelCommentRunStatus.QUEUED
+                        ).label("queued"),
+                        count_when(
+                            ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING
+                        ).label("running"),
                     )
-                    or 0
-                ),
-                bad_targets=await self._count(
-                    session,
-                    Target,
-                    Target.quality_status == TARGET_QUALITY_BAD,
-                ),
-                direct_active_launches=await self._count(
-                    session,
-                    DirectLaunch,
-                    DirectLaunch.status.in_(
-                        [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
-                    ),
-                ),
-                direct_queued_tasks=await self._count(
-                    session,
-                    DirectMessageTask,
-                    DirectMessageTask.status == DirectMessageTaskStatus.QUEUED,
-                ),
-                direct_running_tasks=await self._count(
-                    session,
-                    DirectMessageTask,
-                    DirectMessageTask.status == DirectMessageTaskStatus.RUNNING,
-                ),
-                subscriber_invite_active_launches=await self._count(
-                    session,
-                    SubscriberInviteLaunch,
-                    SubscriberInviteLaunch.status.in_(
-                        [DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING]
-                    ),
-                ),
-                subscriber_invite_queued_tasks=await self._count(
-                    session,
-                    SubscriberInviteTask,
-                    SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
-                ),
-                subscriber_invite_running_tasks=await self._count(
-                    session,
-                    SubscriberInviteTask,
-                    SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
-                ),
-                campaign_reaction_queued_tasks=await self._count(
-                    session,
-                    ReactionTask,
-                    ReactionTask.status == ReactionTaskStatus.QUEUED,
-                ),
-                campaign_reaction_running_tasks=await self._count(
-                    session,
-                    ReactionTask,
-                    ReactionTask.status == ReactionTaskStatus.RUNNING,
-                ),
-                channel_comment_queued_runs=await self._count(
-                    session,
-                    ChannelCommentRun,
-                    ChannelCommentRun.status == ChannelCommentRunStatus.QUEUED,
-                ),
-                channel_comment_running_runs=await self._count(
-                    session,
-                    ChannelCommentRun,
-                    ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
-                ),
-                participant_reaction_queued_tasks=await self._count(
-                    session,
-                    ParticipantReactionTask,
-                    ParticipantReactionTask.status == ParticipantReactionTaskStatus.QUEUED,
-                ),
-                participant_reaction_running_tasks=await self._count(
-                    session,
-                    ParticipantReactionTask,
-                    ParticipantReactionTask.status == ParticipantReactionTaskStatus.RUNNING,
-                ),
+                )
+            ).one()
+            participant_reaction_metrics = (
+                await session.execute(
+                    select(
+                        count_when(
+                            ParticipantReactionTask.status == ParticipantReactionTaskStatus.QUEUED
+                        ).label("queued"),
+                        count_when(
+                            ParticipantReactionTask.status == ParticipantReactionTaskStatus.RUNNING
+                        ).label("running"),
+                    )
+                )
+            ).one()
+            blocked_pairs = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(TargetAccountState)
+                    .where(TargetAccountState.send_blocked.is_(True))
+                )
+                or 0
+            )
+
+            def metric(row: object, name: str) -> int:
+                return int(getattr(row, name) or 0)
+
+            return DashboardStats(
+                accounts_total=metric(account_metrics, "total"),
+                accounts_active=metric(account_metrics, "active"),
+                targets_total=metric(target_metrics, "total"),
+                targets_approved=metric(target_metrics, "approved"),
+                target_lists_total=metric(catalog_metrics, "target_lists"),
+                templates_total=metric(catalog_metrics, "templates"),
+                campaigns_total=metric(catalog_metrics, "campaigns"),
+                queued_runs=metric(run_metrics, "queued"),
+                running_runs=metric(run_metrics, "running"),
+                succeeded_runs=metric(run_metrics, "succeeded"),
+                failed_runs=metric(run_metrics, "failed"),
+                accounts_ready=metric(account_metrics, "ready"),
+                accounts_with_healthy_proxy=metric(proxy_metrics, "healthy_routes"),
+                proxies_total=metric(proxy_metrics, "total"),
+                proxies_healthy=metric(proxy_metrics, "healthy"),
+                proxies_quarantined=metric(proxy_metrics, "quarantined"),
+                proxies_assigned=metric(proxy_metrics, "assigned"),
+                active_launches=metric(run_metrics, "active_launches"),
+                smart_active_chats=metric(run_metrics, "smart_active_chats"),
+                sent_messages_24h=metric(action_metrics, "succeeded"),
+                failed_messages_24h=metric(action_metrics, "failed"),
+                simulated_messages_24h=metric(action_metrics, "simulated"),
+                unknown_mode_messages_24h=metric(action_metrics, "unknown"),
+                uncertain_messages_24h=metric(action_metrics, "uncertain"),
+                available_targets_total=metric(target_metrics, "available_total"),
+                available_targets_enabled=metric(target_metrics, "available_enabled"),
+                blocked_pairs=blocked_pairs,
+                next_scheduled_at=run_metrics.next_scheduled_at,
+                standalone_targets_total=metric(target_metrics, "standalone_total"),
+                standalone_targets_approved=metric(target_metrics, "standalone_approved"),
+                audience_member_count=metric(audience_metrics, "members"),
+                audience_enabled_count=metric(audience_metrics, "enabled"),
+                bad_targets=metric(target_metrics, "bad"),
+                direct_active_launches=metric(direct_metrics, "active_launches"),
+                direct_queued_tasks=metric(direct_metrics, "queued"),
+                direct_running_tasks=metric(direct_metrics, "running"),
+                subscriber_invite_active_launches=metric(invite_metrics, "active_launches"),
+                subscriber_invite_queued_tasks=metric(invite_metrics, "queued"),
+                subscriber_invite_running_tasks=metric(invite_metrics, "running"),
+                campaign_reaction_queued_tasks=metric(reaction_metrics, "queued"),
+                campaign_reaction_running_tasks=metric(reaction_metrics, "running"),
+                channel_comment_queued_runs=metric(comment_metrics, "queued"),
+                channel_comment_running_runs=metric(comment_metrics, "running"),
+                participant_reaction_queued_tasks=metric(participant_reaction_metrics, "queued"),
+                participant_reaction_running_tasks=metric(participant_reaction_metrics, "running"),
             )
 
     async def list_accounts(
@@ -815,6 +1000,62 @@ class AdminRepository:
             await session.commit()
         return normalized_ids
 
+    async def update_account_group_members(
+        self,
+        group_id: int,
+        account_ids: set[int],
+        *,
+        selected: bool | None,
+        actor: str = "control-bot",
+    ) -> set[int]:
+        """Change only the requested members under the database writer lock."""
+        requested = {int(value) for value in account_ids}
+        async with self._session_factory() as session:
+            await session.execute(
+                update(AccountGroup)
+                .where(AccountGroup.id == group_id)
+                .values(name=AccountGroup.name)
+            )
+            group = await session.get(AccountGroup, group_id)
+            if group is None:
+                raise NotFoundError("группа аккаунтов не найдена")
+            self._require_operator_group(group)
+            found = set(await session.scalars(select(Account.id).where(Account.id.in_(requested))))
+            if found != requested:
+                raise NotFoundError("один или несколько аккаунтов не найдены")
+            current = set(
+                await session.scalars(
+                    select(AccountGroupMember.account_id).where(
+                        AccountGroupMember.group_id == group_id
+                    )
+                )
+            )
+            additions = requested - current if selected is not False else set()
+            removals = requested & current if selected is not True else set()
+            if removals:
+                await session.execute(
+                    delete(AccountGroupMember).where(
+                        AccountGroupMember.group_id == group_id,
+                        AccountGroupMember.account_id.in_(removals),
+                    )
+                )
+            session.add_all(
+                [
+                    AccountGroupMember(group_id=group_id, account_id=account_id)
+                    for account_id in additions
+                ]
+            )
+            add_audit_event(
+                session,
+                event_type="account_group.members_updated",
+                entity_type="account_group",
+                entity_id=group_id,
+                details={"added": sorted(additions), "removed": sorted(removals)},
+                actor=actor,
+            )
+            await session.commit()
+            return (current | additions) - removals
+
     @staticmethod
     def _account_ready_conditions() -> tuple[object, ...]:
         return (
@@ -989,7 +1230,7 @@ class AdminRepository:
 
     async def toggle_account(self, account_id: int) -> Account:
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
+            account = await locked_account(session, account_id)
             if account is None:
                 raise NotFoundError("account not found")
             if (
@@ -999,7 +1240,7 @@ class AdminRepository:
                 raise ConflictError(
                     "у аккаунта нет Telegram-сессии; сначала импортируйте её повторно"
                 )
-            protected_reason = account.cooldown_reason in _ACCOUNT_PROTECTED_PAUSE_REASONS
+            protected_reason = account.cooldown_reason in ACCOUNT_PROTECTED_PAUSE_REASONS
             cooldown_until = ensure_utc(account.cooldown_until)
             cooldown_active = cooldown_until is not None and cooldown_until > utc_now()
             if account.status is AccountStatus.DISABLED and (
@@ -1011,14 +1252,15 @@ class AdminRepository:
                 )
             if account.status is AccountStatus.PAUSED and (protected_reason or cooldown_active):
                 raise ConflictError(
-                    "это защитная пауза Telegram. Запустите «Проверить сессию + "
-                    "@SpamBot»: после свободного статуса аккаунт включится автоматически"
+                    "это защитная пауза Telegram. Запустите «Проверить сессию и "
+                    "SpamBot»: после свободного статуса аккаунт включится автоматически"
                 )
             account.status = (
                 AccountStatus.PAUSED
                 if account.status == AccountStatus.ACTIVE
                 else AccountStatus.ACTIVE
             )
+            account.operator_paused = account.status == AccountStatus.PAUSED
             add_audit_event(
                 session,
                 event_type="account.status_changed",
@@ -2821,6 +3063,11 @@ class AdminRepository:
                     campaign.dialogue_steps_json,
                     primary_account_id=campaign.primary_account_id,
                     primary_text=campaign.primary_text,
+                    primary_html=campaign.primary_html,
+                    primary_media_path=campaign.primary_media_path,
+                    primary_media_kind=campaign.primary_media_kind,
+                    primary_media_name=campaign.primary_media_name,
+                    primary_media_size=campaign.primary_media_size,
                     reply_account_id=campaign.reply_account_id,
                     reply_text=campaign.reply_text,
                     reply_delay_seconds=campaign.reply_delay_seconds,
@@ -3866,7 +4113,13 @@ class AdminRepository:
                 func.count(ActionLog.id).label("publication_count"),
             )
             .where(
-                ActionLog.status == ActionStatus.SUCCEEDED,
+                or_(
+                    ActionLog.status == ActionStatus.SUCCEEDED,
+                    and_(
+                        ActionLog.external_message_id.is_not(None),
+                        ActionLog.error_code.in_(ACCEPTED_CAMPAIGN_ACTION_CODES),
+                    ),
+                ),
                 ActionLog.external_message_id.is_not(None),
             )
             .group_by(ActionLog.run_id)
@@ -3971,10 +4224,18 @@ class AdminRepository:
                 Campaign.auto_sender_failover,
             )
         )
-        async with self._session_factory() as session:
-            total = int(
-                await session.scalar(select(func.count()).select_from(grouped.subquery())) or 0
+        count_groups = (
+            select(CampaignRun.campaign_id)
+            .where(
+                CampaignRun.archived_at.is_not(None)
+                if archived
+                else CampaignRun.archived_at.is_(None)
             )
+            .group_by(legacy_namespace, launch_key, CampaignRun.campaign_id)
+            .subquery()
+        )
+        async with self._session_factory() as session:
+            total = int(await session.scalar(select(func.count()).select_from(count_groups)) or 0)
             rows = (
                 await session.execute(
                     grouped.order_by(
@@ -4075,7 +4336,13 @@ class AdminRepository:
                 select(ActionLog.run_id, func.count(ActionLog.id))
                 .where(
                     ActionLog.run_id.in_(run_ids),
-                    ActionLog.status == ActionStatus.SUCCEEDED,
+                    or_(
+                        ActionLog.status == ActionStatus.SUCCEEDED,
+                        and_(
+                            ActionLog.external_message_id.is_not(None),
+                            ActionLog.error_code.in_(ACCEPTED_CAMPAIGN_ACTION_CODES),
+                        ),
+                    ),
                     ActionLog.external_message_id.is_not(None),
                 )
                 .group_by(ActionLog.run_id)
@@ -4224,11 +4491,17 @@ class AdminRepository:
             publications = tuple(
                 action
                 for action in action_logs
-                if action.status == ActionStatus.SUCCEEDED
-                and action.external_message_id is not None
+                if action.external_message_id is not None
+                and (
+                    action.status == ActionStatus.SUCCEEDED
+                    or action.error_code in ACCEPTED_CAMPAIGN_ACTION_CODES
+                )
             )
             attempt_failures = tuple(
-                action for action in action_logs if action.status == ActionStatus.FAILED
+                action
+                for action in action_logs
+                if action.status == ActionStatus.FAILED
+                and action.error_code not in ACCEPTED_CAMPAIGN_ACTION_CODES
             )
             account_ids = {
                 run.sender_account_id for run in runs if run.sender_account_id is not None
@@ -4554,6 +4827,16 @@ class AdminRepository:
             running=counts[RunStatus.RUNNING],
             succeeded=counts[RunStatus.SUCCEEDED],
             failed=counts[RunStatus.FAILED],
+            uncertain_runs=sum(
+                run.status == RunStatus.FAILED and run.error_code in CAMPAIGN_UNCERTAIN_CODES
+                for run in runs
+            ),
+            retryable_failed_count=sum(
+                run.status == RunStatus.FAILED
+                and run.error_code not in CAMPAIGN_NON_RETRYABLE_CODES
+                and run.dispatch_started_at is None
+                for run in runs
+            ),
             cancelled=counts[RunStatus.CANCELLED],
             # SQLite can load older DATETIME values as naive while fresh values in
             # the same process are UTC-aware.  LaunchView is used by UI sorting and

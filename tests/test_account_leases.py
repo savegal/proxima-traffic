@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 
 import pytest
 
@@ -139,13 +140,51 @@ async def test_account_send_reservation_is_atomic_across_runner_instances(tmp_pa
 
         release.set()
         await first_task
+        with pytest.raises(AccountSendDeferred) as paced:
+            await second.run_account_send_operation(account.id, lambda: asyncio.sleep(0))
         async with database.session_factory() as session:
             stored = await session.get(Account, account.id)
             assert stored is not None
             assert stored.sent_today == 1
             assert stored.next_send_at is not None
+            assert paced.value.resume_at == ensure_utc(stored.next_send_at)
             assert stored.send_reservation_token is None
             assert stored.send_reservation_until is None
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_send_attempt_still_paces_account(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'failed-send-pacing.db'}",
+        worker_enabled=False,
+        account_pace_min_seconds=60,
+        account_pace_max_seconds=60,
+    )
+    database = Database(settings.database_url)
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="failed-send-account", ownership_confirmed=True)
+            session.add(account)
+            await session.commit()
+            await session.refresh(account)
+        assert account.id is not None
+        runner = CampaignRunner(database.session_factory, DryRunGateway(), settings=settings)
+
+        async def failed_send() -> None:
+            raise RuntimeError("recipient rejected the attempt")
+
+        with pytest.raises(RuntimeError, match="recipient rejected"):
+            await runner.run_account_send_operation(account.id, failed_send)
+        with pytest.raises(AccountSendDeferred):
+            await runner.run_account_send_operation(account.id, lambda: asyncio.sleep(0))
+        async with database.session_factory() as session:
+            stored = await session.get(Account, account.id)
+            assert stored is not None
+            assert stored.sent_today == 0
+            assert stored.next_send_at is not None
     finally:
         await database.dispose()
 
@@ -233,5 +272,52 @@ async def test_external_account_send_is_counted_once_per_operation_key(tmp_path)
             assert stored is not None
             assert stored.sent_today == 1
             assert stored.sent_since_break == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.parametrize("external_action", [False, True])
+async def test_accounting_keeps_reservation_until_result_is_saved(
+    tmp_path, schema_template, external_action
+):
+    path = tmp_path / "accounting-reservation.db"
+    shutil.copy2(schema_template, path)
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{path}",
+        worker_enabled=False,
+        worker_heartbeat_seconds=1,
+        account_pace_min_seconds=0,
+        account_pace_max_seconds=0,
+        account_daily_limit=0,
+        account_micro_break_every=0,
+    )
+    database = Database(settings.database_url)
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="Reserved until saved", ownership_confirmed=True)
+            session.add(account)
+            await session.commit()
+        runner = CampaignRunner(database.session_factory, DryRunGateway(), settings=settings)
+        competitor = CampaignRunner(database.session_factory, DryRunGateway(), settings=settings)
+
+        async def save_result():
+            if external_action:
+                await runner.record_external_account_send(account.id, operation_key="delivery")
+            else:
+                async with database.session_factory() as session:
+                    await runner._record_account_send(session, account.id)
+                    await session.commit()
+            async with database.session_factory() as session:
+                stored = await session.get(Account, account.id)
+                assert stored.send_reservation_token is not None
+            with pytest.raises(AccountSendDeferred):
+                await competitor.run_account_send_operation(account.id, lambda: asyncio.sleep(0))
+            await asyncio.sleep(1.1)
+
+        await runner.run_account_send_operation(account.id, save_result)
+        async with database.session_factory() as session:
+            stored = await session.get(Account, account.id)
+            assert stored.sent_today == 1
+            assert stored.send_reservation_token is None
     finally:
         await database.dispose()

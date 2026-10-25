@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import weakref
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from html import escape
@@ -14,9 +16,10 @@ from uuid import uuid4
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -25,6 +28,7 @@ from aiogram.types import (
     InputMediaVideo,
     Message,
 )
+from sqlalchemy.exc import SQLAlchemyError
 
 from proxima_traffic.accounts import (
     MAX_PROFILE_PHOTO_BYTES,
@@ -33,6 +37,12 @@ from proxima_traffic.accounts import (
     AccountService,
     ChatFolderError,
 )
+from proxima_traffic.blacklist_import import (
+    MAX_BLACKLIST_IMPORT_BYTES,
+    decode_blacklist_document,
+    parse_blacklist_import,
+)
+from proxima_traffic.blacklist_parser import ChatBlacklistParser
 from proxima_traffic.bot.channel_comment_ui import (
     channel_comment_account_picker,
     channel_comment_chain_menu,
@@ -48,6 +58,7 @@ from proxima_traffic.bot.channel_comment_ui import (
     channel_comment_reactions_menu,
     channel_comment_reactions_text,
     channel_comment_runs_text,
+    channel_comment_wizard_title,
     channel_comments_menu,
     channel_comments_text,
 )
@@ -56,6 +67,12 @@ from proxima_traffic.bot.direct_message_ui import (
     direct_account_picker_text,
     direct_blacklist_add_prompt_text,
     direct_blacklist_menu,
+    direct_blacklist_parse_mode_menu,
+    direct_blacklist_parse_mode_text,
+    direct_blacklist_parse_progress_text,
+    direct_blacklist_parse_prompt_text,
+    direct_blacklist_parse_result_menu,
+    direct_blacklist_parse_result_text,
     direct_blacklist_text,
     direct_campaign_confirmation_menu,
     direct_campaign_confirmation_text,
@@ -72,20 +89,20 @@ from proxima_traffic.bot.direct_message_ui import (
     direct_launches_menu,
     direct_launches_text,
     direct_limit_text,
-    direct_list_picker,
-    direct_list_picker_text,
     direct_messages_home_menu,
     direct_messages_home_text,
+    direct_quarantine_menu,
+    direct_quarantine_text,
     direct_segment_menu,
     direct_segment_text,
+    direct_service_action_menu,
+    direct_service_action_text,
+    subscriber_import_progress_text,
     subscriber_import_prompt_text,
     subscriber_import_result_menu,
     subscriber_import_result_text,
-    subscriber_list_delete_menu,
     subscriber_list_details_menu,
     subscriber_list_details_text,
-    subscriber_lists_menu,
-    subscriber_lists_text,
 )
 from proxima_traffic.bot.error_handling import callback_error_message, operator_error_message
 from proxima_traffic.bot.keyboards import (
@@ -219,6 +236,20 @@ from proxima_traffic.bot.keyboards import (
     template_picker,
     templates_menu,
 )
+from proxima_traffic.bot.middleware import (
+    acknowledge_callback,
+    callback_is_current,
+    mark_callback_data_ready,
+    mark_callback_screen_updated,
+    record_callback_telegram_api,
+    start_callback_telegram_api,
+)
+from proxima_traffic.bot.panel import (
+    answer_panel_input,
+    current_panel_state,
+    remember_recovered_panel,
+    screen_is_uneditable,
+)
 from proxima_traffic.bot.participant_reaction_ui import (
     participant_reaction_account_picker,
     participant_reaction_confirm_menu,
@@ -233,10 +264,16 @@ from proxima_traffic.bot.participant_reaction_ui import (
     participant_reactions_menu,
     participant_reactions_text,
 )
+from proxima_traffic.bot.recipient_report_ui import (
+    recipient_report_menu,
+    recipient_report_text,
+    report_callback,
+)
 from proxima_traffic.bot.renderers import (
     account_avatar_text,
     account_bulk_check_progress_text,
     account_bulk_check_text,
+    account_bulk_cleanup_preview_text,
     account_bulk_cleanup_text,
     account_bulk_spambot_progress_text,
     account_bulk_spambot_text,
@@ -309,6 +346,7 @@ from proxima_traffic.bot.states import (
     CampaignScheduleEditState,
     CampaignVariantState,
     ChannelCommentCreateState,
+    DirectBlacklistChatParseState,
     DirectBlacklistState,
     DirectCampaignCreateState,
     LaunchEditState,
@@ -324,6 +362,8 @@ from proxima_traffic.bot.states import (
     ProxyImportState,
     ProxyMetadataEditState,
     ProxyRotationState,
+    RecipientReportPageState,
+    RecipientReportSearchState,
     SubscriberImportState,
     SubscriberInviteCreateState,
     TargetCooldownState,
@@ -336,6 +376,11 @@ from proxima_traffic.bot.states import (
 from proxima_traffic.bot.subscriber_invite_ui import (
     invite_account_picker,
     invite_account_picker_text,
+    invite_admin_manager_picker,
+    invite_admin_manager_text,
+    invite_admin_setup_confirm_menu,
+    invite_admin_setup_confirm_text,
+    invite_admin_setup_progress_text,
     invite_campaign_confirmation_menu,
     invite_campaign_details_menu,
     invite_campaign_text,
@@ -351,14 +396,13 @@ from proxima_traffic.bot.subscriber_invite_ui import (
     invite_launches_menu,
     invite_launches_text,
     invite_limit_prompt_text,
-    invite_list_picker,
-    invite_list_picker_text,
+    invite_preflight_progress_text,
     invite_segment_menu,
     invite_segment_text,
     subscriber_invites_home_menu,
     subscriber_invites_home_text,
 )
-from proxima_traffic.bot.ui import polish_markup, screen_title, section
+from proxima_traffic.bot.ui import fit_panel_text, polish_markup, screen_title, section
 from proxima_traffic.channel_comments import ChannelCommentService
 from proxima_traffic.config import Settings
 from proxima_traffic.content import (
@@ -374,9 +418,11 @@ from proxima_traffic.content import (
     validate_telegram_text,
 )
 from proxima_traffic.dialogues import DialogueStep, parse_dialogue_steps
+from proxima_traffic.direct_actions import AUTO_DELETE_PERIODS, DIRECT_SERVICE_ACTIONS
 from proxima_traffic.direct_messages import (
+    PRIMARY_SUBSCRIBER_LIST_NAME,
     DirectMessageService,
-    parse_direct_blacklist_ids,
+    SubscriberImportProgress,
 )
 from proxima_traffic.maintenance import (
     create_sqlite_backup,
@@ -409,7 +455,13 @@ from proxima_traffic.proxies import (
     ProxyService,
     ProxyView,
     parse_proxy,
+    proxy_import_values,
     validate_rotation_url,
+)
+from proxima_traffic.recipient_reports import (
+    RecipientReportFilter,
+    RecipientReportKind,
+    normalize_recipient_query,
 )
 from proxima_traffic.scheduling import CapacityEstimate, broadcast_profile, estimate_capacity
 from proxima_traffic.services import TARGET_QUALITY_BAD, ConflictError, NotFoundError, RunQueue
@@ -418,7 +470,6 @@ from proxima_traffic.spambot_checks import SpamBotCheckService
 from proxima_traffic.subscriber_import import (
     SubscriberImportError,
     subscriber_file_supported,
-    subscriber_list_name,
 )
 from proxima_traffic.subscriber_invites import (
     SubscriberInviteService,
@@ -481,6 +532,8 @@ def _dashboard(
         require_proxy=settings.account_require_proxy,
         worker_health=worker_supervisor.snapshots(),
         worker_campaign_scope=settings.worker_campaign_id_scope,
+        worker_enabled=settings.worker_enabled,
+        worker_readiness_max_stale_seconds=settings.worker_readiness_max_stale_seconds,
     )
 
 
@@ -498,7 +551,7 @@ def _channel_comment_delay(value: str) -> int:
 
 
 def _campaign_title(mode: object) -> str:
-    return "📢 Новая рассылка" if mode == "broadcast" else "💬 Новый диалог"
+    return "Новая рассылка" if mode == "broadcast" else "Новый диалог"
 
 
 def _campaign_total_steps(mode: object) -> int:
@@ -513,7 +566,7 @@ async def _dialogue_chain_builder_text(
     accounts = await repository.active_owned_accounts()
     labels = {account.id: account.label for account in accounts}
     lines = [
-        "<b>🧩 Цепочка диалога</b>",
+        "<b>Цепочка диалога</b>",
         f"<code>СООБЩЕНИЙ · {len(steps)} / 20</code>\n",
         "Каждое следующее сообщение отвечает на предыдущее. Перед отправкой софт "
         "проверит личный таймер выбранного аккаунта в конкретном чате и, если нужно, "
@@ -563,7 +616,7 @@ def _campaign_delivery_mode_text(*, template_name: str | None = None) -> str:
         else ""
     )
     return wizard_text(
-        "📢 Новая рассылка",
+        "Новая рассылка",
         5,
         7,
         selected_text + "Как должна работать рассылка?\n\n"
@@ -637,7 +690,7 @@ async def help_command(message: Message) -> None:
 
 @router.callback_query(F.data == "noop")
 async def noop(callback: CallbackQuery) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
 
 
 @router.callback_query(F.data == "fsm:cancel")
@@ -648,7 +701,7 @@ async def cancel_fsm(
     settings: Settings,
     worker_supervisor: WorkerSupervisor,
 ) -> None:
-    await callback.answer("Отменено")
+    await _safe_callback_answer(callback, "Отменено")
     await state.clear()
     stats = await repository.dashboard()
     await _edit_callback(
@@ -705,7 +758,10 @@ async def _show_channel_comment_details(
     page: int,
 ) -> None:
     view = await channel_comments.get_rule_view(rule_id)
-    _, labels = await _comment_accounts(repository, settings)
+    account_ids = {step.account_id for step in ChannelCommentService._rule_steps(view.rule)}
+    if view.rule.last_error_account_id is not None:
+        account_ids.add(view.rule.last_error_account_id)
+    labels = await repository.account_labels_by_ids(account_ids)
     await _edit_callback(
         callback,
         channel_comment_details_text(view, labels),
@@ -786,7 +842,7 @@ async def _show_participant_account_picker(
     active_page = min(max(0, page), max_page)
     await _edit_callback(
         callback,
-        "<b>👍 Аккаунты для реакций</b>\n\n"
+        "<b>Аккаунты для реакций</b>\n\n"
         "Выберите один или несколько аккаунтов. На одно сообщение сервис выберет "
         "только один из них.",
         participant_reaction_account_picker(accounts, selected, page=active_page),
@@ -808,10 +864,11 @@ async def open_participant_reactions(
 @router.callback_query(F.data == "pr:add")
 async def begin_participant_reaction_rule(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    await _remember_origin(callback, state)
     await state.set_state(ParticipantReactionCreateState.name)
     await _edit_callback(
         callback,
-        "<b>👍 Новое правило авто-реакций</b>\n\n"
+        "<b>Новое правило реакций</b>\n\n"
         "Напишите короткое название, например <code>Чаты про крипту · лайки</code>.",
         cancel_menu("pr:home:0"),
     )
@@ -825,14 +882,19 @@ async def participant_reaction_name(
 ) -> None:
     name = " ".join((message.text or "").split())
     if not 1 <= len(name) <= 150:
-        await message.answer("Название — от 1 до 150 символов. Попробуйте ещё раз.")
+        await answer_panel_input(
+            message,
+            state,
+            "Название — от 1 до 150 символов. Попробуйте ещё раз.",
+        )
         return
     await state.update_data(pr_name=name)
     await state.set_state(ParticipantReactionCreateState.target_list)
     page = await repository.list_available_target_lists(0, PAGE_SIZE)
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         "<b>Выберите список чатов</b>\n\n"
-        "В ней будут использоваться только включённые и разрешённые чаты.",
+        "Будут использоваться только включённые и разрешённые чаты этого списка.",
         reply_markup=participant_reaction_list_picker(page),
     )
 
@@ -869,14 +931,16 @@ async def participant_reaction_pick_list(
     try:
         selected = await repository.get_target_list_view(target_list_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.update_data(
         pr_target_list_id=target_list_id, pr_target_list_name=selected.name, pr_account_ids=[]
     )
     if (await state.get_data()).get("pr_edit_rule_id") is not None:
+        await _remember_origin(callback, state)
         await state.set_state(ParticipantReactionEditState.accounts)
     else:
+        await _remember_origin(callback, state)
         await state.set_state(ParticipantReactionCreateState.accounts)
     await _show_participant_account_picker(callback, state, repository, settings, page=0)
 
@@ -917,11 +981,13 @@ async def participant_reaction_toggle_account(
 @router.callback_query(ParticipantReactionCreateState.accounts, F.data == "pr:account:done")
 async def participant_reaction_accounts_done(callback: CallbackQuery, state: FSMContext) -> None:
     if not (await state.get_data()).get("pr_account_ids"):
-        await callback.answer("Выберите хотя бы один аккаунт.", show_alert=True)
+        await _safe_callback_answer(callback, "Выберите хотя бы один аккаунт.", show_alert=True)
         return
     if (await state.get_data()).get("pr_edit_rule_id") is not None:
+        await _remember_origin(callback, state)
         await state.set_state(ParticipantReactionEditState.sample)
     else:
+        await _remember_origin(callback, state)
         await state.set_state(ParticipantReactionCreateState.sample)
     await _edit_callback(
         callback,
@@ -938,8 +1004,10 @@ async def participant_reaction_pick_sample(callback: CallbackQuery, state: FSMCo
     _, _, numerator, denominator = (callback.data or "").split(":")
     await state.update_data(pr_numerator=int(numerator), pr_denominator=int(denominator))
     if (await state.get_data()).get("pr_edit_rule_id") is not None:
+        await _remember_origin(callback, state)
         await state.set_state(ParticipantReactionEditState.emoji)
     else:
+        await _remember_origin(callback, state)
         await state.set_state(ParticipantReactionCreateState.emoji)
     await _edit_callback(
         callback, "<b>Выберите реакцию</b>", participant_reaction_emoji_menu(), answer=False
@@ -954,13 +1022,14 @@ async def participant_reaction_pick_emoji(
     values = {"thumb": "👍", "fire": "🔥", "heart": "❤️", "bolt": "⚡"}
     emoji = values.get((callback.data or "").rsplit(":", 1)[-1])
     if emoji is None:
-        await callback.answer("Неизвестная реакция", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестная реакция", show_alert=True)
         return
     await state.update_data(pr_emoji=emoji)
     data = await state.get_data()
     accounts, labels = await _comment_accounts(repository, settings)
     del accounts
     is_edit = data.get("pr_edit_rule_id") is not None
+    await _remember_origin(callback, state)
     await state.set_state(
         ParticipantReactionEditState.confirm if is_edit else ParticipantReactionCreateState.confirm
     )
@@ -969,7 +1038,7 @@ async def participant_reaction_pick_emoji(
         participant_reaction_draft_text(data, str(data["pr_target_list_name"]), labels),
         participant_reaction_confirm_menu(
             "pr:save" if is_edit else "pr:create",
-            label="✅ Сохранить настройки" if is_edit else "✅ Сохранить и включить",
+            label="✓ Сохранить настройки" if is_edit else "✓ Сохранить и включить",
         ),
         answer=False,
     )
@@ -994,10 +1063,10 @@ async def create_participant_reaction_rule(
             sample_denominator=int(data.get("pr_denominator", 10)),
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Правило включено")
+    await _safe_callback_answer(callback, "Правило включено")
     await _show_participant_reaction_details(
         callback,
         participant_reactions,
@@ -1019,7 +1088,7 @@ async def begin_edit_participant_reaction_rule(
     try:
         view = await participant_reactions.get_rule_view(int(rule_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     try:
         import json
@@ -1039,11 +1108,12 @@ async def begin_edit_participant_reaction_rule(
         pr_denominator=view.rule.sample_denominator,
         pr_emoji=view.rule.emoji,
     )
+    await _remember_origin(callback, state)
     await state.set_state(ParticipantReactionEditState.target_list)
     lists = await repository.list_available_target_lists(0, PAGE_SIZE)
     await _edit_callback(
         callback,
-        "<b>⚙️ Настройка правила</b>\n\n"
+        "<b>Настройка правила</b>\n\n"
         "Выберите список чатов. Очередь со старыми настройками будет отменена.",
         participant_reaction_list_picker(lists),
         answer=False,
@@ -1069,11 +1139,11 @@ async def save_participant_reaction_rule(
             sample_denominator=int(data["pr_denominator"]),
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     page = int(data.get("pr_edit_page", 0))
     await state.clear()
-    await callback.answer("Настройки сохранены")
+    await _safe_callback_answer(callback, "Настройки сохранены")
     await _show_participant_reaction_details(
         callback,
         participant_reactions,
@@ -1102,7 +1172,7 @@ async def participant_reaction_details(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.regexp(r"^pr:toggle:\d+:\d+$"))
@@ -1125,7 +1195,7 @@ async def participant_reaction_toggle(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.regexp(r"^pr:scan:\d+:\d+$"))
@@ -1136,7 +1206,7 @@ async def participant_reaction_scan(
     settings: Settings,
 ) -> None:
     _, _, rule_id, page = (callback.data or "").split(":")
-    await callback.answer("Проверяю новые сообщения…")
+    await _safe_callback_answer(callback, "Проверяю новые сообщения…")
     try:
         await participant_reactions.scan_rule(int(rule_id))
         await _show_participant_reaction_details(
@@ -1148,7 +1218,7 @@ async def participant_reaction_scan(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.regexp(r"^pr:runs:\d+:\d+$"))
@@ -1174,7 +1244,7 @@ async def participant_reaction_runs(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⬅️ К правилу", callback_data=f"pr:details:{rule_id}:{page}"
+                        text="‹ К правилу", callback_data=f"pr:details:{rule_id}:{page}"
                     )
                 ]
             ]
@@ -1202,9 +1272,9 @@ async def delete_participant_reaction(
     try:
         await participant_reactions.delete_rule(int(rule_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Правило удалено")
+    await _safe_callback_answer(callback, "Правило удалено")
     await _show_participant_reactions(callback, participant_reactions, page=int(page))
 
 
@@ -1224,7 +1294,7 @@ async def begin_channel_comment_rule(callback: CallbackQuery, state: FSMContext)
     await state.clear()
     await _edit_callback(
         callback,
-        "<b>💬 Новый канал для комментариев</b>\n\n"
+        "<b>Новый канал для комментариев</b>\n\n"
         "Выберите формат. Обычный режим пишет один комментарий под каждым новым постом. "
         "Цепочка добавляет ответы выбранных аккаунтов с заданными паузами. "
         "Режим с редактированием сначала публикует исходный комментарий, а затем "
@@ -1239,10 +1309,11 @@ async def choose_channel_comment_mode(callback: CallbackQuery, state: FSMContext
     mode = ChannelCommentMode(raw_mode)
     await state.clear()
     await state.update_data(comment_mode=mode.value, comment_steps=[])
+    await _remember_origin(callback, state)
     await state.set_state(ChannelCommentCreateState.name)
     await _edit_callback(
         callback,
-        "<b>1 / 5 · Название</b>\n\n"
+        channel_comment_wizard_title("Название", 1, mode) + "\n\n"
         "Напишите короткое название для себя: например <code>Вакансии · IT</code>.",
         cancel_menu(),
     )
@@ -1252,12 +1323,17 @@ async def choose_channel_comment_mode(callback: CallbackQuery, state: FSMContext
 async def channel_comment_name(message: Message, state: FSMContext) -> None:
     value = (message.text or "").strip()
     if not 1 <= len(value) <= 150:
-        await message.answer("Название — от 1 до 150 символов. Попробуйте ещё раз.")
+        await answer_panel_input(
+            message,
+            state,
+            "Название — от 1 до 150 символов. Попробуйте ещё раз.",
+        )
         return
-    await state.update_data(comment_name=" ".join(value.split()))
+    data = await state.update_data(comment_name=" ".join(value.split()))
     await state.set_state(ChannelCommentCreateState.channel)
-    await message.answer(
-        "<b>2 / 5 · Каналы</b>\n\n"
+    await answer_panel_input(
+        message, state,
+        channel_comment_wizard_title("Каналы", 2, str(data.get("comment_mode", "single"))) + "\n\n"
         "Пришлите UTF-8 <code>.txt</code> или ссылки / @username каналов "
         "по одному в строке. Поддерживаются приватные invite-ссылки <code>t.me/+…</code>.\n"
         "Одинаковая настройка будет создана для каждого канала; сервис будет "
@@ -1279,38 +1355,73 @@ async def channel_comment_channel(
     document = message.document
     if document is not None:
         if not (document.file_name or "").lower().endswith(".txt"):
-            await message.answer(
-                "Нужен UTF-8 документ <code>.txt</code> или текстовый список каналов."
+            await answer_panel_input(
+                message,
+                state,
+                "Нужен UTF-8 документ <code>.txt</code> или текстовый список каналов.",
             )
             return
         if document.file_size is not None and document.file_size > 1_048_576:
-            await message.answer("Файл больше 1 МБ.")
+            await answer_panel_input(message, state, "Файл больше 1 МБ.")
             return
         buffer = BytesIO()
         await bot.download(document, destination=buffer)
         try:
             content = buffer.getvalue().decode("utf-8-sig")
         except UnicodeDecodeError:
-            await message.answer("Файл должен быть сохранён в UTF-8.")
+            await answer_panel_input(message, state, "Файл должен быть сохранён в UTF-8.")
             return
     values = _parse_channel_comment_refs(content)
     if not values:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Нужна хотя бы одна ссылка на канал: @username, публичная ссылка "
-            "или приватная invite-ссылка t.me/+…"
+            "или приватная invite-ссылка t.me/+…",
         )
         return
+    try:
+        normalized_values = [
+            ChannelCommentService._normalize_channel_ref(value) for value in values
+        ]
+    except ConflictError as exc:
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
+        return
+    values = list(dict.fromkeys(normalized_values))
     if len(values) > 25:
-        await message.answer("За один раз можно настроить не больше 25 каналов.")
+        await answer_panel_input(
+            message,
+            state,
+            "За один раз можно настроить не больше 25 каналов.",
+        )
+        return
+    draft = await state.get_data()
+    if draft.get("comment_edit_channels"):
+        await state.update_data(channel_refs=values, comment_edit_channels=False)
+        _, labels = await _comment_accounts(repository, settings)
+        await state.set_state(ChannelCommentCreateState.confirm)
+        await answer_panel_input(
+            message,
+            state,
+            channel_comment_draft_text(await state.get_data(), labels),
+            reply_markup=channel_comment_confirmation_menu(),
+        )
         return
     accounts, _ = await _comment_accounts(repository, settings)
     if not accounts:
-        await message.answer("Сначала добавьте и подготовьте хотя бы один активный аккаунт.")
+        await answer_panel_input(
+            message,
+            state,
+            "Сначала добавьте и подготовьте хотя бы один активный аккаунт.",
+        )
         return
-    await state.update_data(channel_refs=values)
+    data = await state.update_data(channel_refs=values)
     await state.set_state(ChannelCommentCreateState.primary_account)
-    await message.answer(
-        "<b>3 / 5 · Первый аккаунт</b>\n\nОн напишет первый комментарий под новым постом.",
+    await answer_panel_input(
+        message,
+        state,
+        channel_comment_wizard_title("Первый аккаунт", 3, str(data.get("comment_mode", "single")))
+        + "\n\nОн напишет первый комментарий под новым постом.",
         reply_markup=channel_comment_account_picker(
             accounts,
             callback_prefix="comments:pick:primary",
@@ -1336,18 +1447,21 @@ def _parse_channel_comment_refs(content: str) -> list[str]:
 )
 async def page_channel_comment_primary_account(
     callback: CallbackQuery,
+    state: FSMContext,
     repository: AdminRepository,
     settings: Settings,
 ) -> None:
     try:
         page = max(0, int((callback.data or "").rsplit(":", 1)[1]))
     except (IndexError, ValueError):
-        await callback.answer("Некорректная страница", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная страница", show_alert=True)
         return
     accounts, _ = await _comment_accounts(repository, settings)
+    data = await state.get_data()
     await _edit_callback(
         callback,
-        "<b>3 / 5 · Первый аккаунт</b>\n\nОн напишет первый комментарий под новым постом.",
+        channel_comment_wizard_title("Первый аккаунт", 3, str(data.get("comment_mode", "single")))
+        + "\n\nОн напишет первый комментарий под новым постом.",
         channel_comment_account_picker(
             accounts,
             callback_prefix="comments:pick:primary",
@@ -1365,12 +1479,13 @@ async def page_channel_comment_primary_account(
 async def channel_comment_primary_account(callback: CallbackQuery, state: FSMContext) -> None:
     account_id = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(primary_account_id=account_id)
+    await _remember_origin(callback, state)
     await state.set_state(ChannelCommentCreateState.primary_text)
     mode = ChannelCommentMode(str((await state.get_data()).get("comment_mode", "single")))
     if mode == ChannelCommentMode.MESSAGE_EDIT:
         await _edit_callback(
             callback,
-            "<b>4 / 6 · Исходный комментарий</b>\n\n"
+            channel_comment_wizard_title("Исходный комментарий", 4, mode) + "\n\n"
             "Отправьте короткий текст, который появится сразу под новым постом. "
             "Этот текст позднее будет заменён, а не дополнен новым сообщением.",
             cancel_menu(),
@@ -1378,7 +1493,7 @@ async def channel_comment_primary_account(callback: CallbackQuery, state: FSMCon
         return
     await _edit_callback(
         callback,
-        "<b>4 / 5 · Первый комментарий</b>\n\n"
+        channel_comment_wizard_title("Первый комментарий", 4, mode) + "\n\n"
         "Отправьте текст, фото, видео, документ, голосовое или видеокружок. "
         "Кружок отправляется без подписи; остальные вложения можно отправить с подписью.",
         cancel_menu(),
@@ -1399,7 +1514,7 @@ async def channel_comment_primary_text(
         try:
             text, html_text, media = await _extract_broadcast_content(message, bot, settings)
         except ContentError as exc:
-            await message.answer(escape(operator_error_message(exc)))
+            await answer_panel_input(message, state, escape(operator_error_message(exc)))
             return
         await state.update_data(
             primary_text=text,
@@ -1411,8 +1526,9 @@ async def channel_comment_primary_text(
         )
         if mode == ChannelCommentMode.SINGLE:
             await state.set_state(ChannelCommentCreateState.initial_delay)
-            await message.answer(
-                "<b>5 / 5 · Задержка</b>\n\n"
+            await answer_panel_input(
+                message, state,
+                channel_comment_wizard_title("Задержка", 5, mode) + "\n\n"
                 "Через сколько писать после нового поста?\n"
                 "Примеры: <code>0</code>, <code>30s</code>, <code>5m</code>, <code>2h</code>.",
                 reply_markup=cancel_menu(),
@@ -1432,7 +1548,8 @@ async def channel_comment_primary_text(
         await state.update_data(comment_steps=[first_step])
         _, labels = await _comment_accounts(repository, settings)
         await state.set_state(ChannelCommentCreateState.chain_account)
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             channel_comment_draft_text(await state.get_data(), labels),
             reply_markup=channel_comment_chain_menu(1),
         )
@@ -1443,7 +1560,7 @@ async def channel_comment_primary_text(
     try:
         validate_telegram_text(text, html_text)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     if mode == ChannelCommentMode.MESSAGE_EDIT:
         await state.update_data(
@@ -1451,8 +1568,9 @@ async def channel_comment_primary_text(
             message_edit_initial_html=html_text,
         )
         await state.set_state(ChannelCommentCreateState.message_edit_final_text)
-        await message.answer(
-            "<b>5 / 6 · Текст после редактирования</b>\n\n"
+        await answer_panel_input(
+            message, state,
+            channel_comment_wizard_title("Текст после редактирования", 5, mode) + "\n\n"
             "Отправьте финальный текст. Он заменит исходный комментарий в той же ветке.",
             reply_markup=cancel_menu(),
         )
@@ -1467,12 +1585,14 @@ async def channel_comment_message_edit_final_text(message: Message, state: FSMCo
     try:
         validate_telegram_text(text, html_text)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(primary_text=text, primary_html=html_text)
     await state.set_state(ChannelCommentCreateState.message_edit_delay)
-    await message.answer(
-        "<b>6 / 6 · Задержка редактирования</b>\n\n"
+    await answer_panel_input(
+        message, state,
+        channel_comment_wizard_title("Задержка редактирования", 6, ChannelCommentMode.MESSAGE_EDIT)
+        + "\n\n"
         "Через сколько заменить исходный комментарий? Допустимо от <b>5m</b> до <b>30m</b>.\n"
         "Примеры: <code>5m</code>, <code>15m</code>, <code>30m</code>.",
         reply_markup=cancel_menu(),
@@ -1489,10 +1609,14 @@ async def channel_comment_message_edit_delay(
     try:
         delay = _channel_comment_delay(message.text or "")
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     if not 5 * 60 <= delay <= 30 * 60:
-        await message.answer("Для режима с редактированием укажите задержку от 5m до 30m.")
+        await answer_panel_input(
+            message,
+            state,
+            "Для режима с редактированием укажите задержку от 5m до 30m.",
+        )
         return
     await state.update_data(
         initial_delay_seconds=0,
@@ -1500,7 +1624,8 @@ async def channel_comment_message_edit_delay(
     )
     _, labels = await _comment_accounts(repository, settings)
     await state.set_state(ChannelCommentCreateState.confirm)
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         channel_comment_draft_text(await state.get_data(), labels)
         + "\n\n<i>Исходный комментарий будет опубликован сразу после нового поста, "
         "а финальный текст заменит его через заданный интервал.</i>",
@@ -1517,14 +1642,15 @@ async def begin_order_draft(
 ) -> None:
     mode = (callback.data or "").rsplit(":", 1)[1]
     if mode not in {"broadcast", "dialogue"}:
-        await callback.answer("Неизвестный формат рассылки", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный формат рассылки", show_alert=True)
         return
     accounts = await repository.active_owned_accounts(
         require_authorized_session=not settings.dry_run
     )
     minimum = 1 if mode == "broadcast" else 2
     if len(accounts) < minimum:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             f"Для этой рассылки нужно готовых аккаунтов: {minimum}",
             show_alert=True,
         )
@@ -1595,6 +1721,8 @@ async def _inspect_campaign_with_visible_progress(
     callback: CallbackQuery,
     preflight_service: PreflightService,
     campaign_id: int,
+    *,
+    is_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> CampaignPreflightSummary:
     """Run one read-only preflight and keep the operator's screen alive.
 
@@ -1620,6 +1748,8 @@ async def _inspect_campaign_with_visible_progress(
         if checked_pairs not in {0, total_pairs} and checked_pairs - last_visible < update_every:
             return
         async with progress_lock:
+            if is_current is not None and not await is_current():
+                return
             if (
                 checked_pairs != total_pairs
                 and checked_pairs != 0
@@ -1726,8 +1856,9 @@ async def back_to_order_draft(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -1742,7 +1873,7 @@ async def cancel_order_draft(
 ) -> None:
     await state.clear()
     stats = await repository.dashboard()
-    await callback.answer("Черновик закрыт")
+    await _safe_callback_answer(callback, "Черновик закрыт")
     await _edit_callback(
         callback,
         _dashboard(stats, settings, worker_supervisor),
@@ -1774,17 +1905,18 @@ async def explain_incomplete_order(callback: CallbackQuery, state: FSMContext) -
         dialogue_accounts = {int(item.get("account_id") or 0) for item in steps}
         if len(steps) < 2 or len(dialogue_accounts) < 2:
             missing.append("цепочка минимум из 2 сообщений от разных аккаунтов")
-    await callback.answer("Нужно заполнить: " + ", ".join(missing), show_alert=True)
+    await _safe_callback_answer(callback, "Нужно заполнить: " + ", ".join(missing), show_alert=True)
 
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:name")
 async def begin_order_name_edit(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.name)
     await _edit_callback(
         callback,
         wizard_text(
-            "✏️ Название рассылки",
+            "Название рассылки",
             1,
             1,
             f"Текущее: <b>{escape(str(data.get('order_name') or ''))}</b>\n\n"
@@ -1818,11 +1950,12 @@ async def save_order_name(
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:text")
 async def begin_order_text_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.text)
     await _edit_callback(
         callback,
         wizard_text(
-            "✏️ Рекламный текст",
+            "Рекламный текст",
             1,
             1,
             "Отправьте готовый рекламный пост: обычный или форматированный текст, "
@@ -1844,7 +1977,7 @@ async def save_order_text(
     try:
         value, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(
         primary_text=value,
@@ -1892,16 +2025,16 @@ def _order_engagement_text(data: dict[str, object]) -> str:
         else f"<b>выключены</b> · срок ротации {cooldown_days} дн."
     )
     warning = (
-        "\n\n⚠️ <b>Для реакций нужны минимум два выбранных отправителя.</b> "
+        "\n\n! <b>Для реакций нужны минимум два выбранных отправителя.</b> "
         "Автор публикации не может реагировать на собственный пост."
         if reactions_enabled and sender_count < 2
         else ""
     )
     return (
-        "<b>✨ Реакции и отметки</b>\n"
+        "<b>Реакции и отметки</b>\n"
         "<i>Необязательные действия для будущих публикаций этой рассылки.</i>\n\n"
-        f"👍 Реакции: {reaction_state}\n"
-        f"🔔 Отметки участников: {mention_state}\n\n"
+        f"Реакции: {reaction_state}\n"
+        f"Отметки участников: {mention_state}\n\n"
         "Реакции ставят другие выбранные аккаунты после публикации и не задерживают сам пост. "
         "Отметки выбирают 5–10 подходящих участников скрыто; стоп-лист всегда исключается."
         + warning
@@ -1912,8 +2045,9 @@ def _order_engagement_text(data: dict[str, object]) -> str:
 async def open_order_engagement(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.engagement)
     await _edit_callback(
         callback,
@@ -1940,23 +2074,27 @@ async def update_order_engagement(callback: CallbackQuery, state: FSMContext) ->
         emojis = {"like": "👍", "fire": "🔥", "heart": "❤️", "bolt": "⚡"}
         key = action.rsplit(":", 1)[1]
         if key not in emojis:
-            await callback.answer("Неизвестная реакция", show_alert=True)
+            await _safe_callback_answer(callback, "Неизвестная реакция", show_alert=True)
             return
         changes = {"reaction_emoji": emojis[key]}
     elif action.startswith("count:"):
         count = int(action.rsplit(":", 1)[1])
         if not 1 <= count <= 10:
-            await callback.answer("Можно выбрать от 1 до 10 реакций", show_alert=True)
+            await _safe_callback_answer(
+                callback,
+                "Можно выбрать от 1 до 10 реакций",
+                show_alert=True,
+            )
             return
         changes = {"reaction_count": count, "reactions_enabled": True}
     elif action == "mentions:toggle":
         changes = {"hidden_mentions_enabled": not bool(data.get("hidden_mentions_enabled", False))}
     else:
-        await callback.answer("Неизвестная настройка", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестная настройка", show_alert=True)
         return
     await state.update_data(**changes)
     updated = await state.get_data()
-    await callback.answer("Настройка сохранена")
+    await _safe_callback_answer(callback, "Настройка сохранена")
     await _edit_callback(
         callback,
         _order_engagement_text(updated),
@@ -1970,7 +2108,7 @@ async def begin_order_mention_cooldown(callback: CallbackQuery, state: FSMContex
     data = await state.get_data()
     await _edit_callback(
         callback,
-        "<b>🔄 Срок ротации отметок</b>\n\n"
+        "<b>Срок ротации отметок</b>\n\n"
         "Участник не будет выбран повторно в том же чате в течение указанного срока. "
         "Выберите готовый вариант или введите число от <b>1</b> до <b>365</b> дней.",
         order_mention_cooldown_menu(int(data.get("mention_cooldown_days") or 30)),
@@ -1988,7 +2126,7 @@ async def set_order_mention_cooldown_preset(
     days = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(mention_cooldown_days=days)
     data = await state.get_data()
-    await callback.answer("Срок ротации сохранён")
+    await _safe_callback_answer(callback, "Срок ротации сохранён")
     await _edit_callback(
         callback,
         _order_engagement_text(data),
@@ -2002,10 +2140,11 @@ async def begin_custom_order_mention_cooldown(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.mention_cooldown_days)
     await _edit_callback(
         callback,
-        "<b>🔄 Срок ротации отметок</b>\n\nОтправьте целое число дней от <b>1</b> до <b>365</b>.",
+        "<b>Срок ротации отметок</b>\n\nОтправьте целое число дней от <b>1</b> до <b>365</b>.",
         order_back_menu(),
     )
 
@@ -2040,7 +2179,7 @@ async def choose_order_schedule_mode(
     state: FSMContext,
 ) -> None:
     data = await state.get_data()
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _edit_callback(
         callback,
         order_schedule_mode_text(data),
@@ -2057,7 +2196,7 @@ async def set_order_schedule_mode(
 ) -> None:
     selected = (callback.data or "").rsplit(":", 1)[-1]
     if selected not in {"once", "active"}:
-        await callback.answer("Неизвестный режим", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный режим", show_alert=True)
         return
     smart = selected == "active"
     data = await state.get_data()
@@ -2074,7 +2213,8 @@ async def set_order_schedule_mode(
             bool(data.get("auto_sender_failover", True)) if is_broadcast and distributed else False
         ),
     )
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         "Активная рассылка включена" if smart else "Выбран один проход",
     )
     await _show_order_draft(callback, state, repository)
@@ -2108,10 +2248,10 @@ async def choose_order_sender_mode(
         target_count = int(data.get("audience_target_count") or 0)
     await _edit_callback(
         callback,
-        "<b>👥 Как работают аккаунты</b>\n\n"
-        "🤖 <b>Умный выбор</b> — один пост в каждый чат; сервис выбирает подходящий "
+        "<b>Как работают аккаунты</b>\n\n"
+        "<b>Умный выбор</b> — один пост в каждый чат; сервис выбирает подходящий "
         "аккаунт из отмеченного пула.\n\n"
-        "🚀 <b>Независимо</b> — каждый отмеченный аккаунт публикует во всех чатах; "
+        "<b>Независимо</b> — каждый отмеченный аккаунт публикует во всех чатах; "
         "это увеличивает объём, но один заблокированный аккаунт не тормозит остальные.\n\n"
         f"Сейчас: <b>{target_count or '—'} чатов</b> · <b>{sender_count} аккаунтов</b>.\n"
         "Выберите нужный режим явно — настройки можно изменить до запуска.",
@@ -2133,7 +2273,8 @@ async def set_order_sender_mode(
         sender_mode=selected,
         auto_sender_failover=selected == BroadcastSenderMode.DISTRIBUTED.value,
     )
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         "Выбран умный выбор аккаунта"
         if selected == BroadcastSenderMode.DISTRIBUTED.value
         else "Выбраны независимые потоки аккаунтов"
@@ -2147,7 +2288,7 @@ async def redirect_legacy_order_sender_mode(
     state: FSMContext,
 ) -> None:
     if not (await state.get_data()).get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     await choose_order_sender_mode(callback, state)
 
@@ -2162,7 +2303,7 @@ async def choose_order_profile(
     try:
         profile = broadcast_profile(key)
     except ValueError:
-        await callback.answer("Неизвестный режим", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный режим", show_alert=True)
         return
     data = await state.get_data()
     distributed = (
@@ -2201,7 +2342,7 @@ async def open_order_advanced_settings(
     state: FSMContext,
 ) -> None:
     data = await state.get_data()
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _edit_callback(
         callback,
         order_advanced_text(data),
@@ -2212,6 +2353,7 @@ async def open_order_advanced_settings(
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:interval")
 async def begin_order_interval(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.interval_minutes)
     await _edit_callback(
         callback,
@@ -2240,6 +2382,7 @@ async def save_order_interval_preset(
 ) -> None:
     value = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(smart_no_timer_interval_minutes=value, broadcast_profile="manual")
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2256,7 +2399,7 @@ async def save_order_interval(
     except ValueError:
         value = 0
     if not 1 <= value <= 10080:
-        await message.answer("Введите целое число минут от 1 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 1 до 10080.")
         return
     await state.update_data(smart_no_timer_interval_minutes=value, broadcast_profile="manual")
     await state.set_state(OrderDraftState.action)
@@ -2265,11 +2408,12 @@ async def save_order_interval(
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:visibility")
 async def begin_order_visibility(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.visibility_messages)
     await _edit_callback(
         callback,
         wizard_text(
-            "👁 Глубина адаптивной видимости",
+            "Глубина адаптивной видимости",
             1,
             1,
             "Повтор появится после указанного количества новых сообщений в чате. "
@@ -2298,6 +2442,7 @@ async def save_order_visibility_preset(
         min_messages_between_posts=value,
         broadcast_profile="manual",
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2314,7 +2459,11 @@ async def save_order_visibility(
     except ValueError:
         value = 0
     if not 1 <= value <= 100000:
-        await message.answer("Введите целое число новых сообщений от 1 до 100000.")
+        await answer_panel_input(
+            message,
+            state,
+            "Введите целое число новых сообщений от 1 до 100000.",
+        )
         return
     await state.update_data(
         activity_aware=True,
@@ -2341,11 +2490,12 @@ async def toggle_order_activity(
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:check")
 async def begin_order_activity_check(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.activity_check_seconds)
     await _edit_callback(
         callback,
         wizard_text(
-            "🔎 Частота проверки активности",
+            "Частота проверки активности",
             1,
             1,
             "Как часто проверять, ушёл ли рекламный пост вверх? Выберите вариант или "
@@ -2370,6 +2520,7 @@ async def save_order_activity_check_preset(
         activity_check_interval_seconds=seconds,
         broadcast_profile="manual",
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2386,7 +2537,7 @@ async def save_order_activity_check(
     except ValueError:
         seconds = 0
     if not 30 <= seconds <= 3600:
-        await message.answer("Введите целое число секунд от 30 до 3600.")
+        await answer_panel_input(message, state, "Введите целое число секунд от 30 до 3600.")
         return
     await state.update_data(
         activity_check_interval_seconds=seconds,
@@ -2401,6 +2552,7 @@ async def begin_order_visibility_max_wait(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.visibility_max_wait_minutes)
     await _edit_callback(
         callback,
@@ -2436,6 +2588,7 @@ async def save_order_visibility_max_wait_preset(
         visibility_max_wait_seconds=minutes * 60,
         broadcast_profile="manual",
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2452,7 +2605,7 @@ async def save_order_visibility_max_wait(
     except ValueError:
         minutes = 0
     if not 0 <= minutes <= 10080:
-        await message.answer("Введите целое число минут от 0 до 10080.")
+        await answer_panel_input(message, state, "Введите целое число минут от 0 до 10080.")
         return
     await state.update_data(
         visibility_max_wait_seconds=minutes * 60,
@@ -2464,11 +2617,12 @@ async def save_order_visibility_max_wait(
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:duration")
 async def begin_order_duration(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.duration_hours)
     await _edit_callback(
         callback,
         wizard_text(
-            "🗓 Срок работы",
+            "Срок работы",
             1,
             1,
             "Выберите срок ниже или отправьте целое число часов от <b>1</b> до "
@@ -2494,6 +2648,7 @@ async def save_order_duration_preset(
         repeat_forever=value == 0,
         broadcast_profile="manual",
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2510,7 +2665,7 @@ async def save_order_duration(
     except ValueError:
         value = 0
     if not 1 <= value <= 168:
-        await message.answer("Введите целое число часов от 1 до 168.")
+        await answer_panel_input(message, state, "Введите целое число часов от 1 до 168.")
         return
     await state.update_data(
         smart_duration_hours=value,
@@ -2523,11 +2678,12 @@ async def save_order_duration(
 
 @router.callback_query(OrderDraftState.action, F.data == "order:edit:spread")
 async def begin_order_spread(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.spread_hours)
     await _edit_callback(
         callback,
         wizard_text(
-            "🕒 Окно одного прохода",
+            "Окно одного прохода",
             1,
             1,
             "За сколько часов разложить первую отправку по всем чатам? Выберите "
@@ -2549,6 +2705,7 @@ async def save_order_spread_preset(
 ) -> None:
     value = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(spread_hours=value)
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2565,7 +2722,7 @@ async def save_order_spread(
     except ValueError:
         value = -1
     if not 0 <= value <= 168:
-        await message.answer("Введите целое число часов от 0 до 168.")
+        await answer_panel_input(message, state, "Введите целое число часов от 0 до 168.")
         return
     await state.update_data(spread_hours=value)
     await state.set_state(OrderDraftState.action)
@@ -2580,13 +2737,14 @@ async def begin_order_senders(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     accounts = await repository.active_owned_accounts(
         require_authorized_session=bool(data.get("order_require_authorized_session", False))
     )
     selected = {int(item) for item in data.get("sender_account_ids", [])}
     await state.update_data(sender_page=0)
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.sender_accounts)
     await _edit_callback(
         callback,
@@ -2690,14 +2848,14 @@ def _order_sender_picker_text(data: dict[str, object], *, selected_count: int) -
     )
     target_count = max(0, int(data.get("audience_target_count") or 0))
     lines = [
-        "<b>👥 Кто будет отправлять</b>",
+        "<b>Кто будет отправлять</b>",
         f"Выбрано: <b>{selected_count}</b>.",
     ]
     if independent:
         volume = target_count * selected_count
         lines.extend(
             [
-                "<b>🚀 Независимый режим:</b> каждый отмеченный аккаунт — отдельный "
+                "<b>Независимый режим:</b> каждый отмеченный аккаунт — отдельный "
                 "поток в каждом чате. Недоступность одной пары не остановит остальные.",
                 (
                     f"Первый проход: <b>{target_count} чатов × {selected_count} аккаунтов "
@@ -2710,7 +2868,7 @@ def _order_sender_picker_text(data: dict[str, object], *, selected_count: int) -
     else:
         lines.extend(
             [
-                "<b>🤖 Умный выбор:</b> в каждом чате будет один поток. Сервис выберет "
+                "<b>Умный выбор:</b> в каждом чате будет один поток. Сервис выберет "
                 "подходящий аккаунт из этого пула по доступу, лимиту и времени.",
                 "Если выбранный аккаунт недоступен в конкретном чате, включённая "
                 "автозамена попробует другой аккаунт из этого же пула.",
@@ -2768,7 +2926,7 @@ def _active_capacity_warning(
                         "после окончания срока."
                     )
     return (
-        "⚠️ <b>Текущего пула может не хватить для выбранной частоты.</b> "
+        "! <b>Текущего пула может не хватить для выбранной частоты.</b> "
         f"Полный круг по {target_count} чатам займёт примерно "
         f"{ceil(capacity.full_round_seconds / 60)} мин.{daily_line}{coverage_line} "
         f"{shortfall_line} "
@@ -2819,8 +2977,9 @@ async def finish_order_senders(
 ) -> None:
     data = await state.get_data()
     if not data.get("sender_account_ids"):
-        await callback.answer("Выберите хотя бы один аккаунт", show_alert=True)
+        await _safe_callback_answer(callback, "Выберите хотя бы один аккаунт", show_alert=True)
         return
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -2833,7 +2992,7 @@ async def begin_order_audience(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     chats = await repository.list_approved_targets(0, 1)
     lists = await repository.list_target_lists(0, 1)
@@ -2844,10 +3003,11 @@ async def begin_order_audience(
         else "\n\n<i>Список с пометкой «нужно включить» безопасно выключен. Откройте его "
         "и подтвердите включение перед выбором.</i>"
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.audience)
     await _edit_callback(
         callback,
-        "<b>🎯 Куда отправлять</b>\n"
+        "<b>Куда отправлять</b>\n"
         "<i>Соберите аудиторию самым удобным способом.</i>\n\n"
         "Выберите готовый список целиком или отметьте несколько отдельных чатов галочками. "
         "Отмеченные чаты сохранятся как отдельная подборка только для этой рассылки. Чаты "
@@ -2866,14 +3026,15 @@ async def begin_order_target_list_import(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     await state.update_data(order_resume_draft=dict(data))
+    await _remember_origin(callback, state)
     await state.set_state(TargetImportState.name)
     await _edit_callback(
         callback,
         wizard_text(
-            "📚 Новый список для рассылки",
+            "Новый список для рассылки",
             1,
             2,
             "Введите понятное название списка. На следующем шаге можно прикрепить UTF-8 "
@@ -2895,7 +3056,7 @@ async def page_order_chats(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     page = int((callback.data or "").rsplit(":", 1)[1])
     targets = await repository.list_approved_targets(page, AUDIENCE_PAGE_SIZE)
@@ -2910,10 +3071,11 @@ async def page_order_chats(
         if str(target_id).isdigit() and int(target_id) > 0
     }
     await state.update_data(order_audience_page=targets.page)
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.audience_targets)
     await _edit_callback(
         callback,
-        "<b>☑️ Выберите чаты</b>\n\n"
+        "<b>Выберите чаты</b>\n\n"
         f"Отмечено: <b>{len(selected_ids)}</b>. Нажимайте на чаты, затем «Готово».\n"
         "Подборка не изменит уже существующие списки и будет сохранена вместе с этой рассылкой.",
         order_target_picker(targets, selected_ids),
@@ -2940,7 +3102,7 @@ async def _show_order_target_checklist(
     await state.update_data(order_audience_page=targets.page)
     await _edit_callback(
         callback,
-        "<b>☑️ Выберите чаты</b>\n\n"
+        "<b>Выберите чаты</b>\n\n"
         f"Отмечено: <b>{len(selected_ids)}</b>. Нажимайте на чаты, затем «Готово».\n"
         "Подборка не изменит уже существующие списки и будет сохранена вместе с этой рассылкой.",
         order_target_picker(targets, selected_ids),
@@ -2961,14 +3123,18 @@ async def toggle_order_audience_target(
     try:
         target = await repository.get_target(target_id)
     except NotFoundError:
-        await callback.answer("Этот чат больше не существует", show_alert=True)
+        await _safe_callback_answer(callback, "Этот чат больше не существует", show_alert=True)
         return
     if (
         not target.is_standalone
         or not target.approved_by_operator
         or target.quality_status == TARGET_QUALITY_BAD
     ):
-        await callback.answer("Этот чат сейчас недоступен для рассылки", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Этот чат сейчас недоступен для рассылки",
+            show_alert=True,
+        )
         return
     data = await state.get_data()
     selected_ids = {
@@ -3014,13 +3180,14 @@ async def finish_order_audience_targets(
         if str(item).isdigit() and int(item) > 0
     }
     if not selected_ids:
-        await callback.answer("Отметьте хотя бы один чат", show_alert=True)
+        await _safe_callback_answer(callback, "Отметьте хотя бы один чат", show_alert=True)
         return
     await state.update_data(
         target_id=None,
         target_list_id=None,
         order_selected_target_ids=sorted(selected_ids),
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -3032,17 +3199,18 @@ async def begin_order_audience_search(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     kind = (callback.data or "").rsplit(":", 1)[-1]
     if kind not in {"chats", "lists"}:
-        await callback.answer("Неизвестный тип аудитории", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный тип аудитории", show_alert=True)
         return
     await state.update_data(order_audience_search_kind=kind)
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.audience_search)
     await _edit_callback(
         callback,
-        f"<b>🔎 Найти {'чат' if kind == 'chats' else 'список чатов'}</b>\n\n"
+        f"<b>Найти {'чат' if kind == 'chats' else 'список чатов'}</b>\n\n"
         "Отправьте часть названия, username/ссылку или точный числовой ID. "
         "Покажу до 20 совпадений. Выключенный список можно безопасно включить прямо "
         "в этом сценарии.",
@@ -3065,12 +3233,12 @@ async def search_order_audience(
     kind = str(data.get("order_audience_search_kind") or "")
     if kind == "chats":
         items = await repository.search_targets(query, approved_only=True)
-        results = [(f"☑️ {item.title}", f"order:audience:toggle:{item.id}") for item in items]
+        results = [(f"✓ {item.title}", f"order:audience:toggle:{item.id}") for item in items]
     elif kind == "lists":
         items = await repository.search_target_lists(query, approved_only=False)
         results = [
             (
-                f"📚 {item.name} · {item.approved_count} чатов",
+                f"≡ {item.name} · {item.approved_count} чатов",
                 f"order:audience:list:{item.id}",
             )
             for item in items
@@ -3085,7 +3253,7 @@ async def search_order_audience(
     await _edit_origin(
         bot,
         state,
-        "<b>🔎 Результаты поиска</b>\n"
+        "<b>Результаты поиска</b>\n"
         f"<code>{escape(query)}</code> · найдено <b>{len(results)}</b>\n\n"
         + (
             "Нажмите чат, чтобы добавить или убрать его из подборки."
@@ -3106,7 +3274,7 @@ async def page_order_lists(
 ) -> None:
     data = await state.get_data()
     if not data.get("order_draft_active"):
-        await callback.answer("Черновик рассылки уже закрыт", show_alert=True)
+        await _safe_callback_answer(callback, "Черновик рассылки уже закрыт", show_alert=True)
         return
     page = int((callback.data or "").rsplit(":", 1)[1])
     target_lists = await repository.list_target_lists(page, AUDIENCE_PAGE_SIZE)
@@ -3115,11 +3283,12 @@ async def page_order_lists(
             target_lists.pages - 1,
             AUDIENCE_PAGE_SIZE,
         )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.audience)
     await _edit_callback(
         callback,
-        "<b>📚 Списки чатов</b>\n\nВыберите список; справа указано число включённых "
-        "чатов. Пометка ⚪ означает, что список выключен и перед использованием "
+        "<b>Списки чатов</b>\n\nВыберите список; справа указано число включённых "
+        "чатов. Пометка означает, что список выключен и перед использованием "
         "попросит отдельное подтверждение.",
         order_target_list_picker(target_lists),
     )
@@ -3137,13 +3306,18 @@ async def choose_order_target(
     target_id = int((callback.data or "").rsplit(":", 1)[1])
     target = await repository.get_target(target_id)
     if not target.is_standalone or not target.approved_by_operator:
-        await callback.answer("Этот отдельный чат сейчас недоступен", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Этот отдельный чат сейчас недоступен",
+            show_alert=True,
+        )
         return
     await state.update_data(
         target_id=target.id,
         target_list_id=None,
         order_selected_target_ids=[],
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -3162,7 +3336,7 @@ async def choose_order_target_list(
     if not target_list.approved_count:
         await _edit_callback(
             callback,
-            "<b>📚 Список пока выключен</b>\n\n"
+            "<b>Список пока выключен</b>\n\n"
             f"<b>{escape(target_list.name)}</b> содержит <b>{target_list.item_count}</b> чатов, "
             "но ни один из них ещё не включён для рассылки. Это защита от случайного "
             "запуска по новому списку.\n\n"
@@ -3176,6 +3350,7 @@ async def choose_order_target_list(
         target_list_id=target_list.id,
         order_selected_target_ids=[],
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
     await _show_order_draft(callback, state, repository)
 
@@ -3194,12 +3369,12 @@ async def activate_and_choose_order_target_list(
         changed = await repository.set_target_list_approval(target_list_id, True)
         target_list = await repository.get_target_list_view(target_list_id)
     except NotFoundError:
-        await callback.answer("Список больше не существует", show_alert=True)
+        await _safe_callback_answer(callback, "Список больше не существует", show_alert=True)
         return
     if not target_list.approved_count:
         await _edit_callback(
             callback,
-            "<b>⚠️ В списке нет доступных чатов</b>\n\n"
+            "<b>! В списке нет доступных чатов</b>\n\n"
             f"В <b>{escape(target_list.name)}</b> не удалось включить ни одного чата. "
             "Проверьте исключённые чаты и доступ к ним, затем попробуйте снова.",
             order_target_list_activation_menu(target_list.id),
@@ -3211,8 +3386,10 @@ async def activate_and_choose_order_target_list(
         order_selected_target_ids=[],
         order_resume_draft=None,
     )
+    await _remember_origin(callback, state)
     await state.set_state(OrderDraftState.action)
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         f"Включено: {changed}. Выбрано чатов: {target_list.approved_count}",
     )
     await _show_order_draft(callback, state, repository)
@@ -3374,13 +3551,13 @@ async def save_order_draft(
         campaign = await _create_campaign_from_order_draft(data, repository)
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Рассылка сохранена")
+    await _safe_callback_answer(callback, "Рассылка сохранена")
     await _edit_callback(
         callback,
-        "✅ <b>Рассылка сохранена. Отправка ещё не началась.</b>\n\n"
+        "✓ <b>Рассылка сохранена. Отправка ещё не началась.</b>\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, 0),
         answer=False,
@@ -3433,12 +3610,13 @@ async def preview_order_draft(
             settings,
         )
     except (ContentError, TelegramBadRequest) as exc:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             callback_error_message(exc, prefix="Предпросмотр не отправлен"),
             show_alert=True,
         )
         return
-    await callback.answer("Предпросмотр отправлен вам в этот чат")
+    await _safe_callback_answer(callback, "Предпросмотр отправлен вам в этот чат")
 
 
 @router.callback_query(OrderDraftState.action, F.data == "order:launch")
@@ -3486,10 +3664,23 @@ async def launch_order_draft(
                 show_alert=True,
             )
             return
+        preflight_token = uuid4().hex
+        await state.update_data(order_preflight_token=preflight_token)
+
+        async def draft_is_current() -> bool:
+            current = await state.get_data()
+            return bool(
+                current.get("order_draft_active")
+                and current.get("order_preflight_token") == preflight_token
+            )
+
         try:
             campaign = await _create_campaign_from_order_draft(data, repository)
         except (ConflictError, NotFoundError) as exc:
-            await callback.answer(callback_error_message(exc), show_alert=True)
+            await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
+            return
+
+        if not await draft_is_current():
             return
 
         try:
@@ -3497,6 +3688,7 @@ async def launch_order_draft(
                 callback,
                 preflight_service,
                 campaign.id,
+                is_current=draft_is_current,
             )
         except Exception as exc:  # noqa: BLE001 - preserve the saved campaign and a recovery path
             logger.warning(
@@ -3505,10 +3697,12 @@ async def launch_order_draft(
                 exc_info=True,
             )
             sender_ids = await repository.campaign_sender_ids(campaign.id)
+            if not await draft_is_current():
+                return
             await state.clear()
             await _edit_callback(
                 callback,
-                "⚠️ <b>Проверка не завершилась, отправка не началась.</b>\n\n"
+                "! <b>Проверка не завершилась, отправка не началась.</b>\n\n"
                 f"Причина: {escape(operator_error_message(exc))}\n\n"
                 "Рассылка сохранена. Ничего не отправлено и вступления не выполнялись. "
                 "Откройте её карточку, исправьте причину и запустите проверку снова."
@@ -3530,6 +3724,8 @@ async def launch_order_draft(
             target_count=preflight_summary.target_count,
             settings=settings,
         )
+        if not await draft_is_current():
+            return
         await state.clear()
         await _edit_callback(
             callback,
@@ -3578,7 +3774,7 @@ async def begin_list_search(
         "archive": "архиву результатов",
     }
     if section not in labels:
-        await callback.answer("Этот раздел не поддерживает поиск", show_alert=True)
+        await _safe_callback_answer(callback, "Этот раздел не поддерживает поиск", show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -3586,7 +3782,7 @@ async def begin_list_search(
     await state.set_state(ListSearchState.query)
     await _edit_callback(
         callback,
-        "<b>🔎 Быстрый поиск</b>\n\n"
+        "<b>Быстрый поиск</b>\n\n"
         f"Ищем по {labels[section]}. Отправьте часть названия, ссылку/username "
         "чата или точный числовой ID.\n\n"
         "<i>Покажу до 20 самых новых совпадений — листать весь список не нужно.</i>",
@@ -3604,7 +3800,7 @@ async def begin_target_list_chat_search(
     try:
         target_list = await repository.get_target_list_view(int(target_list_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -3617,7 +3813,7 @@ async def begin_target_list_chat_search(
     back_callback = f"tlf:{target_list.id}:{list_page}:all:0"
     await _edit_callback(
         callback,
-        f"<b>🔎 Найти чат в базе «{escape(target_list.name)}»</b>\n\n"
+        f"<b>Найти чат в базе «{escape(target_list.name)}»</b>\n\n"
         "Отправьте часть названия, username, ссылку или точный ID чата. "
         "Поиск выполняется только внутри этого списка и покажет до 20 совпадений.",
         search_prompt_menu("targetlist_targets", back_callback=back_callback),
@@ -3644,7 +3840,7 @@ async def perform_list_search(
         items = await repository.search_targets(query)
         results = [
             (
-                f"{'🟢' if item.approved_by_operator else '⚪️'} {item.title}",
+                f"{'●' if item.approved_by_operator else '◇'} {item.title}",
                 f"target:details:{item.id}:0",
             )
             for item in items
@@ -3653,7 +3849,7 @@ async def perform_list_search(
         items = await repository.search_target_lists(query)
         results = [
             (
-                f"📚 {item.name} ({item.approved_count}/{item.item_count})",
+                f"≡ {item.name} ({item.approved_count}/{item.item_count})",
                 f"targetlist:details:{item.id}:0",
             )
             for item in items
@@ -3670,13 +3866,13 @@ async def perform_list_search(
         results = [
             (
                 (
-                    "🚫"
+                    "×"
                     if item.quality_status == "bad"
-                    else "🔴"
+                    else "×"
                     if item.last_error_code
-                    else "🟢"
+                    else "●"
                     if item.approved_by_operator
-                    else "⚪️"
+                    else "◇"
                 )
                 + f" {item.title} · {item.chat_ref}",
                 f"tld:{item.id}:{target_list_id}:{list_page}:0:all",
@@ -3689,7 +3885,7 @@ async def perform_list_search(
         items = await repository.search_campaigns(query)
         results = [
             (
-                f"{'📢' if item.mode == CampaignMode.BROADCAST else '💬'} {item.name}",
+                f"{'≡' if item.mode == CampaignMode.BROADCAST else '↳'} {item.name}",
                 f"campaign:details:{item.id}:0",
             )
             for item in items
@@ -3701,7 +3897,7 @@ async def perform_list_search(
         )
         results = [
             (
-                f"{'📢' if item.mode == CampaignMode.BROADCAST else '💬'} "
+                f"{'≡' if item.mode == CampaignMode.BROADCAST else '↳'} "
                 f"{item.campaign_name} · {item.finished}/{item.total}",
                 f"launch:details:{item.anchor_run_id}:0",
             )
@@ -3714,7 +3910,7 @@ async def perform_list_search(
     await _edit_origin_data(
         bot,
         data,
-        "<b>🔎 Результаты поиска</b>\n"
+        "<b>Результаты поиска</b>\n"
         f"<code>{escape(query)}</code> · найдено <b>{len(results)}</b>\n\n"
         + (
             "Выберите нужную карточку."
@@ -3740,7 +3936,7 @@ async def open_menu(
     proxy_service: ProxyService,
     worker_supervisor: WorkerSupervisor,
 ) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await state.clear()
     parts = (callback.data or "menu:home").split(":")
     section = parts[1]
@@ -3788,7 +3984,7 @@ async def open_menu(
 
 @router.callback_query(F.data == "queue:stopall:ask")
 async def ask_stop_all(callback: CallbackQuery) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _edit_callback(
         callback,
         "<b>Остановить все отправки?</b>\n\n"
@@ -3809,7 +4005,7 @@ async def confirm_stop_all(
     settings: Settings,
 ) -> None:
     result = await run_queue.cancel_all_with_summary()
-    await callback.answer("Глобальная остановка применена")
+    await _safe_callback_answer(callback, "Глобальная остановка применена")
     stats = await repository.dashboard()
     summary_lines = ["<b>Глобальная остановка применена</b>"]
     if result.task_count:
@@ -3838,7 +4034,7 @@ async def confirm_stop_all(
 
 @router.callback_query(F.data == "campaign:stopall:ask")
 async def ask_stop_all_campaign_deliveries(callback: CallbackQuery) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _edit_callback(
         callback,
         "<b>Остановить текущие публикации по чатам?</b>\n\n"
@@ -3860,9 +4056,9 @@ async def confirm_stop_all_campaign_deliveries(
     settings: Settings,
 ) -> None:
     result = await run_queue.cancel_all_campaign_deliveries()
-    await callback.answer("Остановка публикаций применена")
+    await _safe_callback_answer(callback, "Остановка публикаций применена")
     page = await repository.list_campaigns(0, PAGE_SIZE)
-    summary_lines = ["<b>🛑 Остановка публикаций по чатам применена</b>"]
+    summary_lines = ["<b>Остановка публикаций по чатам применена</b>"]
     if result.queued_runs:
         summary_lines.append(f"В очереди отменено: <b>{result.queued_runs}</b>")
     if result.running_runs:
@@ -3910,12 +4106,12 @@ async def create_backup(
             sha256=verification.sha256,
         )
     except (OSError, RuntimeError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Резервная копия создана", show_alert=True)
+    await _safe_callback_answer(callback, "Резервная копия создана", show_alert=True)
     if isinstance(callback.message, Message):
         await callback.message.answer(
-            f"💾 Backup: <code>{escape(str(path))}</code>\n"
+            f"Backup: <code>{escape(str(path))}</code>\n"
             f"Размер: <b>{verification.size_bytes}</b> байт · "
             f"SHA-256: <code>{verification.sha256[:16]}…</code>"
         )
@@ -3926,10 +4122,10 @@ async def run_doctor(callback: CallbackQuery, settings: Settings) -> None:
     try:
         report = await asyncio.to_thread(inspect_sqlite, settings.database_url)
     except (RuntimeError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Проверка завершена")
-    icon = "✅" if report.healthy else "❌"
+    await _safe_callback_answer(callback, "Проверка завершена")
+    icon = "✓" if report.healthy else "×"
     await _edit_callback(
         callback,
         f"<b>{icon} Диагностика списка</b>\n"
@@ -3950,13 +4146,13 @@ async def run_doctor(callback: CallbackQuery, settings: Settings) -> None:
 
 @router.callback_query(F.data == "proxy:add")
 async def begin_proxy_add(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(ProxyAddState.url)
     await _edit_callback(
         callback,
         wizard_text(
-            "🌐 Новый прокси",
+            "Новый прокси",
             1,
             3,
             "Отправьте адрес прокси:\n\n"
@@ -3996,7 +4192,7 @@ async def proxy_add_url(
         bot,
         state,
         wizard_text(
-            "🌐 Новый прокси",
+            "Новый прокси",
             2,
             3,
             f"Адрес распознан:\n<code>{escape(parsed.masked_endpoint)}</code>\n\n"
@@ -4044,7 +4240,7 @@ async def proxy_add_label(
         await _edit_origin_data(
             bot,
             data,
-            "✅ MTProto-прокси добавлен. Secret сохранён зашифрованно; "
+            "✓ MTProto-прокси добавлен. Secret сохранён зашифрованно; "
             "теперь нажмите «Проверить».\n\n" + proxy_details_text(view),
             proxy_details_menu(view, 0),
         )
@@ -4054,7 +4250,7 @@ async def proxy_add_label(
         bot,
         state,
         wizard_text(
-            "🌐 Новый прокси",
+            "Новый прокси",
             3,
             3,
             "Если это мобильный прокси, отправьте ссылку ротации IP от провайдера.\n\n"
@@ -4083,7 +4279,7 @@ async def proxy_add_group(
         bot,
         state,
         wizard_text(
-            "🌐 Новый прокси",
+            "Новый прокси",
             4,
             4,
             "Если это мобильный прокси, отправьте ссылку ротации IP от провайдера.\n\n"
@@ -4131,7 +4327,7 @@ async def proxy_add_rotation_url(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Прокси добавлен. Пароль сохранён в зашифрованном виде.\n\n" + proxy_details_text(view),
+        "✓ Прокси добавлен. Пароль сохранён в зашифрованном виде.\n\n" + proxy_details_text(view),
         proxy_details_menu(view, 0),
     )
 
@@ -4149,22 +4345,26 @@ def _proxy_draft_url(data: dict[str, object], settings: Settings) -> str:
 
 
 @router.callback_query(F.data == "proxy:import")
+@router.callback_query(F.data == "proxy:mtproto")
 async def begin_proxy_import(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
-    await state.update_data(proxy_group=None)
+    await state.update_data(proxy_group="MTProto" if callback.data == "proxy:mtproto" else None)
     await state.set_state(ProxyImportState.document)
     await _edit_callback(
         callback,
         wizard_text(
-            "📄 Импорт прокси",
+            "Импорт прокси",
             1,
             1,
-            "Прикрепите UTF-8 файл <code>.txt</code> — один прокси на строку.\n\n"
-            "Поддерживаются HTTP(S), SOCKS5, MTProto-ссылки <code>tg://proxy?...</code>, "
+            "Вставьте одну или несколько ссылок из канала прямо сообщением, "
+            "перешлите сообщение со ссылками или прикрепите UTF-8 файл <code>.txt</code>.\n\n"
+            "MTProto: <code>https://t.me/proxy?server=host&amp;port=443&amp;secret=...</code> "
+            "или <code>tg://proxy?...</code>.\n"
+            "Также поддерживаются HTTP(S), SOCKS5, "
             "<code>host:port</code> и <code>host:port:login:password</code>.\n"
             "Лимит: <b>2000 строк · 2 МБ</b>.",
-            hint="Пустые строки и комментарии с # будут пропущены.",
+            hint="Повторы пропускаются. Secret сохраняется зашифрованно.",
         ),
         cancel_menu(),
         answer=False,
@@ -4185,11 +4385,12 @@ async def proxy_import_group(message: Message, state: FSMContext, bot: Bot) -> N
         bot,
         state,
         wizard_text(
-            "📄 Импорт прокси",
+            "Импорт прокси",
             2,
             2,
-            "Прикрепите UTF-8 файл <code>.txt</code> — один адрес на строку.\n\n"
-            "Поддерживаются HTTP(S), SOCKS5, <code>host:port</code> и "
+            "Отправьте ссылки сообщением или прикрепите UTF-8 файл <code>.txt</code>.\n\n"
+            "Поддерживаются MTProto-ссылки t.me/proxy и tg://proxy, HTTP(S), SOCKS5, "
+            "<code>host:port</code> и "
             "<code>host:port:login:password</code>.\n"
             "Лимит: <b>2000 строк · 2 МБ</b>.",
             hint="Пустые строки и комментарии с # будут пропущены.",
@@ -4206,23 +4407,39 @@ async def import_proxy_document(
     proxy_service: ProxyService,
 ) -> None:
     document = message.document
-    if document is None or not (document.file_name or "").lower().endswith(".txt"):
-        await message.answer("Нужен документ с расширением <code>.txt</code>.")
-        return
-    if document.file_size is not None and document.file_size > 2_097_152:
-        await message.answer("Файл больше 2 МБ.")
-        return
-    buffer = BytesIO()
-    await bot.download(document, destination=buffer)
-    try:
-        content = buffer.getvalue().decode("utf-8-sig")
-    except UnicodeDecodeError:
-        await message.answer("Файл должен быть сохранён в UTF-8.")
-        return
-    values = content.splitlines()
-    meaningful = [line for line in values if line.strip() and not line.lstrip().startswith("#")]
-    if len(meaningful) > 2000:
-        await message.answer("В одном файле разрешено не более 2000 непустых строк.")
+    linked_urls = []
+    if document is not None:
+        if not (document.file_name or "").lower().endswith(".txt"):
+            await message.answer("Нужен файл .txt или сообщение со ссылками прокси.")
+            return
+        if document.file_size is not None and document.file_size > 2_097_152:
+            await message.answer("Файл больше 2 МБ.")
+            return
+        buffer = BytesIO()
+        await bot.download(document, destination=buffer)
+        if buffer.getbuffer().nbytes > 2_097_152:
+            await message.answer("Файл больше 2 МБ.")
+            return
+        try:
+            content = buffer.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await message.answer("Файл должен быть сохранён в UTF-8.")
+            return
+    else:
+        content = message.text or message.caption or ""
+        linked_urls = [
+            entity.url for entity in (message.entities or message.caption_entities or [])
+            if entity.url
+        ]
+        if not content and not linked_urls:
+            await message.answer("Вставьте MTProto-ссылки или отправьте файл .txt.")
+            return
+        if len(content.encode("utf-8")) > 2_097_152:
+            await message.answer("Список больше 2 МБ.")
+            return
+    values = proxy_import_values(content, linked_urls=linked_urls)
+    if len(values) > 2000:
+        await message.answer("За один импорт разрешено не более 2000 адресов.")
         return
     data = await state.get_data()
     try:
@@ -4238,7 +4455,7 @@ async def import_proxy_document(
     await _edit_origin_data(
         bot,
         data,
-        f"✅ Импорт завершён: добавлено <b>{result.added}</b>, "
+        f"✓ Импорт завершён: добавлено <b>{result.added}</b>, "
         f"дубликатов <b>{result.skipped}</b>, некорректных <b>{result.invalid}</b>."
         f"{error_preview}\n\n{proxies_text(page)}",
         proxies_menu(page),
@@ -4251,7 +4468,7 @@ async def filter_proxies(callback: CallbackQuery, proxy_service: ProxyService) -
     try:
         selected_filter = ProxyFilter(filter_name)
     except ValueError:
-        await callback.answer("Неизвестный фильтр", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный фильтр", show_alert=True)
         return
     proxy_page = await proxy_service.list_proxies(int(page), PAGE_SIZE, filter_name=selected_filter)
     await _edit_callback(callback, proxies_text(proxy_page), proxies_menu(proxy_page))
@@ -4263,7 +4480,7 @@ async def show_proxy_details(callback: CallbackQuery, proxy_service: ProxyServic
     try:
         item = await proxy_service.get_proxy(int(proxy_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(callback, proxy_details_text(item), proxy_details_menu(item, int(page)))
 
@@ -4271,19 +4488,19 @@ async def show_proxy_details(callback: CallbackQuery, proxy_service: ProxyServic
 @router.callback_query(F.data.startswith("proxy:edit:"))
 async def begin_proxy_edit(callback: CallbackQuery, state: FSMContext) -> None:
     _, _, proxy_id, page = (callback.data or "").split(":")
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(edit_proxy_id=int(proxy_id), edit_proxy_page=int(page))
     await state.set_state(ProxyEditState.url)
     await _edit_callback(
         callback,
         wizard_text(
-            "🔑 Адрес и пароль",
+            "Адрес и пароль",
             1,
             1,
             "Отправьте полный новый адрес прокси. Название и назначения сохранятся, "
             "а результат проверки будет сброшен.\n\n"
-            "🔐 Пароль после сохранения снова станет скрытым.",
+            "Пароль после сохранения снова станет скрытым.",
         ),
         cancel_menu(),
         answer=False,
@@ -4315,7 +4532,7 @@ async def save_proxy_edit(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Адрес и учётные данные заменены. Прокси нужно проверить заново.\n\n"
+        "✓ Адрес и учётные данные заменены. Прокси нужно проверить заново.\n\n"
         + proxy_details_text(item),
         proxy_details_menu(item, int(data["edit_proxy_page"])),
     )
@@ -4324,14 +4541,14 @@ async def save_proxy_edit(
 @router.callback_query(F.data.startswith("proxy:rotation:"))
 async def begin_proxy_rotation_edit(callback: CallbackQuery, state: FSMContext) -> None:
     _, _, proxy_id, page = (callback.data or "").split(":")
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(rotation_proxy_id=int(proxy_id), rotation_proxy_page=int(page))
     await state.set_state(ProxyRotationState.url)
     await _edit_callback(
         callback,
         wizard_text(
-            "🔗 Ссылка ротации",
+            "Ссылка ротации",
             1,
             1,
             "Отправьте HTTP/HTTPS ссылку провайдера для смены IP. "
@@ -4364,7 +4581,7 @@ async def save_proxy_rotation_url(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Ссылка ротации обновлена.\n\n" + proxy_details_text(item),
+        "✓ Ссылка ротации обновлена.\n\n" + proxy_details_text(item),
         proxy_details_menu(item, int(data["rotation_proxy_page"])),
     )
 
@@ -4374,18 +4591,18 @@ async def rotate_proxy(
     callback: CallbackQuery, proxy_service: ProxyService, gateway: object | None = None
 ) -> None:
     _, _, proxy_id, page = (callback.data or "").split(":")
-    await callback.answer("Отправляю запрос ротации…")
+    await _safe_callback_answer(callback, "Отправляю запрос ротации…")
     try:
         before = await proxy_service.get_proxy(int(proxy_id))
         await _close_rotated_account_client(before, gateway)
         item = await proxy_service.rotate_proxy(int(proxy_id))
     except (NotFoundError, ConflictError) as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
         return
     await _edit_callback(
         callback,
-        "✅ Ротация выполнена и новый маршрут автоматически проверен.\n\n"
+        "✓ Ротация выполнена и новый маршрут автоматически проверен.\n\n"
         + proxy_details_text(item),
         proxy_details_menu(item, int(page)),
         answer=False,
@@ -4431,9 +4648,9 @@ async def begin_proxy_metadata_edit(
     try:
         item = await proxy_service.get_proxy(int(proxy_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(
         meta_proxy_id=int(proxy_id),
@@ -4444,7 +4661,7 @@ async def begin_proxy_metadata_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "🏷 Название прокси",
+            "Название прокси",
             1,
             1,
             "Введите новое понятное название, например <code>Мобильный основной</code>.",
@@ -4479,7 +4696,7 @@ async def proxy_metadata_label(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Название обновлено.\n\n" + proxy_details_text(item),
+        "✓ Название обновлено.\n\n" + proxy_details_text(item),
         proxy_details_menu(item, int(data["meta_proxy_page"])),
     )
 
@@ -4509,7 +4726,7 @@ async def save_proxy_metadata(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Название и папка обновлены.\n\n" + proxy_details_text(item),
+        "✓ Название и папка обновлены.\n\n" + proxy_details_text(item),
         proxy_details_menu(item, int(data["meta_proxy_page"])),
     )
 
@@ -4525,9 +4742,9 @@ async def toggle_proxy(
         item = await proxy_service.toggle_proxy(int(proxy_id))
         await _close_rotated_account_client(item, gateway)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Статус изменён")
+    await _safe_callback_answer(callback, "Статус изменён")
     await _edit_callback(
         callback, proxy_details_text(item), proxy_details_menu(item, int(page)), answer=False
     )
@@ -4536,7 +4753,7 @@ async def toggle_proxy(
 @router.callback_query(F.data.startswith("proxy:check:") & ~F.data.startswith("proxy:checkall:"))
 async def check_proxy(callback: CallbackQuery, proxy_service: ProxyService) -> None:
     _, _, proxy_id, page = (callback.data or "").split(":")
-    await callback.answer("Проверяю соединение…")
+    await _safe_callback_answer(callback, "Проверяю соединение…")
     try:
         result = await proxy_service.check_proxy(int(proxy_id))
         item = await proxy_service.get_proxy(int(proxy_id))
@@ -4545,9 +4762,9 @@ async def check_proxy(callback: CallbackQuery, proxy_service: ProxyService) -> N
             await callback.message.answer(escape(operator_error_message(exc)))
         return
     verdict = (
-        "✅ Прокси рабочий: соединение через него установлено"
+        "✓ Прокси рабочий: соединение через него установлено"
         if result.healthy
-        else "🔴 Прокси не работает: соединение через него не установлено"
+        else "Прокси не работает: соединение через него не установлено"
     )
     await _edit_callback(
         callback,
@@ -4560,13 +4777,13 @@ async def check_proxy(callback: CallbackQuery, proxy_service: ProxyService) -> N
 @router.callback_query(F.data.startswith("proxy:checkall:"))
 async def check_all_proxies(callback: CallbackQuery, proxy_service: ProxyService) -> None:
     page_number = int((callback.data or "").rsplit(":", 1)[1])
-    await callback.answer("Запустил параллельную проверку")
+    await _safe_callback_answer(callback, "Запустил параллельную проверку")
     results = await proxy_service.check_all()
     healthy = sum(result.healthy for result in results)
     page = await proxy_service.list_proxies(page_number, PAGE_SIZE)
     await _edit_callback(
         callback,
-        f"<b>🩺 Проверка завершена: {healthy}/{len(results)} прокси рабочие</b>\n\n"
+        f"<b>Проверка завершена: {healthy}/{len(results)} прокси рабочие</b>\n\n"
         + proxies_text(page),
         proxies_menu(page),
         answer=False,
@@ -4575,13 +4792,13 @@ async def check_all_proxies(callback: CallbackQuery, proxy_service: ProxyService
 
 @router.callback_query(F.data == "proxy:autoassign")
 async def begin_proxy_auto_assign(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(ProxyAutoAssignState.group)
     await _edit_callback(
         callback,
         wizard_text(
-            "⚡ Подбор лучшего прокси",
+            "Подбор лучшего прокси",
             1,
             3,
             "Введите группу, из которой нужно выбрать рабочий прокси с наименьшей "
@@ -4605,7 +4822,7 @@ async def proxy_auto_group(message: Message, state: FSMContext, bot: Bot) -> Non
         bot,
         state,
         wizard_text(
-            "⚡ Подбор лучшего прокси",
+            "Подбор лучшего прокси",
             2,
             3,
             "Введите уникальный ключ назначения, например <code>worker-eu-01</code>.",
@@ -4626,7 +4843,7 @@ async def proxy_auto_key(message: Message, state: FSMContext, bot: Bot) -> None:
         bot,
         state,
         wizard_text(
-            "⚡ Подбор лучшего прокси",
+            "Подбор лучшего прокси",
             3,
             3,
             "Опишите назначение или отправьте <code>-</code> без описания.",
@@ -4662,7 +4879,7 @@ async def finish_proxy_auto_assign(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Выбран рабочий прокси с наименьшей текущей нагрузкой.\n\n" + proxy_details_text(item),
+        "✓ Выбран рабочий прокси с наименьшей текущей нагрузкой.\n\n" + proxy_details_text(item),
         proxy_details_menu(item, 0),
     )
 
@@ -4670,14 +4887,14 @@ async def finish_proxy_auto_assign(
 @router.callback_query(F.data.startswith("proxy:assign:"))
 async def begin_proxy_assign(callback: CallbackQuery, state: FSMContext) -> None:
     _, _, proxy_id, page = (callback.data or "").split(":")
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(assign_proxy_id=int(proxy_id), assign_proxy_page=int(page))
     await state.set_state(ProxyAssignState.assignment_key)
     await _edit_callback(
         callback,
         wizard_text(
-            "📌 Резервирование прокси",
+            "Резервирование прокси",
             1,
             2,
             "Введите уникальный ключ назначения, например <code>worker-eu-01</code>. "
@@ -4700,7 +4917,7 @@ async def proxy_assignment_key(message: Message, state: FSMContext, bot: Bot) ->
         bot,
         state,
         wizard_text(
-            "📌 Резервирование прокси",
+            "Резервирование прокси",
             2,
             2,
             "Опишите назначение или отправьте <code>-</code> без описания.",
@@ -4736,7 +4953,7 @@ async def proxy_assignment_purpose(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Прокси зарезервирован.\n\n" + proxy_details_text(item),
+        "✓ Прокси зарезервирован.\n\n" + proxy_details_text(item),
         proxy_details_menu(item, int(data["assign_proxy_page"])),
     )
 
@@ -4753,9 +4970,9 @@ async def release_proxy(
         item = await proxy_service.release_proxy(int(proxy_id))
         await _close_rotated_account_client(before, gateway)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Прокси освобождён")
+    await _safe_callback_answer(callback, "Прокси освобождён")
     await _edit_callback(
         callback, proxy_details_text(item), proxy_details_menu(item, int(page)), answer=False
     )
@@ -4767,7 +4984,7 @@ async def ask_delete_proxy(callback: CallbackQuery, proxy_service: ProxyService)
     try:
         item = await proxy_service.get_proxy(int(proxy_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -4783,9 +5000,9 @@ async def confirm_delete_proxy(callback: CallbackQuery, proxy_service: ProxyServ
     try:
         await proxy_service.delete_proxy(int(proxy_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Прокси удалён")
+    await _safe_callback_answer(callback, "Прокси удалён")
     await _show_proxies(callback, proxy_service, int(page))
 
 
@@ -4808,11 +5025,11 @@ async def ask_delete_proxy_group(callback: CallbackQuery, proxy_service: ProxySe
     groups = await proxy_service.list_groups()
     group = next((item for item in groups if item.id == group_id), None)
     if group is None:
-        await callback.answer("Группа не найдена", show_alert=True)
+        await _safe_callback_answer(callback, "Группа не найдена", show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить группу «{escape(group.name)}»?</b>\n\n"
+        f"<b>Удалить группу «{escape(group.name)}»?</b>\n\n"
         "Прокси сохранятся и перейдут в раздел «без группы». Это действие не удаляет адреса.",
         proxy_group_delete_confirmation(group_id),
     )
@@ -4824,10 +5041,10 @@ async def delete_proxy_group(callback: CallbackQuery, proxy_service: ProxyServic
     try:
         await proxy_service.delete_group(group_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     groups = await proxy_service.list_groups()
-    await callback.answer("Группа удалена; прокси оставлены без группы")
+    await _safe_callback_answer(callback, "Группа удалена; прокси оставлены без группы")
     await _edit_callback(
         callback,
         proxy_groups_text(groups),
@@ -4838,13 +5055,13 @@ async def delete_proxy_group(callback: CallbackQuery, proxy_service: ProxyServic
 
 @router.callback_query(F.data == "proxy:group:add")
 async def begin_proxy_group_create(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(ProxyGroupCreateState.name)
     await _edit_callback(
         callback,
         wizard_text(
-            "🗂 Новая группа",
+            "Новая группа",
             1,
             2,
             "Введите уникальное короткое имя, например <code>EU</code>.",
@@ -4866,7 +5083,7 @@ async def proxy_group_name(message: Message, state: FSMContext, bot: Bot) -> Non
         bot,
         state,
         wizard_text(
-            "🗂 Новая группа",
+            "Новая группа",
             2,
             2,
             "Введите назначение группы или отправьте <code>-</code> без описания.",
@@ -4899,20 +5116,20 @@ async def proxy_group_description(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Группа создана.\n\n" + proxy_groups_text(groups),
+        "✓ Группа создана.\n\n" + proxy_groups_text(groups),
         proxy_groups_menu(groups),
     )
 
 
 @router.callback_query(F.data == "account:add")
 async def begin_account_create(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(AccountCreateState.label)
     await _edit_callback(
         callback,
         wizard_text(
-            "👥 Новая запись аккаунта",
+            "Новая запись аккаунта",
             1,
             3,
             "Введите понятное название. Эта запись будет без сессии и не сможет "
@@ -4935,7 +5152,7 @@ async def account_label(message: Message, state: FSMContext, bot: Bot) -> None:
         bot,
         state,
         wizard_text(
-            "👥 Новая запись аккаунта",
+            "Новая запись аккаунта",
             2,
             3,
             "Введите числовой Telegram User ID или отправьте <code>-</code>.",
@@ -4964,7 +5181,7 @@ async def account_telegram_id(message: Message, state: FSMContext, bot: Bot) -> 
         bot,
         state,
         wizard_text(
-            "👥 Новая запись аккаунта",
+            "Новая запись аккаунта",
             3,
             3,
             "Подтвердите, что аккаунт принадлежит вам. Подключение и авторизация "
@@ -4988,14 +5205,14 @@ async def confirm_account(
             ownership_confirmed=True,
         )
     except ConflictError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Аккаунт добавлен")
+    await _safe_callback_answer(callback, "Аккаунт добавлен")
     page = await repository.list_accounts(0, PAGE_SIZE)
     await _edit_callback(
         callback,
-        f"✅ Аккаунт <b>{escape(account.label)}</b> добавлен.\n\n{accounts_text(page)}",
+        f"✓ Аккаунт <b>{escape(account.label)}</b> добавлен.\n\n{accounts_text(page)}",
         accounts_menu(page),
         answer=False,
     )
@@ -5012,9 +5229,9 @@ async def toggle_account(
     try:
         await repository.toggle_account(int(account_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Статус аккаунта изменён")
+    await _safe_callback_answer(callback, "Статус аккаунта изменён")
     await _show_account_details(
         callback, account_service, proxy_service, int(account_id), int(page)
     )
@@ -5075,7 +5292,7 @@ async def _show_account_groups(
         callback,
         "<b>Группы аккаунтов</b>\n"
         f"<i>Текущий список: {scope} · фильтр: {account_filter_label(account_filter)}</i>\n\n"
-        "Группы — это ваши пересекающиеся разделы. ⭐ Premium — системный: его состав "
+        "Группы — это ваши пересекающиеся разделы. ☆ Premium — системный: его состав "
         "синхронизируется с Telegram. Остальные группы не меняют настройки рассылок, "
         "автокомментариев или авто‑реакций сами по себе: в этих правилах всегда остаётся "
         "только явно выбранный пул аккаунтов.\n\n"
@@ -5113,7 +5330,7 @@ async def _show_account_group_details(
         members = await repository.list_account_group_member_ids(group_id)
         group_views = await repository.list_account_group_views()
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     view = next((item for item in group_views if item.id == group_id), None)
     ready_count = view.ready_count if view is not None else 0
@@ -5122,13 +5339,13 @@ async def _show_account_group_details(
         escape(group.description) if group.description else "Пользовательская группа аккаунтов"
     )
     if group.is_system:
-        title = f"<b>⭐ {escape(group.name)}</b>"
+        title = f"<b>{escape(group.name)}</b>"
         management_note = (
             "Состав определяется только статусом Telegram Premium. После импорта, проверки "
             "сессии или обновления профиля аккаунт добавляется либо убирается автоматически."
         )
     else:
-        title = f"<b>🗂 {escape(group.name)}</b>"
+        title = f"<b>{escape(group.name)}</b>"
         management_note = (
             "Состав можно менять в любой момент. Удаление группы удалит только эту подборку — "
             "сами аккаунты и их историю не затронет."
@@ -5161,7 +5378,8 @@ async def _show_account_group_members(
     try:
         group = await repository.get_account_group(group_id)
         if group.is_system:
-            await callback.answer(
+            await _safe_callback_answer(
+                callback,
                 "Состав Premium обновляется автоматически по данным Telegram.",
                 show_alert=True,
             )
@@ -5173,7 +5391,7 @@ async def _show_account_group_members(
             account_filter=account_filter,
         )
     except (NotFoundError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     empty_hint = (
         "\n\n<i>По этому фильтру аккаунтов нет. Смените фильтр, чтобы добавить нужные.</i>"
@@ -5265,7 +5483,7 @@ async def show_account_group_details(
     try:
         group_id = int(parts[3])
     except (IndexError, ValueError):
-        await callback.answer("Некорректная группа", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная группа", show_alert=True)
         return
     account_filter, group_scope_id, page = _account_scope_from_callback(
         parts,
@@ -5311,7 +5529,11 @@ async def begin_account_group_create(callback: CallbackQuery, state: FSMContext)
         elif parts != ["account", "group", "add"]:
             raise ValueError
     except ValueError:
-        await callback.answer("Некорректный переход к созданию группы", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Некорректный переход к созданию группы",
+            show_alert=True,
+        )
         return
     await state.update_data(
         account_group_create_filter=account_filter.value,
@@ -5323,7 +5545,7 @@ async def begin_account_group_create(callback: CallbackQuery, state: FSMContext)
     await _edit_callback(
         callback,
         wizard_text(
-            "🗂 Новая группа аккаунтов",
+            "Новая группа аккаунтов",
             1,
             2,
             "Введите название до <b>100 символов</b>. Например: <code>Авто‑реакции</code>, "
@@ -5346,7 +5568,7 @@ async def receive_account_group_name(message: Message, state: FSMContext, bot: B
         bot,
         state,
         wizard_text(
-            "🗂 Новая группа аккаунтов",
+            "Новая группа аккаунтов",
             2,
             2,
             "Добавьте короткое описание до <b>500 символов</b> или отправьте <code>-</code>. "
@@ -5373,7 +5595,7 @@ async def receive_account_group_description(
             str(data.get("account_group_name") or ""), description
         )
     except (ConflictError, ValueError) as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
     try:
         account_filter = AccountListFilter(
@@ -5410,9 +5632,9 @@ async def receive_account_group_description(
         bot,
         data,
         (
-            f"✅ <b>Группа «{escape(group.name)}» создана и аккаунт добавлен в неё.</b>"
+            f"✓ <b>Группа «{escape(group.name)}» создана и аккаунт добавлен в неё.</b>"
             if membership_account_id is not None
-            else f"✅ <b>Группа «{escape(group.name)}» создана.</b> Теперь выберите её состав."
+            else f"✓ <b>Группа «{escape(group.name)}» создана.</b> Теперь выберите её состав."
         ),
         (
             account_membership_menu(
@@ -5444,7 +5666,7 @@ async def begin_account_group_edit(
     try:
         group_id = int(parts[3])
     except (IndexError, ValueError):
-        await callback.answer("Некорректная группа", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная группа", show_alert=True)
         return
     account_filter, group_scope_id, page = _account_scope_from_callback(
         parts,
@@ -5455,7 +5677,7 @@ async def begin_account_group_edit(
     try:
         group = await repository.get_account_group(group_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -5470,7 +5692,7 @@ async def begin_account_group_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "✏️ Редактирование группы",
+            "Редактирование группы",
             1,
             2,
             f"Сейчас: <b>{escape(group.name)}</b>\n\n"
@@ -5497,7 +5719,7 @@ async def receive_account_group_edit_name(
         bot,
         state,
         wizard_text(
-            "✏️ Редактирование группы",
+            "Редактирование группы",
             2,
             2,
             "Отправьте новое описание до <b>500 символов</b> или <code>-</code>, "
@@ -5527,7 +5749,7 @@ async def receive_account_group_edit_description(
             description=description,
         )
     except (ConflictError, NotFoundError, ValueError) as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
     try:
         account_filter = AccountListFilter(str(data.get("account_group_edit_filter") or "all"))
@@ -5541,7 +5763,7 @@ async def receive_account_group_edit_description(
         members = await repository.list_account_group_member_ids(group_id)
         group_views = await repository.list_account_group_views()
     except NotFoundError as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
     view = next((item for item in group_views if item.id == group_id), None)
     ready_count = view.ready_count if view is not None else 0
@@ -5553,8 +5775,8 @@ async def receive_account_group_edit_description(
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>Группа обновлена.</b>\n\n"
-        f"<b>🗂 {escape(group.name)}</b>\n"
+        "✓ <b>Группа обновлена.</b>\n\n"
+        f"<b>{escape(group.name)}</b>\n"
         f"<i>{group_description}</i>\n\n"
         f"Аккаунтов: <b>{len(members)}</b> · готовы: <b>{ready_count}</b> · "
         f"Premium: <b>{premium_count}</b>\n\n"
@@ -5577,7 +5799,7 @@ async def show_account_group_members(callback: CallbackQuery, repository: AdminR
         account_filter = _account_filter_from_callback(parts[4])
         page = max(0, int(parts[5]))
     except (IndexError, ValueError):
-        await callback.answer("Некорректный состав группы", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректный состав группы", show_alert=True)
         return
     await _show_account_group_members(
         callback,
@@ -5596,7 +5818,7 @@ async def show_account_group_member_filters(callback: CallbackQuery) -> None:
         account_filter = _account_filter_from_callback(parts[5])
         page = max(0, int(parts[6]))
     except (IndexError, ValueError):
-        await callback.answer("Некорректный фильтр", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректный фильтр", show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -5622,16 +5844,11 @@ async def toggle_account_group_member(
         account_id = int(parts[5])
         account_filter = _account_filter_from_callback(parts[6])
         page = max(0, int(parts[7]))
-        selected = await repository.list_account_group_member_ids(group_id)
-        if account_id in selected:
-            selected.remove(account_id)
-        else:
-            selected.add(account_id)
-        await repository.set_account_group_members(group_id, selected)
-    except (IndexError, ValueError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await repository.update_account_group_members(group_id, {account_id}, selected=None)
+    except (IndexError, ValueError, NotFoundError, ConflictError) as exc:
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Состав группы сохранён")
+    await _safe_callback_answer(callback, "Состав группы сохранён")
     await _show_account_group_members(
         callback,
         repository,
@@ -5654,22 +5871,19 @@ async def toggle_account_group_member_page(
         page = max(0, int(parts[7]))
         if action not in {"on", "off"}:
             raise ValueError("некорректное действие")
-        selected = await repository.list_account_group_member_ids(group_id)
         account_page = await repository.list_accounts(
             page,
             PAGE_SIZE,
             account_filter=account_filter,
         )
         visible_ids = {account.id for account in account_page.items}
-        if action == "on":
-            selected.update(visible_ids)
-        else:
-            selected.difference_update(visible_ids)
-        await repository.set_account_group_members(group_id, selected)
-    except (IndexError, ValueError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await repository.update_account_group_members(
+            group_id, visible_ids, selected=action == "on"
+        )
+    except (IndexError, ValueError, NotFoundError, ConflictError) as exc:
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Состав группы сохранён")
+    await _safe_callback_answer(callback, "Состав группы сохранён")
     await _show_account_group_members(
         callback,
         repository,
@@ -5685,7 +5899,7 @@ async def ask_delete_account_group(callback: CallbackQuery, repository: AdminRep
     try:
         group_id = int(parts[4])
     except (IndexError, ValueError):
-        await callback.answer("Некорректная группа", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная группа", show_alert=True)
         return
     account_filter, group_scope_id, page = _account_scope_from_callback(
         parts,
@@ -5696,7 +5910,7 @@ async def ask_delete_account_group(callback: CallbackQuery, repository: AdminRep
     try:
         group = await repository.get_account_group(group_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -5722,7 +5936,7 @@ async def confirm_delete_account_group(
     try:
         group_id = int(parts[4])
     except (IndexError, ValueError):
-        await callback.answer("Некорректная группа", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная группа", show_alert=True)
         return
     account_filter, group_scope_id, page = _account_scope_from_callback(
         parts,
@@ -5733,9 +5947,9 @@ async def confirm_delete_account_group(
     try:
         await repository.delete_account_group(group_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Группа удалена; аккаунты остались на месте")
+    await _safe_callback_answer(callback, "Группа удалена; аккаунты остались на месте")
     await _show_account_groups(
         callback,
         repository,
@@ -5755,7 +5969,7 @@ async def account_scoped_details(
     try:
         account_id = int(parts[2])
     except (IndexError, ValueError):
-        await callback.answer("Некорректный аккаунт", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректный аккаунт", show_alert=True)
         return
     account_filter, group_id, page = _account_scope_from_callback(
         parts,
@@ -5787,7 +6001,7 @@ async def show_account_membership(
     try:
         account_id = int(parts[2])
     except (IndexError, ValueError):
-        await callback.answer("Некорректный аккаунт", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректный аккаунт", show_alert=True)
         return
     account_filter, group_id, page = _account_scope_from_callback(
         parts,
@@ -5798,7 +6012,7 @@ async def show_account_membership(
     try:
         selected_group_ids = await repository.list_account_membership_group_ids(account_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     groups = await repository.list_account_group_views()
     await _edit_callback(
@@ -5828,7 +6042,7 @@ async def toggle_account_membership(
         account_id = int(parts[2])
         group_id = int(parts[3])
     except (IndexError, ValueError):
-        await callback.answer("Некорректный выбор", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректный выбор", show_alert=True)
         return
     account_filter, group_scope_id, page = _account_scope_from_callback(
         parts,
@@ -5837,17 +6051,12 @@ async def toggle_account_membership(
         page_index=6,
     )
     try:
-        member_ids = await repository.list_account_group_member_ids(group_id)
-        if account_id in member_ids:
-            member_ids.remove(account_id)
-        else:
-            member_ids.add(account_id)
-        await repository.set_account_group_members(group_id, member_ids)
+        await repository.update_account_group_members(group_id, {account_id}, selected=None)
         selected_group_ids = await repository.list_account_membership_group_ids(account_id)
-    except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+    except (NotFoundError, ConflictError) as exc:
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Группы аккаунта обновлены")
+    await _safe_callback_answer(callback, "Группы аккаунта обновлены")
     groups = await repository.list_account_group_views()
     await _edit_callback(
         callback,
@@ -5882,7 +6091,7 @@ async def check_all_account_sessions(
     account_service: AccountService,
 ) -> None:
     _, _, _, page = (callback.data or "").split(":")
-    await callback.answer("Начинаю проверку сессий…")
+    await _safe_callback_answer(callback, "Начинаю проверку сессий…")
     last_visible = -1
     progress_lock = asyncio.Lock()
 
@@ -5911,7 +6120,7 @@ async def check_all_account_sessions(
         logger.exception("Bulk session check failed")
         await _edit_callback(
             callback,
-            "<b>❌ Проверка сессий не завершилась</b>\n\n" + escape(operator_error_message(exc)),
+            "<b>× Проверка сессий не завершилась</b>\n\n" + escape(operator_error_message(exc)),
             account_bulk_check_menu([], page=int(page)),
             answer=False,
         )
@@ -5934,9 +6143,13 @@ async def check_all_accounts_spambot(
 ) -> None:
     _, _, _, page = (callback.data or "").split(":")
     if spambot_checks is None:
-        await callback.answer("Проверка @SpamBot сейчас недоступна", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Проверка @SpamBot сейчас недоступна",
+            show_alert=True,
+        )
         return
-    await callback.answer("Начинаю проверку @SpamBot…")
+    await _safe_callback_answer(callback, "Начинаю проверку @SpamBot…")
     last_visible = -1
     progress_lock = asyncio.Lock()
 
@@ -5965,7 +6178,7 @@ async def check_all_accounts_spambot(
         logger.exception("Bulk @SpamBot check failed")
         await _edit_callback(
             callback,
-            "<b>❌ Проверка @SpamBot не завершилась</b>\n\n" + escape(operator_error_message(exc)),
+            "<b>× Проверка @SpamBot не завершилась</b>\n\n" + escape(operator_error_message(exc)),
             account_bulk_spambot_menu(int(page)),
             answer=False,
         )
@@ -5979,29 +6192,103 @@ async def check_all_accounts_spambot(
 
 
 @router.callback_query(F.data.startswith("account:check:purge:ask:"))
-async def ask_purge_confirmed_invalid_sessions(callback: CallbackQuery) -> None:
+async def ask_purge_confirmed_invalid_sessions(
+    callback: CallbackQuery,
+    state: FSMContext,
+    account_service: AccountService,
+) -> None:
     _, _, _, _, page = (callback.data or "").split(":")
+    await _safe_callback_answer(callback, text="Проверяю кандидатов на удаление…")
+    await state.clear()
+    await _edit_callback(
+        callback, "<b>Проверяю сессии перед просмотром списка…</b>", None, answer=False
+    )
+    last_visible = -1
+
+    async def show_progress(completed: int, total: int) -> None:
+        nonlocal last_visible
+        if completed not in {0, total} and completed - last_visible < max(1, ceil(total / 10)):
+            return
+        last_visible = completed
+        try:
+            await _edit_callback(
+                callback,
+                account_bulk_check_progress_text(completed=completed, total=total),
+                None,
+                answer=False,
+            )
+        except TelegramAPIError:
+            logger.warning("Unable to render cleanup preview progress", exc_info=True)
+
+    try:
+        summary = await account_service.check_all_sessions(on_progress=show_progress)
+    except Exception as exc:  # noqa: BLE001 - leave a useful screen on connection failure
+        await _edit_callback(
+            callback,
+            "Проверка не завершилась: " + escape(operator_error_message(exc)),
+            account_bulk_cleanup_result_menu(int(page)),
+            answer=False,
+        )
+        return
+    candidates = {
+        str(entry.account_id): entry.session_fingerprint
+        for entry in summary.session_revoked
+        if entry.session_fingerprint is not None
+    }
+    token = uuid4().hex[:12]
+    await state.update_data(account_cleanup={"token": token, "candidates": candidates})
     await _edit_callback(
         callback,
-        "<b>🧹 Удалить все подтверждённо невалидные сессии?</b>\n\n"
-        "После подтверждения сервис заново проверит все сохранённые Telegram-сессии "
-        "без отправки сообщений. Удалены будут только те записи, для которых Telegram "
-        "сейчас прямо подтвердит потерю доступа.\n\n"
-        "Ошибки сети, прокси, flood, неизвестный статус и аккаунты с активными задачами "
-        "останутся без изменений.",
-        account_bulk_cleanup_confirmation(int(page)),
+        account_bulk_cleanup_preview_text(summary),
+        account_bulk_cleanup_confirmation(int(page), token=token, count=len(candidates)),
+        answer=False,
     )
 
 
 @router.callback_query(F.data.startswith("account:check:purge:confirm:"))
 async def confirm_purge_confirmed_invalid_sessions(
     callback: CallbackQuery,
+    state: FSMContext,
     account_service: AccountService,
     gateway: object | None = None,
 ) -> None:
-    _, _, _, _, page = (callback.data or "").split(":")
-    await callback.answer("Повторно проверяю и очищаю невалидные сессии…")
-    summary = await account_service.remove_confirmed_invalid_sessions()
+    parts = (callback.data or "").split(":")
+    page = int(parts[4])
+    token = parts[5] if len(parts) == 6 else None
+    data = (
+        await _consume_account_draft(state, ("account_cleanup",), cleanup_token=token)
+        if token
+        else {}
+    )
+    draft = data.get("account_cleanup") or {}
+    if token is None or draft.get("token") != token or not draft.get("candidates"):
+        await _safe_callback_answer(
+            callback,
+            text="Подтверждение устарело. Откройте список удаления заново.",
+            show_alert=True,
+        )
+        return
+    candidates = {int(key): value for key, value in draft["candidates"].items()}
+    await _safe_callback_answer(callback, "Повторно проверяю и очищаю невалидные сессии…")
+    await _edit_callback(
+        callback,
+        "<b>Перепроверяю подтверждённый список перед удалением…</b>",
+        None,
+        answer=False,
+    )
+    try:
+        summary = await account_service.remove_confirmed_invalid_sessions(
+            account_ids=list(candidates),
+            expected_session_fingerprints=candidates,
+        )
+    except Exception as exc:  # noqa: BLE001 - the consumed draft must not leave a spinner
+        await _edit_callback(
+            callback,
+            "Очистка не завершилась: " + escape(operator_error_message(exc)),
+            account_bulk_cleanup_result_menu(page),
+            answer=False,
+        )
+        return
     for result in summary.removed:
         await _close_account_client(result.account_id, gateway)
     await _edit_callback(
@@ -6020,23 +6307,25 @@ async def check_account(
     spambot_checks: SpamBotCheckService | None = None,
 ) -> None:
     _, _, account_id, page = (callback.data or "").split(":")
-    await callback.answer("Проверяю сессию…")
+    await _safe_callback_answer(callback, "Проверяю сессию…")
     try:
         result = await account_service.check_account(int(account_id))
-    except (NotFoundError, AccountImportError) as exc:
+    except (NotFoundError, AccountImportError, AccountProfileError, ConflictError) as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
         return
     if result.failure_code == "session_material_invalid":
-        verdict = "⚠️ Локальные данные сессии не удалось прочитать — Telegram не проверялся"
+        verdict = "! Локальные данные сессии не удалось прочитать — Telegram не проверялся"
+    elif result.failure_code in {"account_dead", "account_unauthorized"}:
+        verdict = "× Telegram подтвердил недействительную сессию — импортируйте аккаунт повторно"
     elif result.error:
         verdict = (
-            "⚠️ Сессия была активна, но текущая проверка связи не выполнена"
+            "! Сессия была активна, но текущая проверка связи не выполнена"
             if result.authorized
-            else "⚠️ Проверка сессии не завершена"
+            else "! Проверка сессии не завершена"
         )
     else:
-        verdict = "✅ Сессия активна" if result.authorized else "❌ Сессия недоступна"
+        verdict = "✓ Сессия активна" if result.authorized else "× Сессия недоступна"
     detail = ""
     if result.error:
         detail = f"\n<code>{escape(result.error)}</code>"
@@ -6048,21 +6337,21 @@ async def check_account(
         )
         if restriction is not None:
             restriction_text = {
-                SpamBotStatus.FREE: "✅ Ограничений @SpamBot нет",
-                SpamBotStatus.TEMPORARY_RESTRICTION: "⏳ @SpamBot: временное ограничение",
-                SpamBotStatus.ACTIVE_RESTRICTION: "⛔ @SpamBot: активное ограничение",
-                SpamBotStatus.PERMANENT_RESTRICTION: "⛔ @SpamBot: постоянное ограничение",
+                SpamBotStatus.FREE: "✓ Ограничений @SpamBot нет",
+                SpamBotStatus.TEMPORARY_RESTRICTION: "◷ @SpamBot: временное ограничение",
+                SpamBotStatus.ACTIVE_RESTRICTION: "× @SpamBot: активное ограничение",
+                SpamBotStatus.PERMANENT_RESTRICTION: "× @SpamBot: постоянное ограничение",
                 SpamBotStatus.RESTRICTION_UNCLEAR: (
-                    "⚠️ @SpamBot подтвердил ограничение, но его точный вид не распознан"
+                    "! @SpamBot подтвердил ограничение, но его точный вид не распознан"
                 ),
-                SpamBotStatus.UNKNOWN: "⚠️ Ответ @SpamBot не удалось однозначно распознать",
+                SpamBotStatus.UNKNOWN: "! Ответ @SpamBot не удалось однозначно распознать",
             }[restriction.status]
             detail += f"\n<b>{restriction_text}</b>"
         else:
             checked_account = await account_service.get_account(int(account_id))
             if checked_account.spambot_status == "error":
                 detail += (
-                    "\n⚠️ <b>@SpamBot не ответил:</b> статус ограничения сохранён "
+                    "\n! <b>@SpamBot не ответил:</b> статус ограничения сохранён "
                     "без изменений. Попробуйте проверку позже."
                 )
     await _show_account_details(
@@ -6145,7 +6434,7 @@ def _bulk_avatar_confirmation_text(
     file_name: str,
 ) -> str:
     return (
-        "<b>🖼 Установить один аватар?</b>\n\n"
+        "<b>Установить один аватар?</b>\n\n"
         f"Область: <b>{escape(scope_label)}</b>\n"
         f"Аккаунтов: <b>{account_count}</b>\n"
         f"Файл: <code>{escape(file_name)}</code>\n\n"
@@ -6161,7 +6450,7 @@ def _bulk_avatar_result_text(
     updated_count: int,
     failures: list[tuple[str, str]],
 ) -> str:
-    state = "✅ Аватары обновлены" if not failures else "🟡 Аватары обновлены с ошибками"
+    state = "✓ Аватары обновлены" if not failures else "Аватары обновлены с ошибками"
     lines = [
         f"<b>{state}</b>",
         f"Область: <b>{escape(scope_label)}</b>",
@@ -6186,7 +6475,8 @@ async def _show_bulk_account_avatar_scope(
 ) -> None:
     accounts = await _ready_profile_accounts(repository)
     if not accounts:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Нет активных аккаунтов с подтверждённой Telegram-сессией",
             show_alert=True,
         )
@@ -6229,16 +6519,18 @@ async def choose_bulk_account_avatar_scope(
     try:
         accounts, scope_label = await _profile_scope_accounts(repository, scope)
     except (ValueError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not accounts:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "В выбранной области нет аккаунтов с подтверждённой сессией",
             show_alert=True,
         )
         return
     if len(accounts) > 200:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "За одну операцию поддерживается не более 200 аккаунтов. Разделите их на группы.",
             show_alert=True,
         )
@@ -6257,7 +6549,7 @@ async def choose_bulk_account_avatar_scope(
     await _edit_callback(
         callback,
         wizard_text(
-            "🖼 Общий аватар Telegram",
+            "Общий аватар Telegram",
             1,
             2,
             (
@@ -6278,7 +6570,8 @@ async def show_bulk_account_names(
 ) -> None:
     accounts = await _ready_profile_accounts(repository)
     if not accounts:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Нет активных аккаунтов с подтверждённой Telegram-сессией",
             show_alert=True,
         )
@@ -6312,16 +6605,18 @@ async def choose_bulk_account_name_scope(
     try:
         accounts, scope_label = await _profile_scope_accounts(repository, scope)
     except (ValueError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not accounts:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "В выбранной области нет аккаунтов с подтверждённой сессией",
             show_alert=True,
         )
         return
     if len(accounts) > 200:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "За одну операцию поддерживается не более 200 аккаунтов. Разделите их на группы.",
             show_alert=True,
         )
@@ -6351,10 +6646,14 @@ async def show_single_account_name_catalog(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not _profile_name_account_ready(account):
-        await callback.answer("У аккаунта нет готовой Telegram-сессии", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "У аккаунта нет готовой Telegram-сессии",
+            show_alert=True,
+        )
         return
     await state.clear()
     await _edit_callback(
@@ -6373,7 +6672,7 @@ async def preview_generated_account_names(
 ) -> None:
     _, _, _, locale, account_id, page = (callback.data or "").split(":")
     if locale not in {"mixed", "ru", "en"}:
-        await callback.answer("Неизвестный каталог имён", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный каталог имён", show_alert=True)
         return
     selected_account_id = int(account_id)
     data = await state.get_data()
@@ -6383,7 +6682,7 @@ async def preview_generated_account_names(
         try:
             account = await account_service.get_account(selected_account_id)
         except NotFoundError as exc:
-            await callback.answer(callback_error_message(exc), show_alert=True)
+            await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
             return
         candidates = [account] if _profile_name_account_ready(account) else []
     else:
@@ -6403,16 +6702,22 @@ async def preview_generated_account_names(
             raw_scope_label = data.get("profile_name_scope_label")
             scope_label = str(raw_scope_label) if raw_scope_label else "Выбранная область"
         else:
-            await callback.answer(
+            await _safe_callback_answer(
+                callback,
                 "Выбор аккаунтов устарел — выберите область заново",
                 show_alert=True,
             )
             return
     if not candidates:
-        await callback.answer("Нет аккаунтов, готовых к изменению профиля", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Нет аккаунтов, готовых к изменению профиля",
+            show_alert=True,
+        )
         return
     if len(candidates) > 200:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "За одну операцию поддерживается не более 200 активных аккаунтов",
             show_alert=True,
         )
@@ -6422,7 +6727,8 @@ async def preview_generated_account_names(
     name_locale: NameLocale = locale
     available_count = available_profile_name_capacity(name_locale, used_names=used_names)
     if available_count < len(candidates):
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "В выбранном каталоге осталось только "
             f"{available_count} свободных имён для {len(candidates)} аккаунтов. "
             "Выберите смешанный каталог или меняйте имена по одному.",
@@ -6437,7 +6743,8 @@ async def preview_generated_account_names(
         )
     except ValueError:
         # A concurrent name update may consume a catalogue entry after the pre-check.
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Не удалось подобрать свободные имена. Обновите список и попробуйте снова.",
             show_alert=True,
         )
@@ -6481,6 +6788,43 @@ async def preview_generated_account_names(
     )
 
 
+_account_draft_locks: weakref.WeakValueDictionary[object, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+async def _consume_account_draft(
+    state: FSMContext,
+    required: tuple[str, ...],
+    *,
+    account_id: int | None = None,
+    cleanup_token: str | None = None,
+    expected_state: str | None = None,
+) -> dict[str, object]:
+    key = getattr(state, "key", id(state))
+    lock = _account_draft_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        data = await state.get_data()
+        if expected_state is not None and await state.get_state() != expected_state:
+            return {}
+        if any(not data.get(name) for name in required):
+            return {}
+        if account_id is not None and int(data.get("profile_account_id", 0)) != account_id:
+            return {}
+        if cleanup_token is not None:
+            draft = data.get("account_cleanup")
+            if (
+                not isinstance(draft, dict)
+                or draft.get("token") != cleanup_token
+                or not draft.get("candidates")
+            ):
+                return {}
+            await state.update_data(account_cleanup=None)
+        else:
+            await state.clear()
+        return data
+
+
 @router.callback_query(AccountBulkNameState.confirm, F.data == "account:names:apply")
 async def apply_generated_account_names(
     callback: CallbackQuery,
@@ -6489,12 +6833,16 @@ async def apply_generated_account_names(
     account_service: AccountService,
     proxy_service: ProxyService,
 ) -> None:
-    data = await state.get_data()
+    data = await _consume_account_draft(state, ("profile_name_assignments",))
     raw_assignments = [
         dict(item) for item in data.get("profile_name_assignments", []) if isinstance(item, dict)
     ]
     if not raw_assignments:
-        await callback.answer("Превью устарело — сформируйте имена заново", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Превью устарело — сформируйте имена заново",
+            show_alert=True,
+        )
         return
     assignments = {
         int(item["account_id"]): ProfileName(
@@ -6506,10 +6854,10 @@ async def apply_generated_account_names(
         for item in raw_assignments
     }
     labels = {int(item["account_id"]): str(item["label"]) for item in raw_assignments}
-    await callback.answer("Применяю имена через Telegram…")
+    await _safe_callback_answer(callback, "Применяю имена через Telegram…")
     if isinstance(callback.message, Message):
         await callback.message.edit_text(
-            "<b>⏳ Обновляю профили Telegram</b>\n\n"
+            "<b>Обновляю профили Telegram</b>\n\n"
             f"Аккаунтов: <b>{len(assignments)}</b>. Сбой одного аккаунта не остановит остальные.",
             reply_markup=None,
         )
@@ -6522,9 +6870,12 @@ async def apply_generated_account_names(
         updated_count=len(result.updated),
         failures=failures,
     )
+    if await state.get_data() or await state.get_state():
+        if isinstance(callback.message, Message):
+            await callback.message.answer(result_text)
+        return
     selected_account_id = int(data.get("profile_name_account_id") or 0)
     page_number = int(data.get("profile_name_page") or 0)
-    await state.clear()
     if selected_account_id:
         await _show_account_details(
             callback,
@@ -6554,10 +6905,10 @@ async def begin_account_name_edit(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if account.session_source.value == "none":
-        await callback.answer("У аккаунта нет Telegram-сессии", show_alert=True)
+        await _safe_callback_answer(callback, "У аккаунта нет Telegram-сессии", show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -6567,7 +6918,7 @@ async def begin_account_name_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "✏️ Имя Telegram",
+            "Имя Telegram",
             1,
             2,
             f"Текущее имя: <b>{current}</b>\n\nВведите новое имя Telegram.",
@@ -6586,7 +6937,7 @@ async def begin_account_label_edit(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -6595,7 +6946,7 @@ async def begin_account_label_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "🏷 Название в боте",
+            "Название в панели",
             1,
             1,
             f"Сейчас: <b>{escape(account.label)}</b>\n\n"
@@ -6624,7 +6975,7 @@ async def save_account_label(
             label=message.text or "",
         )
     except (NotFoundError, ConflictError, AccountImportError) as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
     proxy_slot, shared_proxy_accounts, proxy_view = await _account_proxy_summary(
         proxy_service, account_id
@@ -6633,7 +6984,7 @@ async def save_account_label(
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>Название в боте обновлено. Профиль Telegram не менялся.</b>\n\n"
+        "✓ <b>Название в панели обновлено. Профиль Telegram не менялся.</b>\n\n"
         + account_details_text(
             account,
             proxy_slot=proxy_slot,
@@ -6663,7 +7014,7 @@ async def account_profile_first_name(message: Message, state: FSMContext, bot: B
         bot,
         state,
         wizard_text(
-            "✏️ Имя Telegram",
+            "Имя Telegram",
             2,
             2,
             "Введите фамилию или отправьте <code>-</code>, чтобы оставить поле пустым.",
@@ -6702,29 +7053,34 @@ async def confirm_account_name_edit(
     proxy_service: ProxyService,
 ) -> None:
     _, _, _, account_id, page = (callback.data or "").split(":")
-    data = await state.get_data()
+    data = await _consume_account_draft(
+        state, ("profile_account_id", "profile_first_name"), account_id=int(account_id)
+    )
     if int(data.get("profile_account_id", 0)) != int(account_id):
-        await callback.answer("Карточка аккаунта устарела", show_alert=True)
+        await _safe_callback_answer(callback, "Карточка аккаунта устарела", show_alert=True)
         return
-    await callback.answer("Меняю имя в Telegram…")
+    await _safe_callback_answer(callback, "Меняю имя в Telegram…")
     try:
         await account_service.update_profile_name(
             int(account_id),
             first_name=str(data["profile_first_name"]),
             last_name=str(data.get("profile_last_name") or ""),
         )
-    except (NotFoundError, AccountImportError, AccountProfileError) as exc:
+    except (NotFoundError, AccountImportError, AccountProfileError, ConflictError) as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
         return
-    await state.clear()
+    if await state.get_data() or await state.get_state():
+        if isinstance(callback.message, Message):
+            await callback.message.answer("✓ Имя Telegram обновлено.")
+        return
     await _show_account_details(
         callback,
         account_service,
         proxy_service,
         int(account_id),
         int(page),
-        banner="✅ <b>Имя Telegram обновлено.</b>\n\n",
+        banner="✓ <b>Имя Telegram обновлено.</b>\n\n",
     )
 
 
@@ -6738,20 +7094,24 @@ async def begin_account_about_edit(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not _profile_name_account_ready(account):
-        await callback.answer("У аккаунта нет готовой Telegram-сессии", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "У аккаунта нет готовой Telegram-сессии",
+            show_alert=True,
+        )
         return
     await state.clear()
     await _remember_origin(callback, state)
     await state.update_data(profile_account_id=int(account_id), profile_page=int(page))
     await state.set_state(AccountAboutEditState.text)
-    current = escape(account.about or "не задано")
+    current = escape("не проверено" if account.about is None else account.about or "не задано")
     await _edit_callback(
         callback,
         wizard_text(
-            "📝 Описание Telegram",
+            "Описание Telegram",
             1,
             1,
             f"Текущее описание: <code>{current}</code>\n\n"
@@ -6777,7 +7137,7 @@ async def account_profile_about(message: Message, state: FSMContext, bot: Bot) -
     await _edit_origin(
         bot,
         state,
-        f"<b>📝 Новое описание</b>\n\n<code>{preview}</code>\n\nСохранить в Telegram?",
+        f"<b>Новое описание</b>\n\n<code>{preview}</code>\n\nСохранить в Telegram?",
         account_about_confirmation(int(data["profile_account_id"]), int(data["profile_page"])),
     )
 
@@ -6793,27 +7153,30 @@ async def confirm_account_about_edit(
     proxy_service: ProxyService,
 ) -> None:
     _, _, _, account_id, page = (callback.data or "").split(":")
-    data = await state.get_data()
+    data = await _consume_account_draft(state, ("profile_account_id",), account_id=int(account_id))
     if int(data.get("profile_account_id", 0)) != int(account_id):
-        await callback.answer("Карточка аккаунта устарела", show_alert=True)
+        await _safe_callback_answer(callback, "Карточка аккаунта устарела", show_alert=True)
         return
-    await callback.answer("Сохраняю описание в Telegram…")
+    await _safe_callback_answer(callback, "Сохраняю описание в Telegram…")
     try:
         await account_service.update_profile_about(
             int(account_id), about=str(data["profile_about"])
         )
-    except (NotFoundError, AccountImportError, AccountProfileError) as exc:
+    except (NotFoundError, AccountImportError, AccountProfileError, ConflictError) as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
         return
-    await state.clear()
+    if await state.get_data() or await state.get_state():
+        if isinstance(callback.message, Message):
+            await callback.message.answer("✓ Описание Telegram обновлено.")
+        return
     await _show_account_details(
         callback,
         account_service,
         proxy_service,
         int(account_id),
         int(page),
-        banner="✅ <b>Описание Telegram обновлено.</b>\n\n",
+        banner="✓ <b>Описание Telegram обновлено.</b>\n\n",
     )
 
 
@@ -6825,7 +7188,8 @@ async def show_bulk_account_about(
 ) -> None:
     accounts = await _ready_profile_accounts(repository)
     if not accounts:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Нет активных аккаунтов с подтверждённой Telegram-сессией",
             show_alert=True,
         )
@@ -6859,16 +7223,18 @@ async def choose_bulk_account_about_scope(
     try:
         accounts, scope_label = await _profile_scope_accounts(repository, scope)
     except (ValueError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not accounts:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "В выбранной области нет аккаунтов с подтверждённой сессией",
             show_alert=True,
         )
         return
     if len(accounts) > 200:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "За одну операцию поддерживается не более 200 аккаунтов. Разделите их на группы.",
             show_alert=True,
         )
@@ -6880,7 +7246,7 @@ async def choose_bulk_account_about_scope(
     )
     await _edit_callback(
         callback,
-        "<b>📝 Описания профилей</b>\n\n"
+        "<b>Описания профилей</b>\n\n"
         f"Область: <b>{escape(scope_label)}</b> · аккаунтов: <b>{len(accounts)}</b>\n\n"
         "Можно поставить один текст этой области или очистить описания. У каждого "
         "аккаунта также есть отдельная кнопка «Описание».",
@@ -6900,7 +7266,7 @@ async def begin_bulk_account_about(callback: CallbackQuery, state: FSMContext) -
     await _edit_callback(
         callback,
         wizard_text(
-            "📝 Описание для области",
+            "Описание для области",
             1,
             1,
             f"Область: <b>{escape(scope_label)}</b>\n\n"
@@ -6929,7 +7295,7 @@ async def receive_bulk_account_about(message: Message, state: FSMContext, bot: B
     await _edit_origin(
         bot,
         state,
-        "<b>📝 Установить это описание?</b>\n\n"
+        "<b>Установить это описание?</b>\n\n"
         + (f"Область: <b>{escape(scope_label)}</b>\n\n" if scope_label else "")
         + f"<code>{escape(about)}</code>",
         account_about_bulk_confirmation(scope_label=scope_label),
@@ -6948,12 +7314,20 @@ async def _apply_bulk_account_about(
     accounts = await _ready_profile_accounts(repository)
     accounts = [account for account in accounts if int(account.id) in scope_ids]
     if not accounts:
-        await callback.answer("Нет аккаунтов с готовой Telegram-сессией", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Нет аккаунтов с готовой Telegram-сессией",
+            show_alert=True,
+        )
         return
     if len(accounts) > 200:
-        await callback.answer("За один раз можно изменить не более 200 аккаунтов", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "За один раз можно изменить не более 200 аккаунтов",
+            show_alert=True,
+        )
         return
-    await callback.answer("Обновляю описания через Telegram…")
+    await _safe_callback_answer(callback, "Обновляю описания через Telegram…")
     result = await account_service.bulk_update_profile_about(
         [int(account.id) for account in accounts], about=about
     )
@@ -6962,7 +7336,7 @@ async def _apply_bulk_account_about(
     )
     await _edit_callback(
         callback,
-        f"<b>✅ Описания обработаны</b>\n\n"
+        f"<b>Описания обработаны</b>\n\n"
         f"Обновлено: <b>{len(result.updated)}</b>\n"
         f"Не удалось: <b>{len(result.failures)}</b>"
         + (f"\nОбласть: <b>{escape(scope_label)}</b>" if scope_label else "")
@@ -6979,10 +7353,10 @@ async def confirm_bulk_account_about(
     repository: AdminRepository,
     account_service: AccountService,
 ) -> None:
-    data = await state.get_data()
+    data = await _consume_account_draft(state, ("profile_about_bulk", "profile_about_scope_ids"))
     about = str(data.get("profile_about_bulk") or "")
     if not about:
-        await callback.answer("Введите описание заново", show_alert=True)
+        await _safe_callback_answer(callback, "Введите описание заново", show_alert=True)
         return
     raw_scope_ids = data.get("profile_about_scope_ids")
     scope_ids = (
@@ -6995,13 +7369,13 @@ async def confirm_bulk_account_about(
         else set()
     )
     if not scope_ids:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Выбор аккаунтов устарел — выберите область заново",
             show_alert=True,
         )
         return
     scope_label = str(data.get("profile_about_scope_label") or "") or None
-    await state.clear()
     await _apply_bulk_account_about(
         callback,
         about=about,
@@ -7017,7 +7391,8 @@ async def ask_clear_bulk_account_about(callback: CallbackQuery, state: FSMContex
     data = await state.get_data()
     raw_scope_ids = data.get("profile_about_scope_ids")
     if not isinstance(raw_scope_ids, list) or not raw_scope_ids:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Выбор аккаунтов устарел — выберите область заново",
             show_alert=True,
         )
@@ -7025,7 +7400,7 @@ async def ask_clear_bulk_account_about(callback: CallbackQuery, state: FSMContex
     scope_label = str(data.get("profile_about_scope_label") or "") or None
     await _edit_callback(
         callback,
-        "<b>🧹 Очистить описания?</b>\n\n"
+        "<b>Очистить описания?</b>\n\n"
         + (f"Область: <b>{escape(scope_label)}</b>\n\n" if scope_label else "")
         + "Описание будет удалено только у аккаунтов выбранной области с готовой Telegram-сессией.",
         account_about_bulk_confirmation(clear=True, scope_label=scope_label),
@@ -7039,7 +7414,7 @@ async def confirm_clear_bulk_account_about(
     repository: AdminRepository,
     account_service: AccountService,
 ) -> None:
-    data = await state.get_data()
+    data = await _consume_account_draft(state, ("profile_about_scope_ids",))
     raw_scope_ids = data.get("profile_about_scope_ids")
     scope_ids = (
         {
@@ -7051,13 +7426,13 @@ async def confirm_clear_bulk_account_about(
         else set()
     )
     if not scope_ids:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Выбор аккаунтов устарел — выберите область заново",
             show_alert=True,
         )
         return
     scope_label = str(data.get("profile_about_scope_label") or "") or None
-    await state.clear()
     await _apply_bulk_account_about(
         callback,
         about="",
@@ -7078,7 +7453,7 @@ async def receive_bulk_account_avatar(
     try:
         photo_bytes, file_name = await _download_profile_photo(message, bot)
     except AccountProfileError as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
 
     data = await state.get_data()
@@ -7086,7 +7461,7 @@ async def receive_bulk_account_avatar(
     if not account_ids:
         await state.clear()
         await message.answer(
-            "❌ Выбор аккаунтов устарел. Откройте массовую установку аватара заново."
+            "× Выбор аккаунтов устарел. Откройте массовую установку аватара заново."
         )
         return
     try:
@@ -7098,7 +7473,7 @@ async def receive_bulk_account_avatar(
         )
     except (AccountProfileError, OSError):
         await message.answer(
-            "❌ Не удалось безопасно сохранить фото для подтверждения. Попробуйте ещё раз."
+            "× Не удалось безопасно сохранить фото для подтверждения. Попробуйте ещё раз."
         )
         return
 
@@ -7129,7 +7504,9 @@ async def apply_bulk_account_avatar(
     settings: Settings,
     account_service: AccountService,
 ) -> None:
-    data = await state.get_data()
+    data = await _consume_account_draft(
+        state, ("profile_avatar_draft_path", "profile_avatar_scope_ids")
+    )
     account_ids = _frozen_bulk_avatar_ids(data)
     scope_label = str(data.get("profile_avatar_scope_label") or "Выбранная область")
     raw_labels = data.get("profile_avatar_labels")
@@ -7141,7 +7518,8 @@ async def apply_bulk_account_avatar(
     file_name = str(data.get("profile_avatar_file_name") or "avatar.jpg")
     draft_path = data.get("profile_avatar_draft_path")
     if not account_ids or not isinstance(draft_path, str):
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Подтверждение устарело — выберите аккаунты и фото заново",
             show_alert=True,
         )
@@ -7150,18 +7528,17 @@ async def apply_bulk_account_avatar(
         photo_bytes = await asyncio.to_thread(_read_bulk_avatar_draft, settings, draft_path)
     except (AccountProfileError, OSError) as exc:
         await asyncio.to_thread(_delete_bulk_avatar_draft, settings, draft_path)
-        await state.clear()
         await _edit_callback(
             callback,
-            f"❌ {escape(operator_error_message(exc))}",
+            f"× {escape(operator_error_message(exc))}",
             account_bulk_avatar_result_menu(),
         )
         return
 
-    await callback.answer("Устанавливаю аватар в Telegram…")
+    await _safe_callback_answer(callback, "Устанавливаю аватар в Telegram…")
     if isinstance(callback.message, Message):
         await callback.message.edit_text(
-            "<b>⏳ Устанавливаю общий аватар Telegram</b>\n\n"
+            "<b>Устанавливаю общий аватар Telegram</b>\n\n"
             f"Аккаунтов: <b>{len(account_ids)}</b>. Сбой одного аккаунта не остановит остальные.",
             reply_markup=None,
         )
@@ -7172,10 +7549,9 @@ async def apply_bulk_account_avatar(
             file_name=file_name,
         )
     except AccountProfileError as exc:
-        await state.clear()
         await _edit_callback(
             callback,
-            f"❌ {escape(operator_error_message(exc))}",
+            f"× {escape(operator_error_message(exc))}",
             account_bulk_avatar_result_menu(),
             answer=False,
         )
@@ -7187,7 +7563,17 @@ async def apply_bulk_account_avatar(
         (labels.get(failure.account_id, f"аккаунт #{failure.account_id}"), failure.error)
         for failure in result.failures
     ]
-    await state.clear()
+    if await state.get_data() or await state.get_state():
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                _bulk_avatar_result_text(
+                    scope_label=scope_label,
+                    requested_count=len(account_ids),
+                    updated_count=len(result.updated),
+                    failures=failures,
+                )
+            )
+        return
     await _edit_callback(
         callback,
         _bulk_avatar_result_text(
@@ -7231,7 +7617,7 @@ async def show_account_avatar_menu(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -7254,10 +7640,10 @@ async def begin_account_avatar_upload(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if account.session_source.value == "none":
-        await callback.answer("У аккаунта нет Telegram-сессии", show_alert=True)
+        await _safe_callback_answer(callback, "У аккаунта нет Telegram-сессии", show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -7266,7 +7652,7 @@ async def begin_account_avatar_upload(
     await _edit_callback(
         callback,
         wizard_text(
-            "🖼 Новый аватар Telegram",
+            "Новый аватар Telegram",
             1,
             1,
             "Отправьте фотографию или файл <b>JPG/PNG</b> до <b>10 МБ</b>. "
@@ -7284,12 +7670,25 @@ async def account_avatar_photo(
     account_service: AccountService,
     proxy_service: ProxyService,
 ) -> None:
+    initial_data = await state.get_data()
+    initial_account_id = int(initial_data.get("profile_account_id") or 0)
+    if not initial_account_id:
+        await message.answer("Выбор аккаунта устарел — откройте загрузку аватара заново")
+        return
     try:
         photo_bytes, file_name = await _download_profile_photo(message, bot)
     except AccountProfileError as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
-    data = await state.get_data()
+    data = await _consume_account_draft(
+        state,
+        ("profile_account_id",),
+        account_id=initial_account_id,
+        expected_state=AccountAvatarEditState.photo.state,
+    )
+    if not data:
+        await message.answer("Загрузка отменена: выбор аккаунта изменился")
+        return
     account_id = int(data["profile_account_id"])
     try:
         account = await account_service.update_profile_photo(
@@ -7297,17 +7696,19 @@ async def account_avatar_photo(
             photo_bytes=photo_bytes,
             file_name=file_name,
         )
-    except (NotFoundError, AccountImportError, AccountProfileError) as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+    except (NotFoundError, AccountImportError, AccountProfileError, ConflictError) as exc:
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
     proxy_slot, shared_proxy_accounts, proxy_view = await _account_proxy_summary(
         proxy_service, account_id
     )
-    await state.clear()
+    if await state.get_data() or await state.get_state():
+        await message.answer("✓ Аватар Telegram обновлён.")
+        return
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>Аватар Telegram обновлён.</b>\n\n"
+        "✓ <b>Аватар Telegram обновлён.</b>\n\n"
         + account_details_text(
             account,
             proxy_slot=proxy_slot,
@@ -7333,11 +7734,11 @@ async def ask_delete_account_avatars(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить все аватары «{escape(account.label)}»?</b>\n\n"
+        f"<b>Удалить все аватары «{escape(account.label)}»?</b>\n\n"
         "Telegram удалит текущую фотографию и всю историю предыдущих аватаров. "
         "Действие необратимо.",
         account_avatar_delete_confirmation(account.id, int(page)),
@@ -7351,12 +7752,12 @@ async def confirm_delete_account_avatars(
     proxy_service: ProxyService,
 ) -> None:
     _, _, _, _, account_id, page = (callback.data or "").split(":")
-    await callback.answer("Удаляю аватары в Telegram…")
+    await _safe_callback_answer(callback, "Удаляю аватары в Telegram…")
     try:
         _, deleted = await account_service.delete_profile_photos(int(account_id))
-    except (NotFoundError, AccountImportError, AccountProfileError) as exc:
+    except (NotFoundError, AccountImportError, AccountProfileError, ConflictError) as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
         return
     await _show_account_details(
         callback,
@@ -7364,7 +7765,7 @@ async def confirm_delete_account_avatars(
         proxy_service,
         int(account_id),
         int(page),
-        banner=f"✅ <b>Удалено аватаров: {deleted}.</b>\n\n",
+        banner=f"✓ <b>Удалено аватаров: {deleted}.</b>\n\n",
     )
 
 
@@ -7379,7 +7780,8 @@ async def account_bind_proxy(
     try:
         account = await account_service.get_account(int(account_id))
         if account.session_source.value == "none":
-            await callback.answer(
+            await _safe_callback_answer(
+                callback,
                 "У аккаунта нет Telegram-сессии — сначала импортируйте её",
                 show_alert=True,
             )
@@ -7391,9 +7793,9 @@ async def account_bind_proxy(
         )
         await _close_account_client(int(account_id), gateway)
     except (NotFoundError, ConflictError, ProxyInputError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Назначен рабочий прокси с наименьшей текущей нагрузкой")
+    await _safe_callback_answer(callback, "Назначен рабочий прокси с наименьшей текущей нагрузкой")
     await _show_account_details(
         callback, account_service, proxy_service, int(account_id), int(page)
     )
@@ -7409,10 +7811,10 @@ async def account_release_proxy(
     _, _, _, account_id, page = (callback.data or "").split(":")
     released = await proxy_service.release_assignment_key(f"account:{account_id}")
     if not released:
-        await callback.answer("У аккаунта нет назначенного прокси", show_alert=True)
+        await _safe_callback_answer(callback, "У аккаунта нет назначенного прокси", show_alert=True)
         return
     await _close_account_client(int(account_id), gateway)
-    await callback.answer("Прокси освобождён")
+    await _safe_callback_answer(callback, "Прокси освобождён")
     await _show_account_details(
         callback, account_service, proxy_service, int(account_id), int(page)
     )
@@ -7428,15 +7830,15 @@ async def account_rotate_proxy(
     _, _, _, account_id, page = (callback.data or "").split(":")
     item = await proxy_service.proxy_for_assignment(f"account:{account_id}")
     if item is None:
-        await callback.answer("У аккаунта нет назначенного прокси", show_alert=True)
+        await _safe_callback_answer(callback, "У аккаунта нет назначенного прокси", show_alert=True)
         return
-    await callback.answer("Отправляю запрос ротации…")
+    await _safe_callback_answer(callback, "Отправляю запрос ротации…")
     try:
         await _close_rotated_account_client(item, gateway)
         await proxy_service.rotate_proxy(item.proxy.id)
     except (NotFoundError, ConflictError) as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
         return
     await _show_account_details(
         callback,
@@ -7445,7 +7847,7 @@ async def account_rotate_proxy(
         int(account_id),
         int(page),
         banner=(
-            "✅ <b>Ротация подтверждена. Прокси проверен, все аккаунты на нём "
+            "✓ <b>Ротация подтверждена. Прокси проверен, все аккаунты на нём "
             "переподключатся через новый маршрут.</b>\n\n"
         ),
     )
@@ -7460,7 +7862,7 @@ async def ask_delete_account(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     plan = await account_service.account_removal_plan(account.id)
     if not plan.can_remove:
@@ -7478,7 +7880,7 @@ async def ask_delete_account(
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Убрать аккаунт «{escape(account.label)}»?</b>\n\n"
+        f"<b>Убрать аккаунт «{escape(account.label)}»?</b>\n\n"
         "Сначала сервис безопасно проверит связи. Если аккаунт нигде не нужен, запись, "
         "сессия и прокси удалятся полностью. Если его сохраняют сценарии или история, "
         "будут стёрты только Telegram‑доступ и прокси, а отключённая карточка останется "
@@ -7496,7 +7898,7 @@ async def ask_clear_account_session(
     try:
         account = await account_service.get_account(int(account_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     plan = await account_service.account_removal_plan(account.id)
     if not plan.can_remove:
@@ -7513,7 +7915,7 @@ async def ask_clear_account_session(
         return
     await _edit_callback(
         callback,
-        f"<b>🔐 Стереть доступ «{escape(account.label)}»?</b>\n\n"
+        f"<b>Стереть доступ «{escape(account.label)}»?</b>\n\n"
         "Зашифрованная Telegram-сессия, API-данные и назначение прокси будут удалены. "
         "Историческая запись останется отключённой для журнала. Действие необратимо.",
         account_session_clear_confirmation(account.id, int(page)),
@@ -7531,17 +7933,17 @@ async def confirm_clear_account_session(
     try:
         await account_service.clear_session(int(account_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _close_account_client(int(account_id), gateway)
-    await callback.answer("Сессия и доступ стёрты")
+    await _safe_callback_answer(callback, "Сессия и доступ стёрты")
     await _show_account_details(
         callback,
         account_service,
         proxy_service,
         int(account_id),
         int(page),
-        banner="✅ <b>Доступ удалён; запись оставлена только для истории.</b>\n\n",
+        banner="✓ <b>Доступ удалён; запись оставлена только для истории.</b>\n\n",
     )
 
 
@@ -7556,10 +7958,11 @@ async def confirm_delete_account(
     try:
         result = await account_service.remove_account_safely(int(account_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _close_account_client(int(account_id), gateway)
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         "Telegram-доступ стёрт; запись сохранена для истории"
         if result.preserved_for_history
         else "Аккаунт удалён полностью"
@@ -7582,19 +7985,19 @@ async def begin_account_import(
 ) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) not in {3, 4} or parts[:2] != ["account", "import"]:
-        await callback.answer("Неизвестный тип импорта", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный тип импорта", show_alert=True)
         return
     kind = parts[2]
     try:
         source_page = max(0, int(parts[3])) if len(parts) == 4 else 0
     except ValueError:
-        await callback.answer("Не удалось открыть импорт", show_alert=True)
+        await _safe_callback_answer(callback, "Не удалось открыть импорт", show_alert=True)
         return
     if kind == "menu":
-        await callback.answer()
+        await _safe_callback_answer(callback)
         await _edit_callback(
             callback,
-            "<b>📥 Импорт аккаунта</b>\n\n"
+            "<b>Импорт аккаунта</b>\n\n"
             "Выберите, что у вас есть. Бот сам распознает формат файла .session; "
             "исходные сессии и строки после обработки удаляются из чата.",
             account_import_sources_menu(source_page),
@@ -7602,22 +8005,23 @@ async def begin_account_import(
         )
         return
     if kind not in {"archive", "tdata", "session", "telethon", "pyrogram", "json", "string"}:
-        await callback.answer("Неизвестный тип импорта", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный тип импорта", show_alert=True)
         return
     if settings.telegram_api is None:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Сначала задайте PROXIMA_TELEGRAM_API_ID и PROXIMA_TELEGRAM_API_HASH. "
             "Они нужны для отдельной безопасной сессии сервиса.",
             show_alert=True,
         )
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(import_kind=kind, account_import_page=source_page)
     await state.set_state(AccountImportState.payload)
     prompts = {
         "archive": (
-            "📦 Пакетный импорт аккаунтов",
+            "Пакетный импорт аккаунтов",
             "Прикрепите <code>.zip</code> с файлами <code>.session</code> Telethon или "
             "Pyrogram. Парный <code>.json</code> с тем же именем будет использован как "
             "резервный источник и для пароля 2FA, если он указан в экспорте.\n\n"
@@ -7626,10 +8030,10 @@ async def begin_account_import(
             "Аккаунты обрабатываются по одному. Для каждого берётся любой исправный прокси "
             "из существующего пула; один прокси может использоваться несколькими аккаунтами. "
             "Ошибка одного файла не остановит остальные.\n\n"
-            "🧹 После обработки архив будет удалён из чата.",
+            "После обработки архив будет удалён из чата.",
         ),
         "tdata": (
-            "📥 Импорт tdata",
+            "Импорт tdata",
             "Прикрепите <code>.zip</code>-архив папки <code>tdata</code> из Telegram Desktop.\n\n"
             "Внутри должен быть файл <code>key_datas</code> и папка аккаунта. "
             "Лимит: <b>25 МБ</b>.\n\n"
@@ -7640,33 +8044,33 @@ async def begin_account_import(
             "сохраняться не будет.",
         ),
         "session": (
-            "🗂 Импорт .session",
+            "Импорт .session",
             "Прикрепите <code>.session</code> Telethon или Pyrogram. Формат определится "
             "автоматически. Если скачанный файл нигде не запущен — ничего закрывать не нужно.\n\n"
-            "🧹 После обработки файл будет удалён из чата.",
+            "После обработки файл будет удалён из чата.",
         ),
         "telethon": (
-            "🗂 Импорт .session Telethon",
+            "Импорт .session Telethon",
             "Прикрепите файл Telethon <code>.session</code>. Если вы только скачали его и "
             "нигде не запускали — ничего закрывать не нужно. Закройте другой клиент только "
             "если он прямо сейчас использует эту же сессию.\n\n"
-            "🧹 После обработки файл будет удалён из чата.",
+            "После обработки файл будет удалён из чата.",
         ),
         "pyrogram": (
-            "🗂 Импорт .session Pyrogram",
+            "Импорт .session Pyrogram",
             "Прикрепите файл Pyrogram <code>.session</code>. Бот распознает его структуру "
             "автоматически. Если файл нигде не запущен — ничего закрывать не нужно.\n\n"
-            "🧹 После обработки файл будет удалён из чата.",
+            "После обработки файл будет удалён из чата.",
         ),
         "json": (
-            "📄 Импорт .json",
+            "Импорт .json",
             "Прикрепите <code>.json</code> с session string либо с полями "
             "<code>dc_id</code> и <code>auth_key</code>. Если продавец выдаёт JSON только с "
             "телефоном и данными профиля, авторизоваться по нему нельзя — бот сообщит об этом.\n\n"
-            "🧹 После обработки файл будет удалён из чата.",
+            "После обработки файл будет удалён из чата.",
         ),
         "string": (
-            "🔑 Импорт строки сессии",
+            "Импорт строки сессии",
             "Отправьте строку сессии Telethon или Pyrogram одним сообщением. Если она "
             "нигде не используется прямо сейчас — ничего останавливать не нужно.\n\n"
             "Сервис создаст отдельный зашифрованный <code>auth_key</code>, а исходное "
@@ -7678,7 +8082,7 @@ async def begin_account_import(
         "Названия аккаунтов в боте будут взяты из их текущих имён профиля Telegram. "
         "Позже их можно изменить отдельно, не меняя профили."
         if kind == "archive"
-        else "Название в боте будет взято из текущего имени профиля Telegram. "
+        else "Название в панели будет взято из текущего имени профиля Telegram. "
         "Позже его можно изменить отдельно, не меняя профиль."
     )
     await _edit_callback(
@@ -7766,7 +8170,7 @@ async def account_import_payload(
                 )
                 temporary_proxy_moved = True
     except (AccountImportError, ConflictError, NotFoundError, ProxyInputError) as exc:
-        await message.answer(f"❌ {escape(operator_error_message(exc))}")
+        await message.answer(f"× {escape(operator_error_message(exc))}")
         return
     finally:
         try:
@@ -7787,15 +8191,15 @@ async def account_import_payload(
         return
     proxy_note = ""
     if temporary_proxy_moved:
-        proxy_note = "🌐 Рабочий прокси назначен автоматически.\n"
+        proxy_note = "Рабочий прокси назначен автоматически.\n"
     elif settings.account_require_proxy:
         try:
             await proxy_service.allocate_proxy(
                 f"account:{account.id}", purpose=f"account #{account.id}"
             )
-            proxy_note = "🌐 Рабочий прокси назначен автоматически.\n"
+            proxy_note = "Рабочий прокси назначен автоматически.\n"
         except (ConflictError, ProxyInputError):
-            proxy_note = "⚠️ Рабочий прокси не найден; назначьте его из карточки.\n"
+            proxy_note = "! Рабочий прокси не найден; назначьте его из карточки.\n"
     check = await account_service.check_account(account.id)
     account = await account_service.get_account(account.id)
     proxy_slot, shared_proxy_accounts, proxy_view = await _account_proxy_summary(
@@ -7803,7 +8207,7 @@ async def account_import_payload(
     )
     await state.clear()
     if check.authorized and not check.error:
-        banner = f"✅ <b>Аккаунт загружен и сессия подтверждена.</b>\n{proxy_note}\n"
+        banner = f"✓ <b>Аккаунт загружен и сессия подтверждена.</b>\n{proxy_note}\n"
     else:
         note = f"\n<code>{escape(check.error)}</code>" if check.error else ""
         diagnosis = (
@@ -7812,7 +8216,7 @@ async def account_import_payload(
             else "После настройки прокси повторите проверку из карточки аккаунта."
         )
         banner = (
-            "🟡 <b>Аккаунт загружен, но сессию подтвердить не удалось.</b>\n"
+            "<b>Аккаунт загружен, но сессию подтвердить не удалось.</b>\n"
             f"{proxy_note}"
             f"{diagnosis}"
             f"{note}\n\n"
@@ -7871,13 +8275,13 @@ async def _import_account_archive_message(
                 bot,
                 origin_data,
                 wizard_text(
-                    "📦 Пакетный импорт",
+                    "Пакетный импорт",
                     index,
                     total,
                     "Обрабатывается "
                     f"<code>{escape(_compact_archive_name(entry.preferred_file_name))}</code>.\n\n"
-                    f"✅ Загружено: <b>{len(imported)}</b>\n"
-                    f"⚠️ Пропущено: <b>{len(failures)}</b>\n\n"
+                    f"✓ Загружено: <b>{len(imported)}</b>\n"
+                    f"! Пропущено: <b>{len(failures)}</b>\n\n"
                     "Не закрывайте бот до появления итогового отчёта.",
                 ),
                 None,
@@ -7981,13 +8385,13 @@ def _compact_archive_name(value: str, *, limit: int = 120) -> str:
 
 def _account_archive_result_text(result: AccountArchiveImportResult) -> str:
     lines = [
-        "<b>📦 Пакетный импорт завершён</b>",
+        "<b>Пакетный импорт завершён</b>",
         f"<code>АККАУНТОВ В АРХИВЕ · {result.total}</code>\n",
-        f"✅ Импортировано: <b>{len(result.imported)}</b>",
-        f"⏭ Пропущено с ошибкой: <b>{len(result.failures)}</b>",
+        f"✓ Импортировано: <b>{len(result.imported)}</b>",
+        f"›› Пропущено с ошибкой: <b>{len(result.failures)}</b>",
     ]
     if result.warnings:
-        lines.append(f"⚠️ Требуют внимания: <b>{len(result.warnings)}</b>")
+        lines.append(f"! Требуют внимания: <b>{len(result.warnings)}</b>")
 
     def append_line(line: str, *, limit: int = 3400) -> bool:
         if sum(len(existing) + 1 for existing in lines) + len(line) > limit:
@@ -8000,20 +8404,20 @@ def _account_archive_result_text(result: AccountArchiveImportResult) -> str:
         shown = 0
         for account in result.imported:
             label = escape(_compact_archive_name(account.label, limit=80))
-            if not append_line(f"• ✅ {label} · <code>#{account.id}</code>"):
+            if not append_line(f"• ✓ {label} · <code>#{account.id}</code>"):
                 break
             shown += 1
         if shown < len(result.imported):
             append_line(f"• …и ещё {len(result.imported) - shown}")
     if result.group_name:
         append_line(
-            "\n🗂 <b>Группа импорта:</b> "
+            "\n<b>Группа импорта:</b> "
             f"<b>{escape(result.group_name)}</b> · "
             f"аккаунтов: <b>{len(result.imported)}</b>"
         )
     elif result.group_error:
         append_line(
-            "\n⚠️ <b>Группа импорта не создана:</b> "
+            "\n! <b>Группа импорта не создана:</b> "
             f"{escape(result.group_error)}. Аккаунты сохранены и готовы к работе."
         )
     if result.failures:
@@ -8133,13 +8537,13 @@ async def _import_json_message(
 
 @router.callback_query(F.data == "target:add")
 async def begin_target_create(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(TargetCreateState.chat_ref)
     await _edit_callback(
         callback,
         wizard_text(
-            "🎯 Новый чат",
+            "Новый чат",
             1,
             1,
             "Введите @username, ссылку или числовой chat ID чата. Название будет взято из "
@@ -8152,13 +8556,13 @@ async def begin_target_create(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.callback_query(F.data == "target:import")
 async def begin_target_import(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(TargetImportState.name)
     await _edit_callback(
         callback,
         wizard_text(
-            "📚 Новый список чатов",
+            "Новый список чатов",
             1,
             2,
             "Введите название списка, например <code>Чаты на сутки</code>. "
@@ -8181,7 +8585,7 @@ async def target_list_name(message: Message, state: FSMContext, bot: Bot) -> Non
         bot,
         state,
         wizard_text(
-            "📚 Новый список чатов",
+            "Новый список чатов",
             2,
             2,
             "Прикрепите UTF-8 <code>.txt</code> или вставьте список сообщением: "
@@ -8276,7 +8680,7 @@ def _target_folder_account_picker_text(folder_count: int, account_count: int, *,
     pages = max(1, (account_count + PAGE_SIZE - 1) // PAGE_SIZE)
     active_page = min(max(0, page), pages - 1)
     return wizard_text(
-        "📚 Импорт папки Telegram",
+        "Импорт папки Telegram",
         3,
         3,
         f"Найдено ссылок на папки: <b>{folder_count}</b>.\n"
@@ -8299,7 +8703,11 @@ async def page_target_folder_accounts(
     requested_page = int((callback.data or "").rsplit(":", 1)[1])
     accounts = await repository.active_owned_accounts(require_authorized_session=True)
     if not accounts:
-        await callback.answer("Нет доступных аккаунтов. Импорт отменён.", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Нет доступных аккаунтов. Импорт отменён.",
+            show_alert=True,
+        )
         return
     page = min(max(0, requested_page), max(0, (len(accounts) - 1) // PAGE_SIZE))
     data = await state.get_data()
@@ -8326,7 +8734,7 @@ async def import_target_folders(
     account_id = int((callback.data or "").rsplit(":", 1)[1])
     data = await state.get_data()
     slugs = [str(value) for value in data.get("target_folder_slugs", [])][:10]
-    await callback.answer("Читаю папки через Telegram…")
+    await _safe_callback_answer(callback, "Читаю папки через Telegram…")
     entries: dict[str, TargetSeed] = {}
     folder_errors: list[str] = []
     stats = {
@@ -8365,7 +8773,7 @@ async def import_target_folders(
         )
     except ConflictError as exc:
         if isinstance(callback.message, Message):
-            await callback.message.answer(f"❌ {escape(operator_error_message(exc))}")
+            await callback.message.answer(f"× {escape(operator_error_message(exc))}")
 
 
 async def _finish_target_import(
@@ -8390,7 +8798,7 @@ async def _finish_target_import(
     issues = [str(value) for value in data.get("target_import_issues", [])]
     issues_preview = "\n".join(issues[:5])
     report = (
-        f"✅ <b>Умный импорт завершён</b>\n\n"
+        f"✓ <b>Умный импорт завершён</b>\n\n"
         f"Добавлено: <b>{added}</b>\n"
         f"Уже существовало: <b>{reused}</b>\n"
         f"Дубликатов в списке: <b>{int(data.get('target_import_duplicates', 0))}</b>\n"
@@ -8465,7 +8873,7 @@ async def target_chat_ref(
         return
     if parsed.kind == TargetReferenceKind.CHAT_FOLDER:
         await message.answer(
-            "Это ссылка на папку. Используйте «📄 Импорт .txt» — там бот покажет "
+            "Это ссылка на папку. Используйте « Импорт .txt» — там бот покажет "
             "отдельный отчёт по папкам."
         )
         return
@@ -8493,7 +8901,7 @@ async def target_chat_ref(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Чат добавлен и пока закрыт. Его название будет автоматически взято из Telegram "
+        "✓ Чат добавлен и пока закрыт. Его название будет автоматически взято из Telegram "
         "при первой проверке доступа.\n\n" + targets_text(page),
         targets_menu(page),
     )
@@ -8506,9 +8914,12 @@ async def change_target_approval(callback: CallbackQuery, repository: AdminRepos
         target = await repository.set_target_approval(int(target_id), action == "approve")
         timings = await repository.target_timings(target.id)
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Чат включён" if target.approved_by_operator else "Чат выключен")
+    await _safe_callback_answer(
+        callback,
+        "Чат включён" if target.approved_by_operator else "Чат выключен",
+    )
     await _edit_callback(
         callback,
         target_details_text(target, timings),
@@ -8531,7 +8942,7 @@ async def change_all_standalone_targets_approval(
             message += f" · плохих оставил выключенными: {skipped_bad}"
     else:
         message = f"Выключено чатов: {changed}"
-    await callback.answer(message, show_alert=True)
+    await _safe_callback_answer(callback, message, show_alert=True)
     await _show_targets(callback, repository, int(page))
 
 
@@ -8542,7 +8953,7 @@ async def bad_target_details(callback: CallbackQuery, repository: AdminRepositor
         target = await repository.get_target(int(target_id))
         timings = await repository.target_timings(target.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -8564,15 +8975,19 @@ async def restore_target_quality(callback: CallbackQuery, repository: AdminRepos
         target = await repository.restore_target_quality(int(target_id))
         timings = await repository.target_timings(target.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Чат возвращён в работу; рейтинг и баны сброшены", show_alert=True)
+    await _safe_callback_answer(
+        callback,
+        "Чат возвращён в работу; рейтинг и баны сброшены",
+        show_alert=True,
+    )
     if origin == "bad":
         await _show_bad_targets(callback, repository, int(page), answer=False)
         return
     await _edit_callback(
         callback,
-        "✅ <b>Чат возвращён в работу.</b> Статистика качества начата заново.\n\n"
+        "✓ <b>Чат возвращён в работу.</b> Статистика качества начата заново.\n\n"
         + target_details_text(target, timings),
         target_details_menu(target, int(page)),
         answer=False,
@@ -8586,7 +9001,7 @@ async def target_details(callback: CallbackQuery, repository: AdminRepository) -
         target = await repository.get_target(int(target_id))
         timings = await repository.target_timings(target.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -8606,10 +9021,10 @@ async def unblock_target_accounts(
         target = await repository.get_target(int(target_id))
         timings = await repository.target_timings(target.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     message = f"Сброшено блокировок: {count}" if count else "Запомненных блокировок нет"
-    await callback.answer(message, show_alert=bool(count))
+    await _safe_callback_answer(callback, message, show_alert=bool(count))
     await _edit_callback(
         callback,
         target_details_text(target, timings),
@@ -8628,9 +9043,9 @@ async def begin_target_cooldown_edit(
     try:
         target = await repository.get_target(int(target_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(cooldown_target_id=target.id, cooldown_target_page=int(page))
     await state.set_state(TargetCooldownState.minutes)
@@ -8638,7 +9053,7 @@ async def begin_target_cooldown_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            f"🕒 Интервал · {target.title}",
+            f"Интервал · {target.title}",
             1,
             1,
             f"Текущий интервал: <b>{current} мин.</b>\n\n"
@@ -8663,9 +9078,9 @@ async def begin_target_list_cooldown_edit(
     try:
         target = await repository.get_target_list_target(int(target_list_id), int(target_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(
         cooldown_target_id=target.id,
@@ -8680,7 +9095,7 @@ async def begin_target_list_cooldown_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            f"🕒 Интервал · {target.title}",
+            f"Интервал · {target.title}",
             1,
             1,
             f"Текущий интервал: <b>{current} мин.</b>\n\n"
@@ -8716,7 +9131,7 @@ async def save_target_cooldown_preset(
             )
         timings = await repository.target_timings(target.id)
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     target_list_id = data.get("cooldown_target_list_id")
     if target_list_id is not None:
@@ -8730,10 +9145,10 @@ async def save_target_cooldown_preset(
     else:
         menu = target_details_menu(target, int(data.get("cooldown_target_page", 0)))
     await state.clear()
-    await callback.answer("Интервал чата обновлён")
+    await _safe_callback_answer(callback, "Интервал чата обновлён")
     await _edit_callback(
         callback,
-        "✅ Интервал чата обновлён.\n\n" + target_details_text(target, timings),
+        "✓ Интервал чата обновлён.\n\n" + target_details_text(target, timings),
         menu,
         answer=False,
     )
@@ -8774,7 +9189,7 @@ async def save_target_cooldown(
         await _edit_origin_data(
             bot,
             data,
-            "✅ Интервал чата обновлён.\n\n" + target_details_text(target, timings),
+            "✓ Интервал чата обновлён.\n\n" + target_details_text(target, timings),
             target_list_target_details_menu(
                 target,
                 int(target_list_id),
@@ -8787,7 +9202,7 @@ async def save_target_cooldown(
     await _edit_origin_data(
         bot,
         data,
-        "✅ Интервал чата обновлён.\n\n" + target_details_text(target, timings),
+        "✓ Интервал чата обновлён.\n\n" + target_details_text(target, timings),
         target_details_menu(target, int(data["cooldown_target_page"])),
     )
 
@@ -8803,7 +9218,7 @@ async def cancel_target_cooldown_edit(
     target_list_id = data.get("cooldown_target_list_id")
     await state.clear()
     if target_id is None:
-        await callback.answer("Изменения отменены")
+        await _safe_callback_answer(callback, "Изменения отменены")
         return
     try:
         target = (
@@ -8816,7 +9231,7 @@ async def cancel_target_cooldown_edit(
         )
         timings = await repository.target_timings(target.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if target_list_id is not None:
         menu = target_list_target_details_menu(
@@ -8828,7 +9243,7 @@ async def cancel_target_cooldown_edit(
         )
     else:
         menu = target_details_menu(target, int(data.get("cooldown_target_page", 0)))
-    await callback.answer("Изменения отменены")
+    await _safe_callback_answer(callback, "Изменения отменены")
     await _edit_callback(
         callback,
         target_details_text(target, timings),
@@ -8843,11 +9258,11 @@ async def ask_delete_target(callback: CallbackQuery, repository: AdminRepository
     try:
         target = await repository.get_target(int(target_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить чат «{escape(target.title)}»?</b>\n\n"
+        f"<b>Удалить чат «{escape(target.title)}»?</b>\n\n"
         "Удаление возможно только если чат не входит в список и не используется "
         "сохранённой рассылкой или диалогом.",
         target_delete_confirmation(target.id, int(page)),
@@ -8860,9 +9275,9 @@ async def confirm_delete_target(callback: CallbackQuery, repository: AdminReposi
     try:
         await repository.delete_target(int(target_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Чат удалён")
+    await _safe_callback_answer(callback, "Чат удалён")
     await _show_targets(callback, repository, int(page))
 
 
@@ -8875,7 +9290,7 @@ async def target_list_details(
     try:
         item = await repository.get_target_list_view(int(target_list_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -8894,7 +9309,7 @@ async def begin_target_list_rename(
     try:
         item = await repository.get_target_list_view(int(target_list_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await _remember_origin(callback, state)
@@ -8902,7 +9317,7 @@ async def begin_target_list_rename(
     await state.set_state(TargetListRenameState.name)
     await _edit_callback(
         callback,
-        f"<b>✏️ Переименовать список «{escape(item.name)}»</b>\n\n"
+        f"<b>Переименовать список «{escape(item.name)}»</b>\n\n"
         "Отправьте новое понятное название длиной до 150 символов. "
         "Состав списка и сохранённые рассылки не изменятся.",
         cancel_menu(),
@@ -8927,7 +9342,7 @@ async def save_target_list_name(
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>База переименована.</b>\n\n" + target_list_details_text(item),
+        "✓ <b>База переименована.</b>\n\n" + target_list_details_text(item),
         target_list_details_menu(item, int(data["target_list_rename_page"])),
     )
 
@@ -8983,12 +9398,12 @@ async def bulk_change_target_list_page(
             action == "approve",
         )
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     message = f"Изменено чатов на странице: {changed}"
     if skipped_bad:
         message += f" · плохих пропущено: {skipped_bad}"
-    await callback.answer(message, show_alert=True)
+    await _safe_callback_answer(callback, message, show_alert=True)
     await _show_target_list_targets(
         callback,
         repository,
@@ -9011,7 +9426,7 @@ async def bulk_change_all_target_list_chats(
         changed = await repository.set_target_list_approval(int(target_list_id), approved)
         target_list = await repository.get_target_list_view(int(target_list_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if approved:
         message = f"Включено чатов: {changed}"
@@ -9019,7 +9434,7 @@ async def bulk_change_all_target_list_chats(
             message += f" · плохих оставил выключенными: {target_list.bad_count}"
     else:
         message = f"Выключено чатов: {changed}"
-    await callback.answer(message, show_alert=True)
+    await _safe_callback_answer(callback, message, show_alert=True)
     await _show_target_list_targets(
         callback,
         repository,
@@ -9043,7 +9458,7 @@ async def target_list_target_details(
         target = await repository.get_target_list_target(int(target_list_id), int(target_id))
         timings = await repository.target_timings(target.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -9074,9 +9489,12 @@ async def change_target_list_target_approval(
         )
         timings = await repository.target_timings(target.id)
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Чат включён" if target.approved_by_operator else "Чат выключен")
+    await _safe_callback_answer(
+        callback,
+        "Чат включён" if target.approved_by_operator else "Чат выключен",
+    )
     await _edit_callback(
         callback,
         target_details_text(target, timings),
@@ -9103,11 +9521,11 @@ async def ask_remove_target_from_list(
         target = await repository.get_target_list_target(int(target_list_id), int(target_id))
         target_list = await repository.get_target_list_view(int(target_list_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>➖ Убрать «{escape(target.title)}» из списка "
+        f"<b>Убрать «{escape(target.title)}» из списка "
         f"«{escape(target_list.name)}»?</b>\n\n"
         "Чат исчезнет из этого списка. Если он больше не входит в другие списки, не выбран "
         "отдельной рассылкой и не нужен истории результатов, его техническая запись тоже "
@@ -9133,9 +9551,9 @@ async def confirm_remove_target_from_list(
     try:
         await repository.remove_target_from_list(int(target_list_id), int(target_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Чат убран из списка")
+    await _safe_callback_answer(callback, "Чат убран из списка")
     await _show_target_list_targets(
         callback,
         repository,
@@ -9159,7 +9577,7 @@ async def change_target_list_approval(
         count = await repository.set_target_list_approval(int(target_list_id), action == "approve")
         item = await repository.get_target_list_view(int(target_list_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if action == "approve":
         message = f"Включено чатов: {count}"
@@ -9167,7 +9585,7 @@ async def change_target_list_approval(
             message += f" · плохих оставил выключенными: {item.bad_count}"
     else:
         message = f"Выключено чатов: {count}"
-    await callback.answer(message)
+    await _safe_callback_answer(callback, message)
     await _edit_callback(
         callback,
         target_list_details_text(item),
@@ -9182,11 +9600,11 @@ async def ask_delete_target_list(callback: CallbackQuery, repository: AdminRepos
     try:
         item = await repository.get_target_list_view(int(target_list_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить список «{escape(item.name)}»?</b>\n\n"
+        f"<b>Удалить список «{escape(item.name)}»?</b>\n\n"
         "Список и его связи будут удалены. Чаты, которые существовали только внутри этого "
         "списка и не нужны истории отправок, также будут очищены. Вручную добавленные и "
         "общие для нескольких баз чаты сохранятся.\n\n"
@@ -9202,21 +9620,21 @@ async def confirm_delete_target_list(callback: CallbackQuery, repository: AdminR
     try:
         await repository.delete_target_list(int(target_list_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("База удалена; лишние импортированные чаты очищены")
+    await _safe_callback_answer(callback, "База удалена; лишние импортированные чаты очищены")
     await _show_target_lists(callback, repository, int(page))
 
 
 @router.callback_query(F.data == "template:add")
 async def begin_template_create(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.set_state(TemplateCreateState.name)
     await _edit_callback(
         callback,
         wizard_text(
-            "📝 Новый шаблон",
+            "Новый шаблон",
             1,
             3,
             "Введите название, например <code>Приветствие</code>.",
@@ -9237,7 +9655,7 @@ async def template_name(message: Message, state: FSMContext, bot: Bot) -> None:
     await _edit_origin(
         bot,
         state,
-        wizard_text("📝 Новый шаблон", 2, 3, "Введите первое сообщение."),
+        wizard_text("Новый шаблон", 2, 3, "Введите первое сообщение."),
         cancel_menu(),
     )
 
@@ -9254,7 +9672,7 @@ async def template_primary_text(message: Message, state: FSMContext, bot: Bot) -
         bot,
         state,
         wizard_text(
-            "📝 Новый шаблон",
+            "Новый шаблон",
             3,
             3,
             "Введите ответ для режима диалога или отправьте <code>-</code>, "
@@ -9294,14 +9712,14 @@ async def confirm_template(
             reply_text=str(data["reply_text"]),
         )
     except ConflictError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Текст сохранён")
+    await _safe_callback_answer(callback, "Текст сохранён")
     page = await repository.list_templates(0, PAGE_SIZE)
     await _edit_callback(
         callback,
-        f"✅ Текст <b>{escape(template.name)}</b> сохранён.\n\n{templates_text(page)}",
+        f"✓ Текст <b>{escape(template.name)}</b> сохранён.\n\n{templates_text(page)}",
         templates_menu(page),
         answer=False,
     )
@@ -9313,9 +9731,9 @@ async def toggle_template(callback: CallbackQuery, repository: AdminRepository) 
     try:
         template = await repository.toggle_template(int(template_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Текст включён" if template.enabled else "Текст на паузе")
+    await _safe_callback_answer(callback, "Текст включён" if template.enabled else "Текст на паузе")
     await _edit_callback(
         callback,
         template_details_text(template),
@@ -9333,7 +9751,7 @@ async def template_details(
     try:
         template = await repository.get_template(int(template_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -9348,11 +9766,11 @@ async def ask_delete_template(callback: CallbackQuery, repository: AdminReposito
     try:
         template = await repository.get_template(int(template_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить шаблон «{escape(template.name)}»?</b>\n\n"
+        f"<b>Удалить шаблон «{escape(template.name)}»?</b>\n\n"
         "Уже сохранённые рассылки и диалоги не изменятся: в них хранится собственная копия.",
         template_delete_confirmation(template.id, int(page)),
     )
@@ -9364,9 +9782,9 @@ async def confirm_delete_template(callback: CallbackQuery, repository: AdminRepo
     try:
         await repository.delete_template(int(template_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Текст удалён")
+    await _safe_callback_answer(callback, "Текст удалён")
     await _show_templates(callback, repository, int(page))
 
 
@@ -9378,15 +9796,15 @@ async def begin_template_edit(
 ) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) != 4:
-        await callback.answer("Некорректная команда", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная команда", show_alert=True)
         return
     template_id, page = int(parts[2]), int(parts[3])
     try:
         template = await repository.get_template(template_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(
         edit_template_id=template.id,
@@ -9397,7 +9815,7 @@ async def begin_template_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            f"✏️ Редактирование · {template.name}",
+            f"Редактирование · {template.name}",
             1,
             2,
             "Введите новое первое сообщение.",
@@ -9419,7 +9837,7 @@ async def edit_template_primary(message: Message, state: FSMContext, bot: Bot) -
         bot,
         state,
         wizard_text(
-            "✏️ Редактирование текста",
+            "Редактирование текста",
             2,
             2,
             "Введите новый ответ для режима диалога или отправьте <code>-</code>, "
@@ -9441,7 +9859,7 @@ async def edit_template_reply(message: Message, state: FSMContext, bot: Bot) -> 
     await _edit_origin(
         bot,
         state,
-        "<b>✅ Сохранить новые тексты?</b>\n\n"
+        "<b>Сохранить новые тексты?</b>\n\n"
         f"<b>1 · Первое сообщение</b>\n"
         f"<blockquote>{escape(str(data['edit_primary_text']))}</blockquote>\n"
         f"<b>2 · Адресный ответ</b>\n"
@@ -9464,11 +9882,11 @@ async def save_template_edit(
             reply_text=str(data["edit_reply_text"]),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     page = int(data["edit_template_page"])
     await state.clear()
-    await callback.answer("Текст обновлён")
+    await _safe_callback_answer(callback, "Текст обновлён")
     await _edit_callback(
         callback,
         template_details_text(template),
@@ -9498,7 +9916,7 @@ async def begin_typed_campaign_create(
 ) -> None:
     mode = (callback.data or "").rsplit(":", 1)[1]
     if mode not in {"broadcast", "dialogue"}:
-        await callback.answer("Неизвестный режим", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный режим", show_alert=True)
         return
     await begin_order_draft(callback, state, repository, settings)
 
@@ -9522,7 +9940,7 @@ async def _begin_campaign_create(
             if not settings.dry_run
             else "Нужен минимум один активный подтверждённый аккаунт"
         )
-        await callback.answer(detail, show_alert=True)
+        await _safe_callback_answer(callback, detail, show_alert=True)
         return
     if mode == "dialogue" and len(accounts) < 2:
         detail = (
@@ -9530,22 +9948,26 @@ async def _begin_campaign_create(
             if not settings.dry_run
             else "Для диалога нужны минимум два аккаунта"
         )
-        await callback.answer(detail, show_alert=True)
+        await _safe_callback_answer(callback, detail, show_alert=True)
         return
     if not targets and not target_lists:
-        await callback.answer("Сначала откройте чат или список чатов", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Сначала откройте чат или список чатов",
+            show_alert=True,
+        )
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     if mode is not None:
         await state.update_data(mode=mode)
     await state.set_state(CampaignCreateState.name)
     title = (
-        "📢 Новая рассылка"
+        "Новая рассылка"
         if mode == "broadcast"
-        else "💬 Новый диалог"
+        else "Новый диалог"
         if mode == "dialogue"
-        else "🚀 Новая рассылка"
+        else "Новая рассылка"
     )
     body = (
         "Введите название для себя, например <code>Рассылка 24ч</code>. "
@@ -9593,7 +10015,7 @@ async def campaign_name(
                 bot,
                 state,
                 wizard_text(
-                    "📢 Новая рассылка",
+                    "Новая рассылка",
                     2,
                     7,
                     "По умолчанию отмечены все готовые аккаунты — это рабочий пул и "
@@ -9623,7 +10045,7 @@ async def campaign_name(
         bot,
         state,
         wizard_text(
-            "🚀 Новая рассылка",
+            "Новая рассылка",
             2,
             7,
             "Выберите режим:\n"
@@ -9643,7 +10065,7 @@ async def campaign_mode(
 ) -> None:
     mode = (callback.data or "").rsplit(":", 1)[1]
     if mode not in {"broadcast", "dialogue"}:
-        await callback.answer("Неизвестный режим", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный режим", show_alert=True)
         return
     accounts = await repository.active_owned_accounts(
         require_authorized_session=not settings.dry_run
@@ -9654,17 +10076,18 @@ async def campaign_mode(
             if not settings.dry_run
             else "Для диалога нужно минимум два аккаунта"
         )
-        await callback.answer(detail, show_alert=True)
+        await _safe_callback_answer(callback, detail, show_alert=True)
         return
     await state.update_data(mode=mode)
     if mode == "broadcast":
         default_sender_ids = [account.id for account in accounts]
         await state.update_data(sender_account_ids=default_sender_ids)
+        await _remember_origin(callback, state)
         await state.set_state(CampaignCreateState.sender_accounts)
         await _edit_callback(
             callback,
             wizard_text(
-                "📢 Новая рассылка",
+                "Новая рассылка",
                 2,
                 7,
                 "По умолчанию отмечены все готовые аккаунты — это рабочий пул и "
@@ -9675,6 +10098,7 @@ async def campaign_mode(
             campaign_sender_picker(accounts, set(default_sender_ids)),
         )
         return
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.primary_account)
     await _edit_callback(
         callback,
@@ -9698,12 +10122,13 @@ async def campaign_primary(
     repository: AdminRepository,
     settings: Settings,
 ) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     account_id = int((callback.data or "").rsplit(":", 1)[1])
     data = await state.get_data()
     await state.update_data(primary_account_id=account_id)
     if data.get("mode") == "broadcast":
         await state.update_data(sender_account_ids=[account_id])
+        await _remember_origin(callback, state)
         await state.set_state(CampaignCreateState.sender_accounts)
         accounts = await repository.active_owned_accounts(
             require_authorized_session=not settings.dry_run
@@ -9711,7 +10136,7 @@ async def campaign_primary(
         await _edit_callback(
             callback,
             wizard_text(
-                "📢 Новая рассылка",
+                "Новая рассылка",
                 2,
                 7,
                 "Отметьте аккаунты, которые будут отправлять. Первый уже выбран. "
@@ -9721,6 +10146,7 @@ async def campaign_primary(
             answer=False,
         )
         return
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.reply_account)
     accounts = [
         item
@@ -9732,7 +10158,7 @@ async def campaign_primary(
     await _edit_callback(
         callback,
         wizard_text(
-            "💬 Новый диалог",
+            "Новый диалог",
             3,
             7,
             "Выберите второй аккаунт: он отправит ответ через reply.",
@@ -9765,7 +10191,7 @@ async def campaign_sender_toggle(
     await _edit_callback(
         callback,
         wizard_text(
-            "📢 Новая рассылка",
+            "Новая рассылка",
             2,
             7,
             "Выберите аккаунты-отправители. При начале отправки чаты распределятся между "
@@ -9795,7 +10221,7 @@ async def campaign_sender_bulk(
     await _edit_callback(
         callback,
         wizard_text(
-            "📢 Новая рассылка",
+            "Новая рассылка",
             2,
             7,
             "Выберите аккаунты-отправители. При начале отправки чаты распределятся между "
@@ -9814,7 +10240,11 @@ async def campaign_sender_done(
     data = await state.get_data()
     selected = [int(item) for item in data.get("sender_account_ids", [])]
     if not selected:
-        await callback.answer("Выберите хотя бы одного отправителя", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Выберите хотя бы одного отправителя",
+            show_alert=True,
+        )
         return
     await state.update_data(primary_account_id=selected[0])
     await _show_campaign_audience_source(callback, state, repository)
@@ -9826,11 +10256,11 @@ async def campaign_reply_account(
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     account_id = int((callback.data or "").rsplit(":", 1)[1])
     data = await state.get_data()
     if account_id == data.get("primary_account_id"):
-        await callback.answer("Аккаунты должны различаться", show_alert=True)
+        await _safe_callback_answer(callback, "Аккаунты должны различаться", show_alert=True)
         return
     await state.update_data(reply_account_id=account_id)
     await _show_campaign_audience_source(callback, state, repository, answer=False)
@@ -9911,7 +10341,7 @@ async def campaign_audience_source(
             campaign_target_list_picker(lists_page),
         )
         return
-    await callback.answer("Неизвестный тип аудитории", show_alert=True)
+    await _safe_callback_answer(callback, "Неизвестный тип аудитории", show_alert=True)
 
 
 @router.callback_query(
@@ -9924,14 +10354,14 @@ async def begin_campaign_target_search(
 ) -> None:
     kind = (callback.data or "").rsplit(":", 1)[-1]
     if kind not in {"chats", "lists"}:
-        await callback.answer("Неизвестный тип аудитории", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный тип аудитории", show_alert=True)
         return
     await _remember_origin(callback, state)
     await state.update_data(campaign_target_search_kind=kind)
     await state.set_state(CampaignCreateState.target_search)
     await _edit_callback(
         callback,
-        f"<b>🔎 Найти {'чат' if kind == 'chats' else 'список чатов'}</b>\n\n"
+        f"<b>Найти {'чат' if kind == 'chats' else 'список чатов'}</b>\n\n"
         "Отправьте часть названия, username/ссылку или точный ID. "
         "Покажу до 20 доступных совпадений.",
         search_prompt_menu(
@@ -9958,7 +10388,7 @@ async def search_campaign_target(
         items = await repository.search_targets(query, approved_only=True)
         results = [
             (
-                f"📌 {item.title} · {item.chat_ref}",
+                f"· {item.title} · {item.chat_ref}",
                 f"campaign:pick:target:{item.id}",
             )
             for item in items
@@ -9967,7 +10397,7 @@ async def search_campaign_target(
         items = await repository.search_target_lists(query, approved_only=True)
         results = [
             (
-                f"📚 {item.name} · {item.approved_count} чатов",
+                f"≡ {item.name} · {item.approved_count} чатов",
                 f"campaign:pick:targetlist:{item.id}",
             )
             for item in items
@@ -9980,7 +10410,7 @@ async def search_campaign_target(
     await _edit_origin(
         bot,
         state,
-        "<b>🔎 Результаты поиска аудитории</b>\n"
+        "<b>Результаты поиска аудитории</b>\n"
         f"<code>{escape(query)}</code> · найдено <b>{len(results)}</b>\n\n"
         + ("Выберите нужную аудиторию." if results else "Совпадений нет."),
         search_results_menu(
@@ -10001,6 +10431,7 @@ async def cancel_campaign_target_search(
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.target)
     await campaign_audience_source(callback, state, repository)
 
@@ -10020,14 +10451,14 @@ async def campaign_target_page(
     target_lists = await repository.available_target_lists()
 
     if mode == "broadcast":
-        title = "📢 Новая рассылка"
+        title = "Новая рассылка"
         step = 3
         text_body = (
             f"Отправителей выбрано: <b>{len(selected_senders)}</b>.\n\n"
             "Теперь выберите один чат или список чатов."
         )
     else:
-        title = "💬 Новый диалог"
+        title = "Новый диалог"
         step = 4
         text_body = (
             "Выберите чат или список чатов. Для списка будет создана отдельная отправка "
@@ -10047,7 +10478,7 @@ async def campaign_target(
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     target_id = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(target_id=target_id, target_list_id=None)
     await _offer_campaign_templates(callback, state, repository)
@@ -10059,7 +10490,7 @@ async def campaign_target_list(
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
-    await callback.answer()
+    await _safe_callback_answer(callback)
     target_list_id = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(target_id=None, target_list_id=target_list_id)
     await _offer_campaign_templates(callback, state, repository)
@@ -10113,6 +10544,7 @@ async def campaign_template(
 ) -> None:
     value = (callback.data or "").rsplit(":", 1)[1]
     if value == "manual":
+        await _remember_origin(callback, state)
         await state.set_state(CampaignCreateState.primary_text)
         data = await state.get_data()
         await _edit_callback(
@@ -10129,14 +10561,18 @@ async def campaign_template(
     try:
         template = await repository.get_template(int(value))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not template.enabled:
-        await callback.answer("Текст поставлен на паузу", show_alert=True)
+        await _safe_callback_answer(callback, "Текст поставлен на паузу", show_alert=True)
         return
     data = await state.get_data()
     if data.get("mode") == "dialogue" and not template.reply_text.strip():
-        await callback.answer("В этом тексте не задан ответ для диалога", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "В этом тексте не задан ответ для диалога",
+            show_alert=True,
+        )
         return
     await state.update_data(
         template_id=template.id,
@@ -10144,6 +10580,7 @@ async def campaign_template(
         reply_text=template.reply_text,
     )
     if data.get("mode") == "broadcast":
+        await _remember_origin(callback, state)
         await state.set_state(CampaignCreateState.repeat_mode)
         await _edit_callback(
             callback,
@@ -10151,11 +10588,12 @@ async def campaign_template(
             campaign_repeat_mode_picker(),
         )
         return
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.reply_delay)
     await _edit_callback(
         callback,
         wizard_text(
-            "💬 Новый диалог",
+            "Новый диалог",
             7,
             7,
             f"Выбран текст <b>{escape(template.name)}</b>.\n\n"
@@ -10216,7 +10654,7 @@ async def campaign_primary_text(
         bot,
         state,
         wizard_text(
-            "💬 Новый диалог",
+            "Новый диалог",
             6,
             7,
             "Отправьте ответ: текст, фото, видео, документ, голосовое или видеокружок. "
@@ -10251,7 +10689,7 @@ async def campaign_reply_text(
         bot,
         state,
         wizard_text(
-            "💬 Новый диалог",
+            "Новый диалог",
             7,
             7,
             "Введите задержку ответа: от <b>0</b> до <b>3600</b> секунд.",
@@ -10323,6 +10761,7 @@ async def begin_order_dialogue_chain(
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.chain_action)
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
@@ -10348,7 +10787,11 @@ async def add_dialogue_chain_step(
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
     if len(steps) >= 20:
-        await callback.answer("В одной цепочке максимум 20 сообщений", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "В одной цепочке максимум 20 сообщений",
+            show_alert=True,
+        )
         return
     previous_account_id = int(steps[-1]["account_id"]) if steps else None
     accounts = [
@@ -10359,13 +10802,14 @@ async def add_dialogue_chain_step(
         if previous_account_id is None or account.id != previous_account_id
     ]
     if not accounts:
-        await callback.answer("Нет другого активного аккаунта", show_alert=True)
+        await _safe_callback_answer(callback, "Нет другого активного аккаунта", show_alert=True)
         return
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.chain_account)
     await _edit_callback(
         callback,
         wizard_text(
-            "🧩 Новое сообщение цепочки",
+            "Новое сообщение цепочки",
             len(steps) + 1,
             20,
             "Выберите аккаунт для следующего сообщения. Подряд один и тот же "
@@ -10391,7 +10835,7 @@ async def remove_dialogue_chain_step(
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
     if not steps:
-        await callback.answer("Цепочка уже пустая", show_alert=True)
+        await _safe_callback_answer(callback, "Цепочка уже пустая", show_alert=True)
         return
     steps.pop()
     await state.update_data(dialogue_steps=steps)
@@ -10418,9 +10862,14 @@ async def finish_dialogue_chain(
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
     if len(steps) < 2:
-        await callback.answer("В диалоге должно быть хотя бы два сообщения", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "В диалоге должно быть хотя бы два сообщения",
+            show_alert=True,
+        )
         return
     if data.get("order_draft_active"):
+        await _remember_origin(callback, state)
         await state.set_state(OrderDraftState.action)
         await _show_order_draft(callback, state, repository)
         return
@@ -10434,10 +10883,10 @@ async def finish_dialogue_chain(
             )
             sender_ids = await repository.campaign_sender_ids(campaign.id)
         except (ConflictError, NotFoundError) as exc:
-            await callback.answer(callback_error_message(exc), show_alert=True)
+            await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
             return
         await state.clear()
-        await callback.answer("Цепочка обновлена")
+        await _safe_callback_answer(callback, "Цепочка обновлена")
         await _edit_callback(
             callback,
             campaign_details_text(campaign, sender_ids),
@@ -10445,6 +10894,7 @@ async def finish_dialogue_chain(
             answer=False,
         )
         return
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.confirm)
     await _edit_callback(
         callback,
@@ -10465,14 +10915,15 @@ async def choose_dialogue_chain_account(
     data = await state.get_data()
     steps = [dict(item) for item in data.get("dialogue_steps", [])]
     if steps and int(steps[-1]["account_id"]) == account_id:
-        await callback.answer("Выберите другой аккаунт", show_alert=True)
+        await _safe_callback_answer(callback, "Выберите другой аккаунт", show_alert=True)
         return
     await state.update_data(chain_account_id=account_id)
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.chain_text)
     await _edit_callback(
         callback,
         wizard_text(
-            "🧩 Текст сообщения",
+            "Текст сообщения",
             len(steps) + 1,
             20,
             "Отправьте следующее сообщение: текст, фото, видео, документ, голосовое или "
@@ -10537,7 +10988,7 @@ async def dialogue_chain_text(
         bot,
         state,
         wizard_text(
-            "🧩 Задержка сообщения",
+            "Задержка сообщения",
             1,
             1,
             "Через сколько секунд после предыдущего сообщения отправить это? "
@@ -10642,6 +11093,7 @@ async def campaign_spread_hours_preset(
         smart_no_timer_interval_minutes=0,
         auto_sender_failover=False,
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.confirm)
     data = await state.get_data()
     await _edit_callback(
@@ -10669,11 +11121,12 @@ async def campaign_repeat_mode(
             smart_no_timer_interval_minutes=0,
             auto_sender_failover=False,
         )
+        await _remember_origin(callback, state)
         await state.set_state(CampaignCreateState.spread_hours)
         await _edit_callback(
             callback,
             wizard_text(
-                "📢 Одноразовая рассылка",
+                "Одноразовая рассылка",
                 6,
                 7,
                 "За сколько часов разложить один пост в каждый чат?\n\n"
@@ -10699,11 +11152,12 @@ async def campaign_repeat_mode(
         visibility_max_wait_seconds=default_profile.visibility_max_wait_seconds,
         auto_sender_failover=True,
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.smart_duration_hours)
     await _edit_callback(
         callback,
         wizard_text(
-            "♻️ Умная непрерывная рассылка",
+            "Умная непрерывная рассылка",
             6,
             7,
             "Сколько часов рассылка должна оставаться активной? В течение этого срока "
@@ -10737,11 +11191,12 @@ async def campaign_smart_duration_preset(
         smart_duration_hours=max(1, hours),
         repeat_forever=hours == 0,
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.smart_no_timer_interval_minutes)
     await _edit_callback(
         callback,
         wizard_text(
-            "♻️ Умная непрерывная рассылка",
+            "Умная непрерывная рассылка",
             7,
             7,
             period + "Как часто писать в чат, если у него <b>нет</b> ни Telegram slow mode, "
@@ -10778,7 +11233,7 @@ async def campaign_smart_duration(
         bot,
         state,
         wizard_text(
-            "♻️ Умная непрерывная рассылка",
+            "Умная непрерывная рассылка",
             7,
             7,
             f"Срок активности: <b>{hours} ч.</b>\n\n"
@@ -10806,6 +11261,7 @@ async def campaign_smart_interval_preset(
 ) -> None:
     minutes = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(smart_no_timer_interval_minutes=minutes)
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.confirm)
     data = await state.get_data()
     await _edit_callback(
@@ -10845,6 +11301,7 @@ async def campaign_repeat_count_preset(
 ) -> None:
     count = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(repeat_count=count)
+    await _remember_origin(callback, state)
     await state.set_state(CampaignCreateState.confirm)
     data = await state.get_data()
     await _edit_callback(
@@ -10992,14 +11449,14 @@ async def confirm_campaign(
             ),
         )
     except ConflictError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Сценарий сохранён")
+    await _safe_callback_answer(callback, "Сценарий сохранён")
     page = await repository.list_campaigns(0, PAGE_SIZE)
     await _edit_callback(
         callback,
-        f"✅ «{escape(campaign.name)}» сохранено. Теперь можно запустить из списка.\n\n"
+        f"✓ «{escape(campaign.name)}» сохранено. Теперь можно запустить из списка.\n\n"
         f"{campaigns_text(page, worker_campaign_scope=settings.worker_campaign_id_scope)}",
         campaigns_menu(page),
         answer=False,
@@ -11016,7 +11473,7 @@ async def begin_campaign_content_edit(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _remember_origin(callback, state)
     if campaign.mode == CampaignMode.BROADCAST:
@@ -11028,7 +11485,7 @@ async def begin_campaign_content_edit(
         await _edit_callback(
             callback,
             wizard_text(
-                f"✏️ Пост · {campaign.name}",
+                f"Пост · {campaign.name}",
                 1,
                 1,
                 "Отправьте новый текст или медиа с подписью. Форматирование сохранится. "
@@ -11044,12 +11501,17 @@ async def begin_campaign_content_edit(
             campaign.dialogue_steps_json,
             primary_account_id=campaign.primary_account_id,
             primary_text=campaign.primary_text,
+            primary_html=campaign.primary_html,
+            primary_media_path=campaign.primary_media_path,
+            primary_media_kind=campaign.primary_media_kind,
+            primary_media_name=campaign.primary_media_name,
+            primary_media_size=campaign.primary_media_size,
             reply_account_id=campaign.reply_account_id,
             reply_text=campaign.reply_text,
             reply_delay_seconds=campaign.reply_delay_seconds,
         )
     except ValueError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.update_data(
         dialogue_steps=[step.as_dict() for step in steps],
@@ -11101,7 +11563,7 @@ async def save_campaign_content_text(
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>Текст будущих рассылок обновлён.</b>\n\n"
+        "✓ <b>Текст будущих рассылок обновлён.</b>\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, page),
     )
@@ -11120,9 +11582,9 @@ async def cancel_campaign_content_edit(
         campaign = await repository.get_campaign(int(campaign_id))
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Изменения отменены")
+    await _safe_callback_answer(callback, "Изменения отменены")
     await _edit_callback(
         callback,
         campaign_details_text(campaign, sender_ids),
@@ -11141,14 +11603,14 @@ async def begin_campaign_target_edit(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     targets_page = await repository.list_approved_targets(0, 1)
     target_lists = await repository.list_available_target_lists(0, 1)
     if not targets_page.total and not target_lists.total:
-        await callback.answer("Нет включённых чатов или баз", show_alert=True)
+        await _safe_callback_answer(callback, "Нет включённых чатов или баз", show_alert=True)
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(
         edit_campaign_id=campaign.id,
@@ -11160,7 +11622,7 @@ async def begin_campaign_target_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            f"🎯 Куда отправлять · {campaign.name}",
+            f"Куда отправлять · {campaign.name}",
             1,
             1,
             "Выберите новый чат или список. Уже созданные отправки и история не изменятся; "
@@ -11189,13 +11651,13 @@ async def _show_campaign_checked_target_picker(
     try:
         campaign = await repository.get_campaign(campaign_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     page = await repository.list_approved_targets(target_page, AUDIENCE_PAGE_SIZE)
     if page.page >= page.pages and page.pages:
         page = await repository.list_approved_targets(page.pages - 1, AUDIENCE_PAGE_SIZE)
     if not page.items:
-        await callback.answer("Нет включённых отдельных чатов", show_alert=True)
+        await _safe_callback_answer(callback, "Нет включённых отдельных чатов", show_alert=True)
         return
     data = await state.get_data()
     selected_ids = {
@@ -11213,7 +11675,7 @@ async def _show_campaign_checked_target_picker(
     await _edit_callback(
         callback,
         wizard_text(
-            f"☑️ Подборка чатов · {campaign.name}",
+            f"✓ Подборка чатов · {campaign.name}",
             1,
             1,
             "Отметьте нужные чаты и нажмите «Сохранить подборку». Будет создана новая "
@@ -11240,7 +11702,11 @@ async def page_campaign_checked_targets(
     _, _, _, campaign_id, campaign_page, target_page = (callback.data or "").split(":")
     data = await state.get_data()
     if int(data.get("edit_campaign_id") or campaign_id) != int(campaign_id):
-        await callback.answer("Откройте редактирование чатов заново", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Откройте редактирование чатов заново",
+            show_alert=True,
+        )
         return
     if not data.get("edit_campaign_selection_initialized"):
         try:
@@ -11248,7 +11714,7 @@ async def page_campaign_checked_targets(
                 int(campaign_id)
             )
         except NotFoundError as exc:
-            await callback.answer(callback_error_message(exc), show_alert=True)
+            await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
             return
         await state.update_data(
             edit_campaign_selected_target_ids=selected_ids,
@@ -11335,7 +11801,7 @@ async def save_campaign_checked_targets(
         if str(value).isdigit()
     ]
     if not selected_ids:
-        await callback.answer("Выберите хотя бы один чат", show_alert=True)
+        await _safe_callback_answer(callback, "Выберите хотя бы один чат", show_alert=True)
         return
     campaign_id = int(data["edit_campaign_id"])
     page = int(data["edit_campaign_page"])
@@ -11348,13 +11814,13 @@ async def save_campaign_checked_targets(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Подборка чатов сохранена")
+    await _safe_callback_answer(callback, "Подборка чатов сохранена")
     await _edit_callback(
         callback,
-        "✅ <b>Подборка чатов обновлена для следующих рассылок.</b>\n\n"
+        "✓ <b>Подборка чатов обновлена для следующих рассылок.</b>\n\n"
         "Исходный список не менялся: сценарий получил новую независимую подборку.\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, page),
@@ -11369,10 +11835,11 @@ async def begin_campaign_checked_target_search(
 ) -> None:
     data = await state.get_data()
     await state.update_data(edit_target_search_kind="checked")
+    await _remember_origin(callback, state)
     await state.set_state(CampaignEditState.search)
     await _edit_callback(
         callback,
-        "<b>🔎 Найти чат в подборке</b>\n\n"
+        "<b>Найти чат в подборке</b>\n\n"
         "Отправьте часть названия, username/ссылку или точный ID. Результат можно "
         "отметить галочкой.",
         search_prompt_menu(
@@ -11402,7 +11869,7 @@ async def browse_campaign_edit_targets(
     try:
         campaign = await repository.get_campaign(campaign_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if kind == "lists":
         page = await repository.list_available_target_lists(target_page, AUDIENCE_PAGE_SIZE)
@@ -11421,12 +11888,12 @@ async def browse_campaign_edit_targets(
             )
         description = "Выберите один вручную добавленный чат."
     else:
-        await callback.answer("Неизвестный тип аудитории", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный тип аудитории", show_alert=True)
         return
     await _edit_callback(
         callback,
         wizard_text(
-            f"🎯 Куда отправлять · {campaign.name}",
+            f"Куда отправлять · {campaign.name}",
             1,
             1,
             description + " Уже созданные отправки и история не изменятся; новые чаты "
@@ -11451,14 +11918,15 @@ async def begin_campaign_edit_target_search(
 ) -> None:
     _, _, _, kind, campaign_id, campaign_page = (callback.data or "").split(":")
     if kind not in {"chats", "lists"}:
-        await callback.answer("Неизвестный тип аудитории", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный тип аудитории", show_alert=True)
         return
     await state.update_data(edit_target_search_kind=kind)
+    await _remember_origin(callback, state)
     await state.set_state(CampaignEditState.search)
     back_callback = f"campaign:edit:browse:{kind}:{campaign_id}:{campaign_page}:0"
     await _edit_callback(
         callback,
-        f"<b>🔎 Найти {'чат' if kind == 'chats' else 'список чатов'}</b>\n\n"
+        f"<b>Найти {'чат' if kind == 'chats' else 'список чатов'}</b>\n\n"
         "Отправьте часть названия, username/ссылку или точный ID. "
         "Поиск затронет только доступные аудитории.",
         search_prompt_menu("campaign", back_callback=back_callback),
@@ -11483,18 +11951,18 @@ async def search_campaign_edit_target(
     if kind == "chats":
         items = await repository.search_targets(query, approved_only=True)
         results = [
-            (f"📌 {item.title} · {item.chat_ref}", f"cedit:target:{item.id}") for item in items
+            (f"· {item.title} · {item.chat_ref}", f"cedit:target:{item.id}") for item in items
         ]
     elif kind == "checked":
         items = await repository.search_targets(query, approved_only=True)
         results = [
-            (f"☑️ {item.title} · {item.chat_ref}", f"campaign:edit:checktoggle:{item.id}")
+            (f"✓ {item.title} · {item.chat_ref}", f"campaign:edit:checktoggle:{item.id}")
             for item in items
         ]
     elif kind == "lists":
         items = await repository.search_target_lists(query, approved_only=True)
         results = [
-            (f"📚 {item.name} · {item.approved_count} чатов", f"cedit:list:{item.id}")
+            (f"≡ {item.name} · {item.approved_count} чатов", f"cedit:list:{item.id}")
             for item in items
         ]
     else:
@@ -11508,7 +11976,7 @@ async def search_campaign_edit_target(
     await _edit_origin(
         bot,
         state,
-        "<b>🔎 Результаты поиска аудитории</b>\n"
+        "<b>Результаты поиска аудитории</b>\n"
         f"<code>{escape(query)}</code> · найдено <b>{len(results)}</b>\n\n"
         + (
             "Отметьте чат галочкой."
@@ -11543,6 +12011,7 @@ async def cancel_campaign_edit_target_search(
     state: FSMContext,
     repository: AdminRepository,
 ) -> None:
+    await _remember_origin(callback, state)
     await state.set_state(CampaignEditState.target)
     await browse_campaign_edit_targets(callback, repository)
 
@@ -11558,7 +12027,7 @@ async def save_campaign_target_edit(
     target_id = int(raw_id) if kind == "target" else None
     target_list_id = int(raw_id) if kind == "list" else None
     if target_id is None and target_list_id is None:
-        await callback.answer("Некорректная цель", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная цель", show_alert=True)
         return
     try:
         campaign = await repository.update_campaign_target(
@@ -11568,14 +12037,14 @@ async def save_campaign_target_edit(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     page = int(data["edit_campaign_page"])
     await state.clear()
-    await callback.answer("Цель обновлена")
+    await _safe_callback_answer(callback, "Цель обновлена")
     await _edit_callback(
         callback,
-        "✅ <b>Чат или список изменены для следующих рассылок.</b>\n\n"
+        "✓ <b>Чат или список изменены для следующих рассылок.</b>\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, page),
         answer=False,
@@ -11592,9 +12061,9 @@ async def begin_campaign_schedule_edit(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer()
+    await _safe_callback_answer(callback)
     await _remember_origin(callback, state)
     await state.update_data(
         schedule_campaign_id=campaign.id,
@@ -11623,7 +12092,7 @@ async def begin_campaign_schedule_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            f"🧠 Расписание · {escape(campaign.name)}",
+            f"Расписание · {escape(campaign.name)}",
             1,
             3,
             f"Сейчас: <b>{current}</b>.\n\n"
@@ -11663,24 +12132,25 @@ async def choose_campaign_schedule_mode(
             )
             sender_ids = await repository.campaign_sender_ids(campaign.id)
         except (NotFoundError, ConflictError) as exc:
-            await callback.answer(callback_error_message(exc), show_alert=True)
+            await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
             return
         page = int(data["schedule_campaign_page"])
         await state.clear()
-        await callback.answer("Оставлен один проход")
+        await _safe_callback_answer(callback, "Оставлен один проход")
         await _edit_callback(
             callback,
-            "✅ <b>Расписание обновлено.</b>\n\n" + campaign_details_text(campaign, sender_ids),
+            "✓ <b>Расписание обновлено.</b>\n\n" + campaign_details_text(campaign, sender_ids),
             campaign_details_menu(campaign, page),
             answer=False,
         )
         return
     if callback.data == "cschedule:continuous":
+        await _remember_origin(callback, state)
         await state.set_state(CampaignScheduleEditState.smart_duration_hours)
         await _edit_callback(
             callback,
             wizard_text(
-                "♻️ Умная непрерывная рассылка",
+                "Умная непрерывная рассылка",
                 2,
                 3,
                 "Укажите новый срок активности: выберите вариант, «До остановки» или введите "
@@ -11691,11 +12161,12 @@ async def choose_campaign_schedule_mode(
             campaign_smart_duration_presets(cancel_callback="cschedule:cancel"),
         )
         return
+    await _remember_origin(callback, state)
     await state.set_state(CampaignScheduleEditState.interval_minutes)
     await _edit_callback(
         callback,
         wizard_text(
-            "🧠 Умное расписание",
+            "Умное расписание",
             2,
             3,
             "Введите минимальный интервал между проходами: от <b>1</b> до "
@@ -11725,11 +12196,12 @@ async def edit_campaign_smart_duration_preset(
         schedule_smart_duration_hours=max(1, hours),
         schedule_repeat_forever=hours == 0,
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignScheduleEditState.smart_no_timer_interval_minutes)
     await _edit_callback(
         callback,
         wizard_text(
-            "♻️ Умная непрерывная рассылка",
+            "Умная непрерывная рассылка",
             3,
             3,
             period + "Задайте интервал только для чатов <b>без</b> Telegram slow mode и "
@@ -11765,7 +12237,7 @@ async def edit_campaign_smart_duration(
         bot,
         state,
         wizard_text(
-            "♻️ Умная непрерывная рассылка",
+            "Умная непрерывная рассылка",
             3,
             3,
             f"Срок активности: <b>{hours} ч.</b>\n\n"
@@ -11807,14 +12279,14 @@ async def save_campaign_smart_schedule_preset(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     page = int(data["schedule_campaign_page"])
     await state.clear()
-    await callback.answer("Умная непрерывная рассылка сохранена")
+    await _safe_callback_answer(callback, "Умная непрерывная рассылка сохранена")
     await _edit_callback(
         callback,
-        "✅ <b>Умная непрерывная рассылка обновлена.</b>\n\n"
+        "✓ <b>Умная непрерывная рассылка обновлена.</b>\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, page),
         answer=False,
@@ -11857,7 +12329,7 @@ async def save_campaign_smart_schedule(
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>Умная непрерывная рассылка обновлена.</b>\n\n"
+        "✓ <b>Умная непрерывная рассылка обновлена.</b>\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, int(data["schedule_campaign_page"])),
     )
@@ -11873,11 +12345,12 @@ async def edit_campaign_schedule_interval_preset(
 ) -> None:
     minutes = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(schedule_interval_minutes=minutes)
+    await _remember_origin(callback, state)
     await state.set_state(CampaignScheduleEditState.repeat_count)
     await _edit_callback(
         callback,
         wizard_text(
-            "🧠 Умное расписание",
+            "Умное расписание",
             3,
             3,
             f"Интервал: <b>{minutes} мин.</b>\n\n"
@@ -11908,7 +12381,7 @@ async def edit_campaign_schedule_interval(
         bot,
         state,
         wizard_text(
-            "🧠 Умное расписание",
+            "Умное расписание",
             3,
             3,
             "Введите общее число проходов от <b>2</b> до <b>100</b>.",
@@ -11936,14 +12409,14 @@ async def save_campaign_schedule_preset(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     page = int(data["schedule_campaign_page"])
     await state.clear()
-    await callback.answer("Умное расписание сохранено")
+    await _safe_callback_answer(callback, "Умное расписание сохранено")
     await _edit_callback(
         callback,
-        "✅ <b>Умное расписание сохранено.</b>\n\n" + campaign_details_text(campaign, sender_ids),
+        "✓ <b>Умное расписание сохранено.</b>\n\n" + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, page),
         answer=False,
     )
@@ -11979,7 +12452,7 @@ async def save_campaign_schedule(
     await _edit_origin_data(
         bot,
         data,
-        "✅ <b>Умное расписание сохранено.</b>\n\n" + campaign_details_text(campaign, sender_ids),
+        "✓ <b>Умное расписание сохранено.</b>\n\n" + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, int(data["schedule_campaign_page"])),
     )
 
@@ -11995,15 +12468,15 @@ async def cancel_campaign_schedule_edit(
     page = int(data.get("schedule_campaign_page", 0))
     await state.clear()
     if campaign_id is None:
-        await callback.answer("Изменения отменены")
+        await _safe_callback_answer(callback, "Изменения отменены")
         return
     try:
         campaign = await repository.get_campaign(int(campaign_id))
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Изменения отменены")
+    await _safe_callback_answer(callback, "Изменения отменены")
     await _edit_callback(
         callback,
         campaign_details_text(campaign, sender_ids),
@@ -12018,10 +12491,10 @@ async def ask_pause_campaign(callback: CallbackQuery, repository: AdminRepositor
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not campaign.enabled:
-        await callback.answer("Сценарий уже приостановлен")
+        await _safe_callback_answer(callback, "Сценарий уже приостановлен")
         await _edit_callback(
             callback,
             campaign_details_text(campaign, await repository.campaign_sender_ids(campaign.id)),
@@ -12031,7 +12504,7 @@ async def ask_pause_campaign(callback: CallbackQuery, repository: AdminRepositor
         return
     await _edit_callback(
         callback,
-        f"<b>⏸ Приостановить «{escape(campaign.name)}»?</b>\n\n"
+        f"<b>Ⅱ Приостановить «{escape(campaign.name)}»?</b>\n\n"
         "Новые запуски будут недоступны. Задания уже в очереди перестанут браться в "
         "работу, а ожидающие реакции отменятся; уже взятое задание может завершиться "
         "ошибкой конфигурации.\n\n"
@@ -12050,9 +12523,9 @@ async def confirm_pause_campaign(callback: CallbackQuery, repository: AdminRepos
             campaign = await repository.toggle_campaign(campaign.id)
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Сценарий приостановлен")
+    await _safe_callback_answer(callback, "Сценарий приостановлен")
     await _edit_callback(
         callback,
         campaign_details_text(campaign, sender_ids),
@@ -12067,12 +12540,12 @@ async def toggle_campaign(callback: CallbackQuery, repository: AdminRepository) 
     try:
         current = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if current.enabled:
         await _edit_callback(
             callback,
-            f"<b>⏸ Приостановить «{escape(current.name)}»?</b>\n\n"
+            f"<b>Ⅱ Приостановить «{escape(current.name)}»?</b>\n\n"
             "Эта кнопка на старом сообщении не приостанавливает сценарий сразу. "
             "Подтвердите действие ниже.",
             campaign_pause_confirmation(current.id, int(page)),
@@ -12082,9 +12555,9 @@ async def toggle_campaign(callback: CallbackQuery, repository: AdminRepository) 
         campaign = await repository.toggle_campaign(current.id)
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Новые запуски снова разрешены")
+    await _safe_callback_answer(callback, "Новые запуски снова разрешены")
     await _edit_callback(
         callback,
         campaign_details_text(campaign, sender_ids),
@@ -12104,7 +12577,7 @@ async def campaign_details(
         campaign = await repository.get_campaign(int(campaign_id))
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await _edit_callback(
@@ -12132,7 +12605,7 @@ async def _show_campaign_sender_editor(
     await _edit_callback(
         callback,
         wizard_text(
-            "👥 Отправители",
+            "Отправители",
             1,
             1,
             "Выберите аккаунты для будущих отправок этой рассылки. Уже начатые "
@@ -12160,17 +12633,21 @@ async def begin_campaign_sender_edit(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
         if campaign.mode != CampaignMode.BROADCAST:
-            await callback.answer("Пул отправителей доступен только для рассылки", show_alert=True)
+            await _safe_callback_answer(
+                callback,
+                "Пул отправителей доступен только для рассылки",
+                show_alert=True,
+            )
             return
         selected_ids = await repository.campaign_sender_ids(campaign.id)
         accounts = await repository.active_owned_accounts(
             require_authorized_session=not settings.dry_run
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not accounts:
-        await callback.answer("Нет готовых аккаунтов для выбора", show_alert=True)
+        await _safe_callback_answer(callback, "Нет готовых аккаунтов для выбора", show_alert=True)
         return
     available_ids = {account.id for account in accounts}
     await state.clear()
@@ -12179,6 +12656,7 @@ async def begin_campaign_sender_edit(
         edit_campaign_page=int(page),
         edit_sender_ids=[account_id for account_id in selected_ids if account_id in available_ids],
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignEditState.senders)
     await _show_campaign_sender_editor(callback, state, repository, settings)
 
@@ -12233,7 +12711,11 @@ async def save_campaign_sender_edit(
     data = await state.get_data()
     selected_ids = [int(item) for item in data.get("edit_sender_ids", [])]
     if not selected_ids:
-        await callback.answer("Выберите хотя бы одного отправителя", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Выберите хотя бы одного отправителя",
+            show_alert=True,
+        )
         return
     campaign_id = int(data["edit_campaign_id"])
     page = int(data["edit_campaign_page"])
@@ -12241,13 +12723,13 @@ async def save_campaign_sender_edit(
         campaign = await repository.update_campaign_senders(campaign_id, selected_ids)
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Пул изменён для будущих отправок")
+    await _safe_callback_answer(callback, "Пул изменён для будущих отправок")
     await _edit_callback(
         callback,
-        "✅ <b>Отправители обновлены.</b> Уже начатые отправки не изменились.\n\n"
+        "✓ <b>Отправители обновлены.</b> Уже начатые отправки не изменились.\n\n"
         + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, page),
         answer=False,
@@ -12265,7 +12747,7 @@ async def campaign_variants(
         campaign = await repository.get_campaign(int(campaign_id))
         variants = await repository.campaign_content_variants(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await _edit_callback(
@@ -12288,7 +12770,7 @@ async def campaign_variant_details(
             variant_id,
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -12313,10 +12795,10 @@ async def start_campaign_variant_add(
         campaign = await repository.get_campaign(int(campaign_id))
         variants = await repository.campaign_content_variants(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if len(variants) >= 10:
-        await callback.answer("Достигнут лимит: 10 вариантов", show_alert=True)
+        await _safe_callback_answer(callback, "Достигнут лимит: 10 вариантов", show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -12324,10 +12806,11 @@ async def start_campaign_variant_add(
         variant_campaign_page=int(page),
         variant_edit_mode="add",
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignVariantState.name)
     await _edit_callback(
         callback,
-        "<b>➕ Новый вариант · шаг 1 из 2</b>\n\n"
+        "<b>Новый вариант · шаг 1 из 2</b>\n\n"
         "Отправьте короткое понятное название, например "
         "<code>Оффер A</code> или <code>Вечерний текст</code>.",
         campaign_variant_input_cancel(campaign.id, int(page)),
@@ -12345,7 +12828,8 @@ async def receive_campaign_variant_name(
     campaign_id = int(data.get("variant_campaign_id") or 0)
     page = int(data.get("variant_campaign_page") or 0)
     if not 1 <= len(name) <= 80:
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             "Название должно содержать от 1 до 80 символов.",
             reply_markup=campaign_variant_input_cancel(campaign_id, page),
         )
@@ -12360,14 +12844,16 @@ async def receive_campaign_variant_name(
                 repository, campaign_id, variant_id
             )
         except (ConflictError, NotFoundError) as exc:
-            await message.answer(
+            await answer_panel_input(
+                message, state,
                 f"<b>Не удалось изменить название:</b> {escape(operator_error_message(exc))}",
                 reply_markup=campaign_variant_input_cancel(campaign_id, page),
             )
             return
         await state.clear()
-        await message.answer(
-            "✅ <b>Название изменено.</b>\n\n" + campaign_variant_text(campaign, variant),
+        await answer_panel_input(
+            message, state,
+            "✓ <b>Название изменено.</b>\n\n" + campaign_variant_text(campaign, variant),
             reply_markup=campaign_variant_menu(
                 campaign, variant, variant_count=len(variants), page=page
             ),
@@ -12375,8 +12861,9 @@ async def receive_campaign_variant_name(
         return
     await state.update_data(variant_name=name)
     await state.set_state(CampaignVariantState.content)
-    await message.answer(
-        "<b>➕ Новый вариант · шаг 2 из 2</b>\n\n"
+    await answer_panel_input(
+        message, state,
+        "<b>Новый вариант · шаг 2 из 2</b>\n\n"
         "Отправьте готовый рекламный пост. Можно обычный или форматированный текст, "
         "а также одно фото, видео или документ с подписью. После создания в карточке "
         "варианта можно собрать альбом до 10 фото/видео.",
@@ -12425,17 +12912,19 @@ async def receive_campaign_variant_content(
             variant.variant_id,
         )
     except (ContentError, ConflictError, NotFoundError) as exc:
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             f"<b>Не удалось создать вариант:</b> {escape(operator_error_message(exc))}",
             reply_markup=campaign_variant_input_cancel(campaign_id, page),
         )
         return
     await state.clear()
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         (
-            "✅ <b>Текст варианта обновлён.</b>\n\n"
+            "✓ <b>Текст варианта обновлён.</b>\n\n"
             if edit_mode == "text"
-            else "✅ <b>Вариант добавлен и включён в ротацию.</b>\n\n"
+            else "✓ <b>Вариант добавлен и включён в ротацию.</b>\n\n"
         )
         + campaign_variant_text(campaign, variant),
         reply_markup=campaign_variant_menu(
@@ -12458,10 +12947,10 @@ async def start_campaign_contact_variant_add(
         campaign = await repository.get_campaign(int(campaign_id))
         variants = await repository.campaign_content_variants(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if len(variants) >= 10:
-        await callback.answer("Достигнут лимит: 10 вариантов", show_alert=True)
+        await _safe_callback_answer(callback, "Достигнут лимит: 10 вариантов", show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -12469,10 +12958,11 @@ async def start_campaign_contact_variant_add(
         variant_campaign_page=int(page),
         variant_edit_mode="contact_add",
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignVariantState.contact)
     await _edit_callback(
         callback,
-        "<b>📇 Новый контакт</b>\n\n"
+        "<b>Новый контакт</b>\n\n"
         "Самый быстрый способ — отправьте контакт через скрепку Telegram. "
         "Либо пришлите одной строкой:\n"
         "<code>+79991234567 | Алиса | Соколова</code>\n\n"
@@ -12494,10 +12984,10 @@ async def start_campaign_contact_variant_edit(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if variant.contact is None:
-        await callback.answer("Этот вариант не является контактом", show_alert=True)
+        await _safe_callback_answer(callback, "Этот вариант не является контактом", show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -12506,10 +12996,11 @@ async def start_campaign_contact_variant_edit(
         variant_id=variant.variant_id,
         variant_edit_mode="contact_edit",
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignVariantState.contact)
     await _edit_callback(
         callback,
-        f"<b>✏️ Контакт · {escape(variant.name)}</b>\n\n"
+        f"<b>Контакт · {escape(variant.name)}</b>\n\n"
         "Отправьте новый контакт через скрепку Telegram или строкой:\n"
         "<code>+79991234567 | Алиса | Соколова</code>\n\n"
         "Фамилию можно не указывать.",
@@ -12543,7 +13034,8 @@ async def receive_campaign_variant_contact(
             variant.variant_id,
         )
     except (ContentError, ConflictError, NotFoundError) as exc:
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             f"<b>Не удалось сохранить контакт:</b> {escape(operator_error_message(exc))}\n\n"
             "Отправьте контакт через скрепку или строкой "
             "<code>+79991234567 | Алиса | Соколова</code>.",
@@ -12551,11 +13043,12 @@ async def receive_campaign_variant_contact(
         )
         return
     await state.clear()
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         (
-            "✅ <b>Контакт обновлён.</b>\n\n"
+            "✓ <b>Контакт обновлён.</b>\n\n"
             if edit_mode == "contact_edit"
-            else "✅ <b>Контакт добавлен в ротацию.</b>\n\n"
+            else "✓ <b>Контакт добавлен в ротацию.</b>\n\n"
         )
         + campaign_variant_text(campaign, variant),
         reply_markup=campaign_variant_menu(
@@ -12579,7 +13072,7 @@ async def start_campaign_variant_rename(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -12588,10 +13081,11 @@ async def start_campaign_variant_rename(
         variant_id=variant.variant_id,
         variant_edit_mode="rename",
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignVariantState.name)
     await _edit_callback(
         callback,
-        f"<b>🏷 Название варианта</b>\n\nСейчас: <b>{escape(variant.name)}</b>. "
+        f"<b>Название варианта</b>\n\nСейчас: <b>{escape(variant.name)}</b>. "
         "Отправьте новое название длиной до 80 символов.",
         campaign_variant_input_cancel(campaign.id, int(page)),
     )
@@ -12609,7 +13103,7 @@ async def start_campaign_variant_text_edit(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -12618,10 +13112,11 @@ async def start_campaign_variant_text_edit(
         variant_id=variant.variant_id,
         variant_edit_mode="text",
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignVariantState.content)
     await _edit_callback(
         callback,
-        f"<b>✏️ Текст · {escape(variant.name)}</b>\n\n"
+        f"<b>Текст · {escape(variant.name)}</b>\n\n"
         "Отправьте новый текст. Форматирование Telegram сохранится. Альбом останется "
         "без изменений; при наличии медиа подпись ограничена 1024 символами.",
         campaign_variant_input_cancel(campaign.id, int(page)),
@@ -12640,9 +13135,12 @@ async def toggle_campaign_variant(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Вариант включён" if variant.enabled else "Вариант выключен")
+    await _safe_callback_answer(
+        callback,
+        "Вариант включён" if variant.enabled else "Вариант выключен",
+    )
     await _edit_callback(
         callback,
         campaign_variant_text(campaign, variant),
@@ -12663,7 +13161,7 @@ async def start_campaign_variant_media_add(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -12671,10 +13169,11 @@ async def start_campaign_variant_media_add(
         variant_campaign_page=int(page),
         variant_id=variant.variant_id,
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignVariantState.media)
     await _edit_callback(
         callback,
-        f"<b>🖼 Альбом · {escape(variant.name)}</b>\n\n"
+        f"<b>Альбом · {escape(variant.name)}</b>\n\n"
         "Отправьте одно фото или видео. Повторите действие для каждого следующего "
         "файла. В альбоме может быть до 10 элементов. Документ доступен только как "
         "одиночный файл.",
@@ -12699,14 +13198,16 @@ async def receive_campaign_variant_media(
         variant = await repository.add_campaign_variant_media(campaign_id, variant_id, media)
         campaign, variants, _ = await _campaign_variant_context(repository, campaign_id, variant_id)
     except (ContentError, ConflictError, NotFoundError) as exc:
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             f"<b>Не удалось добавить медиа:</b> {escape(operator_error_message(exc))}",
             reply_markup=campaign_variant_input_cancel(campaign_id, page),
         )
         return
     await state.clear()
-    await message.answer(
-        "✅ <b>Медиа добавлено в альбом.</b>\n\n" + campaign_variant_text(campaign, variant),
+    await answer_panel_input(
+        message, state,
+        "✓ <b>Медиа добавлено в альбом.</b>\n\n" + campaign_variant_text(campaign, variant),
         reply_markup=campaign_variant_menu(
             campaign, variant, variant_count=len(variants), page=page
         ),
@@ -12727,9 +13228,9 @@ async def remove_campaign_variant_media(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Медиа убрано из альбома")
+    await _safe_callback_answer(callback, "Медиа убрано из альбома")
     await _edit_callback(
         callback,
         campaign_variant_text(campaign, variant),
@@ -12749,11 +13250,11 @@ async def ask_delete_campaign_variant(
             repository, int(campaign_id), variant_id
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить вариант «{escape(variant.name)}»?</b>\n\n"
+        f"<b>Удалить вариант «{escape(variant.name)}»?</b>\n\n"
         "Он перестанет использоваться в новых рассылках. Уже созданные рассылки сохранят "
         "свой снимок контента и останутся неизменными.",
         campaign_variant_delete_confirmation(campaign.id, variant_id, int(page)),
@@ -12771,9 +13272,9 @@ async def confirm_delete_campaign_variant(
         campaign = await repository.get_campaign(int(campaign_id))
         variants = await repository.campaign_content_variants(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Вариант удалён")
+    await _safe_callback_answer(callback, "Вариант удалён")
     await _edit_callback(
         callback,
         campaign_variants_text(campaign, variants),
@@ -12796,11 +13297,12 @@ async def preview_campaign_variant(
         variant = variants[0] if variant_id == "primary" else _find_variant(variants, variant_id)
         await _send_variant_preview(bot, callback.from_user.id, variant, settings)
     except (ContentError, ConflictError, NotFoundError, TelegramBadRequest) as exc:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             callback_error_message(exc, prefix="Предпросмотр не отправлен"), show_alert=True
         )
         return
-    await callback.answer("Предпросмотр отправлен вам в этот чат")
+    await _safe_callback_answer(callback, "Предпросмотр отправлен вам в этот чат")
 
 
 @router.callback_query(F.data.startswith("campaign:preflight:"))
@@ -12815,7 +13317,7 @@ async def campaign_preflight(
     try:
         campaign = await repository.get_campaign(campaign_id_value)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     try:
         summary = await _inspect_campaign_with_visible_progress(
@@ -12827,7 +13329,7 @@ async def campaign_preflight(
         logger.warning("Campaign-only preflight failed for campaign %s", campaign.id, exc_info=True)
         await _edit_callback(
             callback,
-            f"<b>❌ Проверка не выполнена</b>\n\n{escape(operator_error_message(exc))}",
+            f"<b>× Проверка не выполнена</b>\n\n{escape(operator_error_message(exc))}",
             campaign_details_menu(campaign, page_value),
             answer=False,
         )
@@ -12856,18 +13358,22 @@ async def choose_campaign_sender_mode(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
         if campaign.mode != CampaignMode.BROADCAST:
-            await callback.answer("Режим аккаунтов доступен только для рассылки", show_alert=True)
+            await _safe_callback_answer(
+                callback,
+                "Режим аккаунтов доступен только для рассылки",
+                show_alert=True,
+            )
             return
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        "<b>👥 Как будут работать аккаунты</b>\n\n"
-        "🤖 <b>Умный выбор</b> — один пост в каждый чат; сервис выберет подходящий "
+        "<b>Как будут работать аккаунты</b>\n\n"
+        "<b>Умный выбор</b> — один пост в каждый чат; сервис выберет подходящий "
         "аккаунт из пула.\n\n"
-        "🚀 <b>Независимо</b> — каждый из выбранных аккаунтов публикует во всех чатах. "
+        "<b>Независимо</b> — каждый из выбранных аккаунтов публикует во всех чатах. "
         "Объём первого прохода увеличится пропорционально числу аккаунтов.\n\n"
         f"Выбрано аккаунтов: <b>{len(sender_ids)}</b>. Изменение применяется только к "
         "будущим запускам; уже созданная очередь не изменится.",
@@ -12890,9 +13396,10 @@ async def set_campaign_sender_mode(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ValueError, ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         "Режим будущих запусков: умный выбор"
         if campaign.sender_mode == BroadcastSenderMode.DISTRIBUTED
         else "Режим будущих запусков: независимые потоки"
@@ -12927,9 +13434,10 @@ async def toggle_campaign_hidden_mentions(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         "Отметки участников включены"
         if campaign.hidden_mentions_enabled
         else "Отметки участников выключены"
@@ -12951,11 +13459,11 @@ async def campaign_mention_cooldown(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        "<b>🔄 Ротация отметок рассылки</b>\n\n"
+        "<b>Ротация отметок рассылки</b>\n\n"
         "Один и тот же участник не будет повторно отмечен этой рассылкой в одном "
         "и том же чате, пока не пройдёт выбранное число дней. Разные чаты ведут "
         "историю независимо.",
@@ -12980,9 +13488,10 @@ async def set_campaign_mention_cooldown_preset(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         f"Повторная отметка — не раньше чем через {campaign.mention_cooldown_days} дн."
     )
     await _edit_callback(
@@ -13004,6 +13513,7 @@ async def begin_custom_campaign_mention_cooldown(
         campaign_mention_campaign_id=int(campaign_id),
         campaign_mention_page=int(page),
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignEditState.mention_cooldown)
     await _edit_callback(
         callback,
@@ -13020,7 +13530,7 @@ async def custom_campaign_mention_cooldown(
 ) -> None:
     raw_value = (message.text or "").strip()
     if not raw_value.isdigit() or not 1 <= int(raw_value) <= 365:
-        await message.answer("Укажите целое число дней от 1 до 365.")
+        await answer_panel_input(message, state, "Укажите целое число дней от 1 до 365.")
         return
     data = await state.get_data()
     campaign_id = int(data["campaign_mention_campaign_id"])
@@ -13032,10 +13542,11 @@ async def custom_campaign_mention_cooldown(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         campaign_details_text(campaign, sender_ids),
         reply_markup=campaign_details_menu(campaign, page),
     )
@@ -13062,12 +13573,12 @@ async def apply_campaign_profile(
         )
         sender_ids = await repository.campaign_sender_ids(campaign.id)
     except (ValueError, ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(f"Режим «{profile.title}» применён")
+    await _safe_callback_answer(callback, f"Режим «{profile.title}» применён")
     await _edit_callback(
         callback,
-        f"✅ <b>{profile.icon} {profile.title} рассылка настроена.</b>\n"
+        f"✓ <b>{profile.icon} {profile.title} рассылка настроена.</b>\n"
         f"{escape(profile.description)}.\n\n" + campaign_details_text(campaign, sender_ids),
         campaign_details_menu(campaign, int(page)),
         answer=False,
@@ -13084,10 +13595,14 @@ async def campaign_advanced_settings(
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not campaign.smart_timer_mode:
-        await callback.answer("Точная настройка доступна для умного сценария", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Точная настройка доступна для умного сценария",
+            show_alert=True,
+        )
         return
     await state.clear()
     await _edit_callback(
@@ -13110,16 +13625,16 @@ async def begin_campaign_advanced_edit(
             "Отправьте число минут от 1 до 10080. Для активного режима по умолчанию — 5.",
         ),
         "duration": (
-            "🗓 Срок работы",
+            "Срок работы",
             "Отправьте число часов от 0 до 168. 0 — работать до ручной остановки; "
             "24 — срок активного режима по умолчанию.",
         ),
         "depth": (
-            "👁 Глубина видимости",
+            "Глубина видимости",
             "Отправьте число новых сообщений от 1 до 100000. Быстрое значение по умолчанию — 10.",
         ),
         "check": (
-            "🔎 Частота проверки",
+            "Частота проверки",
             "Отправьте число секунд от 30 до 3600. По умолчанию — 60 секунд.",
         ),
         "maxwait": (
@@ -13130,12 +13645,12 @@ async def begin_campaign_advanced_edit(
     }
     spec = specs.get(field)
     if spec is None:
-        await callback.answer("Неизвестная настройка", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестная настройка", show_alert=True)
         return
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
     await state.update_data(
@@ -13143,6 +13658,7 @@ async def begin_campaign_advanced_edit(
         schedule_campaign_page=int(page),
         schedule_advanced_field=field,
     )
+    await _remember_origin(callback, state)
     await state.set_state(CampaignScheduleEditState.advanced_value)
     await _edit_callback(
         callback,
@@ -13174,7 +13690,11 @@ async def save_campaign_advanced_value(
     }
     minimum, maximum, unit = ranges.get(field, (1, 0, ""))
     if not minimum <= value <= maximum:
-        await message.answer(f"Введите целое число {unit} от {minimum} до {maximum}.")
+        await answer_panel_input(
+            message,
+            state,
+            f"Введите целое число {unit} от {minimum} до {maximum}.",
+        )
         return
     try:
         current = await repository.get_campaign(campaign_id)
@@ -13199,13 +13719,15 @@ async def save_campaign_advanced_value(
             **changes,
         )
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             f"Не удалось сохранить настройку: {escape(operator_error_message(exc))}"
         )
         return
     await state.clear()
-    await message.answer(
-        "✅ <b>Настройка сохранена.</b>\n\n" + campaign_advanced_text(campaign),
+    await answer_panel_input(
+        message, state,
+        "✓ <b>Настройка сохранена.</b>\n\n" + campaign_advanced_text(campaign),
         reply_markup=campaign_advanced_menu(campaign, page),
     )
 
@@ -13228,7 +13750,7 @@ async def toggle_campaign_advanced_setting(
         elif field == "failover":
             changes["auto_sender_failover"] = not current.auto_sender_failover
         else:
-            await callback.answer("Неизвестная настройка", show_alert=True)
+            await _safe_callback_answer(callback, "Неизвестная настройка", show_alert=True)
             return
         campaign = await repository.update_campaign_smart_schedule(
             current.id,
@@ -13237,9 +13759,9 @@ async def toggle_campaign_advanced_setting(
             **changes,
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Настройка изменена")
+    await _safe_callback_answer(callback, "Настройка изменена")
     await _edit_callback(
         callback,
         campaign_advanced_text(campaign),
@@ -13262,6 +13784,11 @@ def _campaign_reaction_step_count(campaign) -> int:
             campaign.dialogue_steps_json,
             primary_account_id=campaign.primary_account_id,
             primary_text=campaign.primary_text,
+            primary_html=campaign.primary_html,
+            primary_media_path=campaign.primary_media_path,
+            primary_media_kind=campaign.primary_media_kind,
+            primary_media_name=campaign.primary_media_name,
+            primary_media_size=campaign.primary_media_size,
             reply_account_id=campaign.reply_account_id,
             reply_text=campaign.reply_text,
             reply_delay_seconds=campaign.reply_delay_seconds,
@@ -13277,7 +13804,7 @@ async def campaign_reactions_settings(callback: CallbackQuery, repository: Admin
         step_count = _campaign_reaction_step_count(campaign)
         sender_count = len(await repository.campaign_sender_ids(campaign.id))
     except (NotFoundError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -13290,7 +13817,7 @@ async def campaign_reactions_settings(callback: CallbackQuery, repository: Admin
 async def update_campaign_reactions(callback: CallbackQuery, repository: AdminRepository) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) != 6:
-        await callback.answer("Неизвестная настройка реакций", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестная настройка реакций", show_alert=True)
         return
     _, _, action, value, campaign_id, page = parts
     emojis = {"like": "👍", "fire": "🔥", "heart": "❤️", "bolt": "⚡"}
@@ -13309,14 +13836,14 @@ async def update_campaign_reactions(callback: CallbackQuery, repository: AdminRe
                 current.id, dialogue_step=int(value)
             )
         else:
-            await callback.answer("Неизвестная настройка реакций", show_alert=True)
+            await _safe_callback_answer(callback, "Неизвестная настройка реакций", show_alert=True)
             return
         step_count = _campaign_reaction_step_count(campaign)
         sender_count = len(await repository.campaign_sender_ids(campaign.id))
     except (KeyError, ValueError, ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Настройка реакций сохранена")
+    await _safe_callback_answer(callback, "Настройка реакций сохранена")
     await _edit_callback(
         callback,
         campaign_reactions_text(campaign, step_count, sender_count=sender_count),
@@ -13331,11 +13858,11 @@ async def ask_delete_campaign(callback: CallbackQuery, repository: AdminReposito
     try:
         campaign = await repository.get_campaign(int(campaign_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        f"<b>🗑 Удалить «{escape(campaign.name)}»?</b>\n\n"
+        f"<b>Удалить «{escape(campaign.name)}»?</b>\n\n"
         "Удалить можно только рассылку, которая ещё ни разу не начиналась. "
         "История выполненных отправок не стирается.",
         campaign_delete_confirmation(campaign.id, int(page)),
@@ -13352,9 +13879,9 @@ async def confirm_delete_campaign(
     try:
         await repository.delete_campaign(int(campaign_id))
     except (NotFoundError, ConflictError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Сценарий удалён")
+    await _safe_callback_answer(callback, "Сценарий удалён")
     await _show_campaigns(callback, repository, settings, int(page))
 
 
@@ -13374,23 +13901,36 @@ async def ask_enqueue_campaign(
             target_list = await repository.get_target_list_view(campaign.target_list_id)
             target_count = target_list.approved_count
             if target_count == 0:
-                await callback.answer("В базе нет включённых чатов", show_alert=True)
+                await _safe_callback_answer(
+                    callback,
+                    "В базе нет включённых чатов",
+                    show_alert=True,
+                )
                 return
         elif campaign.target_id is not None:
             target = await repository.get_target(campaign.target_id)
             if not target.approved_by_operator:
-                await callback.answer("Выбранный чат сейчас выключен", show_alert=True)
+                await _safe_callback_answer(
+                    callback,
+                    "Выбранный чат сейчас выключен",
+                    show_alert=True,
+                )
                 return
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not campaign.enabled:
-        await callback.answer("Эта рассылка остановлена. Сначала включите её.", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Эта рассылка остановлена. Сначала включите её.",
+            show_alert=True,
+        )
         return
     worker_scope = settings.worker_campaign_id_scope
     if worker_scope is not None and campaign.id not in worker_scope:
         active_ids = ", ".join(f"#{item}" for item in sorted(worker_scope))
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Фоновый worker сейчас ограничен рассылками "
             f"{active_ids}. Эта рассылка не начнётся, пока ограничение не снимут.",
             show_alert=True,
@@ -13408,7 +13948,8 @@ async def ask_enqueue_campaign(
         else (target_count or 1) * campaign.repeat_count
     )
     if planned_tasks > 5000:
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Слишком много отправок: уменьшите число проходов или чатов до 5000",
             show_alert=True,
         )
@@ -13431,7 +13972,7 @@ async def ask_enqueue_campaign(
         logger.warning("Campaign preflight failed for campaign %s", campaign.id, exc_info=True)
         await _edit_callback(
             callback,
-            f"<b>❌ Проверка не выполнена</b>\n\n{escape(operator_error_message(exc))}",
+            f"<b>× Проверка не выполнена</b>\n\n{escape(operator_error_message(exc))}",
             campaign_details_menu(campaign, int(page)),
             answer=False,
         )
@@ -13469,9 +14010,17 @@ async def enqueue_campaign(
     run_queue: RunQueue,
     settings: Settings,
 ) -> None:
-    _, _, launch_action, campaign_id, page = (callback.data or "").split(":")
+    parts = (callback.data or "").split(":")
+    if len(parts) != 6 or re.fullmatch(r"[0-9a-f]{12}", parts[-1]) is None:
+        await _safe_callback_answer(
+            callback,
+            "Кнопка запуска устарела. Откройте рассылку и подтвердите новый запуск.",
+            show_alert=True,
+        )
+        return
+    _, _, launch_action, campaign_id, page, launch_token = parts
     if launch_action not in {"confirm", "deferred"}:
-        await callback.answer("Неизвестный вариант запуска", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный вариант запуска", show_alert=True)
         return
     allow_deferred_start = launch_action == "deferred"
     campaign_id_value = int(campaign_id)
@@ -13479,19 +14028,23 @@ async def enqueue_campaign(
     try:
         campaign = await repository.get_campaign(campaign_id_value)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     worker_scope = settings.worker_campaign_id_scope
     if worker_scope is not None and campaign.id not in worker_scope:
         active_ids = ", ".join(f"#{item}" for item in sorted(worker_scope))
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Фоновый worker сейчас ограничен рассылками "
             f"{active_ids}. Эта рассылка не начнётся, пока ограничение не снимут.",
             show_alert=True,
         )
         return
-    launch_key = uuid4().hex
-    await callback.answer("Проверяю свежесть результата и ставлю рассылку в очередь…")
+    launch_key = f"botchat:{campaign_id_value}:{launch_token}"
+    await _safe_callback_answer(
+        callback,
+        "Проверяю свежесть результата и ставлю рассылку в очередь…",
+    )
     summary: CampaignPreflightSummary | None = None
     try:
         # Review already performed the full read-only RPC preflight. Reuse its
@@ -13538,11 +14091,11 @@ async def enqueue_campaign(
         launch, launch_runs = await repository.get_launch(max(run.id for run in runs))
         targets = await repository.targets_by_ids({run.target_id for run in launch_runs})
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        "✅ <b>Рассылка поставлена в очередь.</b>\n\n"
+        "✓ <b>Рассылка поставлена в очередь.</b>\n\n"
         + launch_details_text(launch, launch_runs, targets),
         launch_details_menu(launch, 0),
         answer=False,
@@ -13556,7 +14109,7 @@ async def launch_details(callback: CallbackQuery, repository: AdminRepository) -
         launch, runs = await repository.get_launch(int(anchor_run_id))
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -13575,10 +14128,14 @@ async def begin_active_launch_text_edit(
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not launch.active:
-        await callback.answer("В этой рассылке больше нет будущих отправок", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "В этой рассылке больше нет будущих отправок",
+            show_alert=True,
+        )
         return
     await _remember_origin(callback, state)
     await state.update_data(
@@ -13589,7 +14146,7 @@ async def begin_active_launch_text_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "✏️ Будущие посты активной рассылки",
+            "Будущие посты активной рассылки",
             1,
             1,
             "Отправьте новый рекламный текст. Он попадёт только в ещё не "
@@ -13634,7 +14191,7 @@ async def save_active_launch_text(
     await _edit_origin_data(
         bot,
         data,
-        f"✅ <b>Новый текст применён к будущим отправкам: {count}.</b>\n\n"
+        f"✓ <b>Новый текст применён к будущим отправкам: {count}.</b>\n\n"
         + launch_details_text(launch, runs, targets),
         launch_details_menu(launch, page),
     )
@@ -13651,10 +14208,14 @@ async def begin_active_launch_interval_edit(
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not launch.active or not launch.smart_timer_mode:
-        await callback.answer("Автоматическая рассылка уже завершена", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Автоматическая рассылка уже завершена",
+            show_alert=True,
+        )
         return
     await _remember_origin(callback, state)
     await state.update_data(
@@ -13709,7 +14270,7 @@ async def save_active_launch_interval(
     await _edit_origin_data(
         bot,
         data,
-        f"✅ <b>Интервал изменён на {minutes} мин. для {count} будущих отправок.</b>\n\n"
+        f"✓ <b>Интервал изменён на {minutes} мин. для {count} будущих отправок.</b>\n\n"
         + launch_details_text(launch, runs, targets),
         launch_details_menu(launch, page),
     )
@@ -13726,10 +14287,10 @@ async def begin_active_launch_depth_edit(
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not launch.active or not launch.smart_timer_mode:
-        await callback.answer("Активная рассылка уже завершена", show_alert=True)
+        await _safe_callback_answer(callback, "Активная рассылка уже завершена", show_alert=True)
         return
     await _remember_origin(callback, state)
     await state.update_data(
@@ -13740,7 +14301,7 @@ async def begin_active_launch_depth_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "👁 Порог новых сообщений",
+            "Порог новых сообщений",
             1,
             1,
             "После скольких новых сообщений в конкретном чате публиковать следующий "
@@ -13785,7 +14346,7 @@ async def save_active_launch_depth(
     await _edit_origin_data(
         bot,
         data,
-        f"✅ <b>Порог изменён: после {messages} новых сообщений.</b> "
+        f"✓ <b>Порог изменён: после {messages} новых сообщений.</b> "
         f"Обновлено будущих отправок: {count}.\n\n" + launch_details_text(launch, runs, targets),
         launch_details_menu(launch, page),
     )
@@ -13802,10 +14363,10 @@ async def begin_active_launch_max_wait_edit(
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not launch.active or not launch.smart_timer_mode:
-        await callback.answer("Активная рассылка уже завершена", show_alert=True)
+        await _safe_callback_answer(callback, "Активная рассылка уже завершена", show_alert=True)
         return
     await _remember_origin(callback, state)
     await state.update_data(
@@ -13859,7 +14420,7 @@ async def save_active_launch_max_wait(
     await _edit_origin_data(
         bot,
         data,
-        f"✅ <b>Условие повтора обновлено: {mode}.</b> "
+        f"✓ <b>Условие повтора обновлено: {mode}.</b> "
         f"Обновлено будущих отправок: {count}.\n\n" + launch_details_text(launch, runs, targets),
         launch_details_menu(launch, page),
     )
@@ -13876,10 +14437,14 @@ async def begin_active_launch_duration_edit(
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not launch.active or not launch.smart_timer_mode:
-        await callback.answer("Автоматическая рассылка уже завершена", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Автоматическая рассылка уже завершена",
+            show_alert=True,
+        )
         return
     await _remember_origin(callback, state)
     await state.update_data(
@@ -13890,7 +14455,7 @@ async def begin_active_launch_duration_edit(
     await _edit_callback(
         callback,
         wizard_text(
-            "🗓 Работать ещё",
+            "Работать ещё",
             1,
             1,
             "Сколько часов рассылке работать <b>с текущего момента</b>? "
@@ -13914,7 +14479,7 @@ async def save_active_launch_duration(
     try:
         hours = int(raw)
     except ValueError:
-        hours = 0
+        hours = -1
     if not 0 <= hours <= 168:
         await message.answer("Введите целое число часов от 0 до 168.")
         return
@@ -13935,11 +14500,11 @@ async def save_active_launch_duration(
         bot,
         data,
         (
-            "✅ <b>Рассылка будет работать до ручной остановки; "
+            "✓ <b>Рассылка будет работать до ручной остановки; "
             f"обновлено отправок: {count}.</b>\n\n"
             if hours == 0
             else (
-                f"✅ <b>Рассылка будет активна ещё {hours} ч.; обновлено отправок: {count}.</b>\n\n"
+                f"✓ <b>Рассылка будет активна ещё {hours} ч.; обновлено отправок: {count}.</b>\n\n"
             )
         )
         + launch_details_text(launch, runs, targets),
@@ -13960,7 +14525,7 @@ async def cancel_active_launch_edit(
         launch, runs = await repository.get_launch(int(anchor_run_id))
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -13978,9 +14543,9 @@ async def archive_launch(
     try:
         count = await repository.set_launch_archived(int(anchor_run_id), True)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(f"Рассылка убрана в архив · отправок {count}")
+    await _safe_callback_answer(callback, f"Рассылка убрана в архив · отправок {count}")
     await _show_runs(callback, repository, int(page))
 
 
@@ -13993,9 +14558,9 @@ async def restore_launch(
     try:
         count = await repository.set_launch_archived(int(anchor_run_id), False)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(f"Рассылка возвращена · отправок {count}")
+    await _safe_callback_answer(callback, f"Рассылка возвращена · отправок {count}")
     await _show_archived_runs(callback, repository, int(page))
 
 
@@ -14005,10 +14570,10 @@ async def ask_cancel_launch(callback: CallbackQuery, repository: AdminRepository
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if not launch.pending_work:
-        await callback.answer("Партия уже завершена", show_alert=True)
+        await _safe_callback_answer(callback, "Партия уже завершена", show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -14029,9 +14594,9 @@ async def confirm_cancel_launch(
         launch, runs = await repository.get_launch(int(anchor_run_id))
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(f"Остановка запрошена для отправок: {count}")
+    await _safe_callback_answer(callback, f"Остановка запрошена для отправок: {count}")
     await _edit_callback(
         callback,
         launch_details_text(launch, runs, targets),
@@ -14049,14 +14614,19 @@ async def ask_retry_failed_launch(
     try:
         launch, _ = await repository.get_launch(int(anchor_run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    if not launch.failed:
-        await callback.answer("Ошибок для повтора нет", show_alert=True)
+    if not launch.retryable_failed:
+        await _safe_callback_answer(
+            callback,
+            "Нет подтверждённо неотправленных задач. "
+            "Неизвестные исходы и удалённые сообщения не повторяются",
+            show_alert=True,
+        )
         return
     await _edit_callback(
         callback,
-        f"<b>🔁 Повторить {launch.failed} неотправленных?</b>\n\n"
+        f"<b>Повторить {launch.retryable_failed} неотправленных?</b>\n\n"
         "Успешные чаты не затрагиваются. Перед повтором исправьте причину ошибки: "
         "прокси, доступ аккаунта или ограничения чата.",
         launch_retry_confirmation(launch.anchor_run_id, int(page)),
@@ -14075,15 +14645,15 @@ async def confirm_retry_failed_launch(
         launch, runs = await repository.get_launch(int(anchor_run_id))
         targets = await repository.targets_by_ids({run.target_id for run in runs})
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     if count == 0:
-        await callback.answer("Ошибок для повтора уже нет", show_alert=True)
+        await _safe_callback_answer(callback, "Ошибок для повтора уже нет", show_alert=True)
         return
-    await callback.answer(f"Возвращено в очередь: {count}")
+    await _safe_callback_answer(callback, f"Возвращено в очередь: {count}")
     await _edit_callback(
         callback,
-        "✅ <b>Неотправленные чаты возвращены в очередь.</b>\n\n"
+        "✓ <b>Неотправленные чаты возвращены в очередь.</b>\n\n"
         + launch_details_text(launch, runs, targets),
         launch_details_menu(launch, int(page)),
         answer=False,
@@ -14097,7 +14667,7 @@ async def run_details(callback: CallbackQuery, repository: AdminRepository) -> N
         run, actions = await repository.get_run(int(run_id))
         target = await repository.get_target(run.target_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -14116,9 +14686,9 @@ async def cancel_run(
     try:
         run = await run_queue.cancel(int(run_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(f"Отправка #{run.id}: {run.status.value}")
+    await _safe_callback_answer(callback, f"Отправка #{run.id}: {run.status.value}")
     await _show_runs(callback, repository, int(page))
 
 
@@ -14156,7 +14726,7 @@ async def page_channel_comment_chain_account(
     try:
         page = max(0, int((callback.data or "").rsplit(":", 1)[1]))
     except (IndexError, ValueError):
-        await callback.answer("Некорректная страница", show_alert=True)
+        await _safe_callback_answer(callback, "Некорректная страница", show_alert=True)
         return
     accounts, _ = await _comment_accounts(repository, settings)
     await _edit_callback(
@@ -14198,6 +14768,7 @@ async def channel_comment_chain_show(
 async def channel_comment_chain_account(callback: CallbackQuery, state: FSMContext) -> None:
     account_id = int((callback.data or "").rsplit(":", 1)[1])
     await state.update_data(chain_account_id=account_id)
+    await _remember_origin(callback, state)
     await state.set_state(ChannelCommentCreateState.chain_text)
     await _edit_callback(
         callback,
@@ -14217,7 +14788,7 @@ async def channel_comment_chain_text(
     try:
         text, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(
         chain_text=text,
@@ -14228,7 +14799,8 @@ async def channel_comment_chain_text(
         chain_media_size=media.size if media else None,
     )
     await state.set_state(ChannelCommentCreateState.chain_delay)
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         "Через сколько после прошлого комментария отправить этот ответ?\n"
         "Примеры: <code>30s</code>, <code>5m</code>, <code>1h</code>.",
         reply_markup=cancel_menu(),
@@ -14245,12 +14817,12 @@ async def channel_comment_chain_delay(
     try:
         delay = _channel_comment_delay(message.text or "")
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     data = await state.get_data()
     steps = [dict(item) for item in data.get("comment_steps", []) if isinstance(item, dict)]
     if len(steps) >= 20:
-        await message.answer("В цепочке уже максимум 20 сообщений.")
+        await answer_panel_input(message, state, "В цепочке уже максимум 20 сообщений.")
         return
     steps.append(
         {
@@ -14270,7 +14842,8 @@ async def channel_comment_chain_delay(
     await state.update_data(comment_steps=steps)
     await state.set_state(ChannelCommentCreateState.chain_account)
     _, labels = await _comment_accounts(repository, settings)
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         channel_comment_draft_text(await state.get_data(), labels),
         reply_markup=channel_comment_chain_menu(len(steps)),
     )
@@ -14283,8 +14856,13 @@ async def channel_comment_chain_delay(
 async def channel_comment_chain_finish(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     if len(data.get("comment_steps", [])) < 2:
-        await callback.answer("Добавьте хотя бы один ответ к первому комментарию.", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Добавьте хотя бы один ответ к первому комментарию.",
+            show_alert=True,
+        )
         return
+    await _remember_origin(callback, state)
     await state.set_state(ChannelCommentCreateState.initial_delay)
     await _edit_callback(
         callback,
@@ -14305,12 +14883,13 @@ async def channel_comment_initial_delay(
     try:
         delay = _channel_comment_delay(message.text or "")
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.update_data(initial_delay_seconds=delay)
     _, labels = await _comment_accounts(repository, settings)
     await state.set_state(ChannelCommentCreateState.confirm)
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         channel_comment_draft_text(await state.get_data(), labels)
         + (
             "\n\n<i>После включения сервис не возьмёт старые посты. "
@@ -14318,6 +14897,42 @@ async def channel_comment_initial_delay(
         ),
         reply_markup=channel_comment_confirmation_menu(),
     )
+
+
+@router.callback_query(
+    ChannelCommentCreateState.confirm,
+    F.data.startswith("comments:review:"),
+)
+async def edit_channel_comment_review(callback: CallbackQuery, state: FSMContext) -> None:
+    await _remember_origin(callback, state)
+    section_name = (callback.data or "").rsplit(":", 1)[-1]
+    if section_name == "channels":
+        await state.update_data(comment_edit_channels=True)
+        await state.set_state(ChannelCommentCreateState.channel)
+        text = (
+            "<b>Каналы</b>\n\nПришлите новый список @username или ссылок, "
+            "по одному в строке, либо UTF-8 .txt. Остальные настройки черновика сохранятся."
+        )
+    elif section_name == "delay":
+        data = await state.get_data()
+        editing = data.get("comment_mode") == ChannelCommentMode.MESSAGE_EDIT.value
+        await state.set_state(
+            ChannelCommentCreateState.message_edit_delay
+            if editing
+            else ChannelCommentCreateState.initial_delay
+        )
+        text = (
+            "<b>Задержка редактирования</b>\n\nУкажите от <code>5m</code> до <code>30m</code>."
+            if editing
+            else (
+                "<b>Задержка первого комментария</b>\n\n"
+                "Примеры: <code>0</code>, <code>30s</code>, <code>5m</code>."
+            )
+        )
+    else:
+        await _safe_callback_answer(callback, "Настройка не найдена", show_alert=True)
+        return
+    await _edit_callback(callback, text, cancel_menu())
 
 
 @router.callback_query(
@@ -14335,10 +14950,21 @@ async def create_channel_comment_rule(
     # resolve several channels and their linked discussion groups. Acknowledge
     # the button before doing network work; the durable result is delivered as
     # a normal message below instead of a late (and failing) callback toast.
-    await callback.answer("Проверяем каналы и доступ аккаунта…")
+    await _safe_callback_answer(callback, "Проверяем каналы и доступ аккаунта…")
+    creation_token = uuid4().hex
+    await state.update_data(comment_creation_token=creation_token)
     data = await state.get_data()
     mode = ChannelCommentMode(str(data["comment_mode"]))
     skipped_channels: list[tuple[str, str]] = []
+
+    async def before_create() -> None:
+        latest = await state.get_data()
+        if (
+            await state.get_state() != ChannelCommentCreateState.confirm.state
+            or latest.get("comment_creation_token") != creation_token
+        ):
+            raise ConflictError("Настройка отменена или открыт другой черновик")
+
     try:
         steps = [
             DialogueStep(**item) for item in data.get("comment_steps", []) if isinstance(item, dict)
@@ -14388,11 +15014,12 @@ async def create_channel_comment_rule(
                 else None
             ),
             preflight_failures=skipped_channels,
+            before_create=before_create,
         )
     except (ConflictError, ValueError) as exc:
         if callback.message is not None:
             await callback.message.answer(
-                f"⚠️ <b>Настройка не создана</b>\n\n{escape(callback_error_message(exc))}"
+                f"! <b>Настройка не создана</b>\n\n{escape(callback_error_message(exc))}"
             )
         return
     await state.clear()
@@ -14401,8 +15028,7 @@ async def create_channel_comment_rule(
         "Канал включён: новые посты будут отслеживаться"
         if count == 1
         else f"Включено каналов: {count}"
-        + (f" · пропущено: {len(skipped_channels)}" if skipped_channels else "")
-    )
+    ) + (f" · пропущено: {len(skipped_channels)}" if skipped_channels else "")
     await _show_channel_comment_details(
         callback,
         channel_comments,
@@ -14412,7 +15038,7 @@ async def create_channel_comment_rule(
         page=0,
     )
     if callback.message is not None:
-        await callback.message.answer(f"✅ {result_text}")
+        await callback.message.answer(f"✓ {result_text}")
     if skipped_channels and callback.message is not None:
         skipped_text = "\n".join(
             f"• <code>{escape(channel_ref)}</code> — {escape(reason)}"
@@ -14445,7 +15071,7 @@ async def channel_comment_details(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("comments:mentions:toggle:"))
@@ -14462,7 +15088,8 @@ async def toggle_channel_comment_hidden_mentions(
             current.rule.id,
             not current.rule.hidden_mentions_enabled,
         )
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Отметки участников включены"
             if rule.hidden_mentions_enabled
             else "Отметки участников выключены"
@@ -14476,7 +15103,7 @@ async def toggle_channel_comment_hidden_mentions(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("comments:mentions:cooldown:"))
@@ -14488,11 +15115,11 @@ async def channel_comment_mention_cooldown(
     try:
         view = await channel_comments.get_rule_view(int(rule_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
-        "<b>🔄 Ротация отметок</b>\n\n"
+        "<b>Ротация отметок</b>\n\n"
         "Один и тот же участник не будет повторно отмечен в этом канале, пока "
         "не пройдёт выбранное число дней. Уже зарезервированные комментарии сохранят "
         "свой безопасный список.",
@@ -14526,9 +15153,10 @@ async def set_channel_comment_mention_cooldown_preset(
             page=int(page),
         )
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer(
+    await _safe_callback_answer(
+        callback,
         f"Повторная отметка — не раньше чем через {rule.mention_cooldown_days} дн."
     )
 
@@ -14544,6 +15172,7 @@ async def begin_custom_channel_comment_mention_cooldown(
         comment_mention_rule_id=int(rule_id),
         comment_mention_page=int(page),
     )
+    await _remember_origin(callback, state)
     await state.set_state(ChannelCommentCreateState.mention_cooldown)
     await _edit_callback(
         callback,
@@ -14562,7 +15191,7 @@ async def custom_channel_comment_mention_cooldown(
 ) -> None:
     raw_value = (message.text or "").strip()
     if not raw_value.isdigit() or not 1 <= int(raw_value) <= 365:
-        await message.answer("Укажите целое число дней от 1 до 365.")
+        await answer_panel_input(message, state, "Укажите целое число дней от 1 до 365.")
         return
     data = await state.get_data()
     rule_id = int(data["comment_mention_rule_id"])
@@ -14571,11 +15200,12 @@ async def custom_channel_comment_mention_cooldown(
         await channel_comments.set_rule_mention_cooldown_days(rule_id, int(raw_value))
         view = await channel_comments.get_rule_view(rule_id)
     except (ConflictError, NotFoundError) as exc:
-        await message.answer(escape(operator_error_message(exc)))
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
         return
     await state.clear()
     _, labels = await _comment_accounts(repository, settings)
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         channel_comment_details_text(view, labels),
         reply_markup=channel_comment_details_menu(view, page=page),
     )
@@ -14601,7 +15231,7 @@ async def toggle_channel_comment_rule(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("comments:autoreplace:"))
@@ -14618,7 +15248,8 @@ async def toggle_channel_comment_auto_replacement(
             current.rule.id,
             not current.rule.auto_replace_primary_account,
         )
-        await callback.answer(
+        await _safe_callback_answer(
+            callback,
             "Автозамена аккаунта включена"
             if rule.auto_replace_primary_account
             else "Автозамена аккаунта выключена"
@@ -14632,7 +15263,7 @@ async def toggle_channel_comment_auto_replacement(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("comments:check:"))
@@ -14672,10 +15303,11 @@ async def begin_replace_channel_comment_account(
     _, _, _, rule_id, page = (callback.data or "").split(":")
     accounts, _ = await _comment_accounts(repository, settings)
     if not accounts:
-        await callback.answer("Нет активных аккаунтов для замены", show_alert=True)
+        await _safe_callback_answer(callback, "Нет активных аккаунтов для замены", show_alert=True)
         return
     await state.clear()
     await state.update_data(comment_replace_rule_id=int(rule_id), comment_replace_page=int(page))
+    await _remember_origin(callback, state)
     await state.set_state(ChannelCommentCreateState.replace_primary_account)
     await _edit_callback(
         callback,
@@ -14708,7 +15340,11 @@ async def page_replace_channel_comment_account(
         rule_page = int(data["comment_replace_page"])
     except (IndexError, KeyError, TypeError, ValueError):
         await state.clear()
-        await callback.answer("Черновик замены устарел. Откройте правило заново.", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Черновик замены устарел. Откройте правило заново.",
+            show_alert=True,
+        )
         return
     accounts, _ = await _comment_accounts(repository, settings)
     await _edit_callback(
@@ -14744,10 +15380,10 @@ async def replace_channel_comment_account(
     try:
         await channel_comments.replace_primary_account(rule_id, account_id)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await state.clear()
-    await callback.answer("Первый аккаунт заменён")
+    await _safe_callback_answer(callback, "Первый аккаунт заменён")
     await _show_channel_comment_details(
         callback,
         channel_comments,
@@ -14776,7 +15412,7 @@ async def open_channel_comment_reactions(
             page=int(page),
         )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
 
 
 @router.callback_query(F.data.startswith("comments:reactions:toggle:"))
@@ -14787,7 +15423,7 @@ async def toggle_channel_comment_reactions(
     settings: Settings,
 ) -> None:
     _, _, _, rule_id, page = (callback.data or "").split(":")
-    await callback.answer("Обновляем реакции…")
+    await _safe_callback_answer(callback, "Обновляем реакции…")
     try:
         view = await channel_comments.get_rule_view(int(rule_id))
         await channel_comments.update_rule_reactions(
@@ -14796,7 +15432,7 @@ async def toggle_channel_comment_reactions(
         )
     except (ConflictError, NotFoundError) as exc:
         if callback.message is not None:
-            await callback.message.answer(f"⚠️ {escape(callback_error_message(exc))}")
+            await callback.message.answer(f"! {escape(callback_error_message(exc))}")
         return
     await _show_channel_comment_reactions(
         callback,
@@ -14818,12 +15454,12 @@ async def set_channel_comment_reaction_emoji(
     _, _, _, rule_id, page, key = (callback.data or "").split(":")
     emoji = {"like": "👍", "fire": "🔥", "heart": "❤️", "bolt": "⚡"}.get(key)
     if emoji is None:
-        await callback.answer("Неизвестная реакция", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестная реакция", show_alert=True)
         return
     try:
         await channel_comments.update_rule_reactions(int(rule_id), emoji=emoji)
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _show_channel_comment_reactions(
         callback,
@@ -14846,7 +15482,7 @@ async def set_channel_comment_reaction_count(
     try:
         await channel_comments.update_rule_reactions(int(rule_id), count=int(raw_count))
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _show_channel_comment_reactions(
         callback,
@@ -14867,7 +15503,7 @@ async def cycle_channel_comment_reaction_step(
 ) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) not in {5, 6}:
-        await callback.answer("Неизвестный шаг комментария", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный шаг комментария", show_alert=True)
         return
     _, _, _, rule_id, page, *selected = parts
     try:
@@ -14889,7 +15525,7 @@ async def cycle_channel_comment_reaction_step(
             dialogue_step=next_step,
         )
     except (ConflictError, NotFoundError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _show_channel_comment_reactions(
         callback,
@@ -14912,13 +15548,13 @@ async def open_channel_comment_reaction_accounts(
     try:
         view = await channel_comments.get_rule_view(int(rule_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     accounts, _ = await _comment_accounts(repository, settings)
     selected = channel_comment_reaction_account_ids(view)
     await _edit_callback(
         callback,
-        "<b>👥 Аккаунты для реакций</b>\n\n"
+        "<b>Аккаунты для реакций</b>\n\n"
         "Выберите аккаунты, которые могут ставить реакции на собственный комментарий. "
         "Автор конкретного комментария будет исключён автоматически.",
         channel_comment_reaction_account_picker(
@@ -14953,12 +15589,12 @@ async def toggle_channel_comment_reaction_account(
         )
         refreshed = await channel_comments.get_rule_view(int(rule_id))
     except (ConflictError, NotFoundError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     accounts, _ = await _comment_accounts(repository, settings)
     await _edit_callback(
         callback,
-        "<b>👥 Аккаунты для реакций</b>\n\n"
+        "<b>Аккаунты для реакций</b>\n\n"
         "Выберите аккаунты, которые могут ставить реакции на собственный комментарий. "
         "Автор конкретного комментария будет исключён автоматически.",
         channel_comment_reaction_account_picker(
@@ -14984,8 +15620,11 @@ async def channel_comment_runs(
         reaction_summaries = await channel_comments.recent_run_reaction_summaries(
             [int(run.id) for run in runs if run.id is not None]
         )
+        delivery_summaries = await channel_comments.recent_run_delivery_summaries(
+            [int(run.id) for run in runs if run.id is not None]
+        )
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -14993,6 +15632,7 @@ async def channel_comment_runs(
             runs,
             channel_ref=view.rule.channel_ref,
             reaction_summaries=reaction_summaries,
+            delivery_summaries=delivery_summaries,
         ),
         InlineKeyboardMarkup(
             inline_keyboard=[
@@ -15015,9 +15655,9 @@ async def confirm_delete_channel_comment_rule(
     try:
         await channel_comments.delete_rule(int(rule_id))
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
-    await callback.answer("Канал архивирован; история сохранена")
+    await _safe_callback_answer(callback, "Канал архивирован; история сохранена")
     await _show_channel_comments(callback, channel_comments, page=int(page))
 
 
@@ -15037,6 +15677,7 @@ async def _show_direct_messages_home(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
+    await direct_messages.get_primary_subscriber_list()
     dashboard = await direct_messages.dashboard()
     await _edit_callback(
         callback,
@@ -15052,6 +15693,7 @@ async def open_direct_messages_home(
     state: FSMContext,
     direct_messages: DirectMessageService,
 ) -> None:
+    await _safe_callback_answer(callback)
     await state.clear()
     await _show_direct_messages_home(callback, direct_messages)
 
@@ -15063,6 +15705,7 @@ async def begin_subscriber_import(
     settings: Settings,
 ) -> None:
     await state.clear()
+    await _remember_origin(callback, state)
     await state.set_state(SubscriberImportState.document)
     await _edit_callback(
         callback,
@@ -15071,29 +15714,210 @@ async def begin_subscriber_import(
     )
 
 
+async def _show_direct_quarantine(
+    callback: CallbackQuery, direct_messages: DirectMessageService,
+    page: int, *, notice: str | None = None,
+) -> None:
+    page = max(0, page)
+    recipients, total = await direct_messages.list_quarantined_recipients(page)
+    last_page = max(0, (total - 1) // 5)
+    if page > last_page:
+        page = last_page
+        recipients, total = await direct_messages.list_quarantined_recipients(page)
+    await _edit_callback(
+        callback, direct_quarantine_text(recipients, total, page, notice=notice),
+        direct_quarantine_menu(recipients, total, page), answer=False,
+    )
+
+
+@router.callback_query(F.data.startswith("dm:quarantine:"))
+async def open_direct_quarantine(
+    callback: CallbackQuery, state: FSMContext, direct_messages: DirectMessageService,
+) -> None:
+    await _safe_callback_answer(callback)
+    await state.clear()
+    page = int((callback.data or "").rsplit(":", 1)[1])
+    await _show_direct_quarantine(callback, direct_messages, page)
+
+
+@router.callback_query(F.data.startswith("dm:quarantinecheck:"))
+async def recheck_direct_quarantine(
+    callback: CallbackQuery,
+    state: FSMContext,
+    direct_messages: DirectMessageService,
+) -> None:
+    await _safe_callback_answer(callback)
+    await state.clear()
+    _, _, subscriber_id, page = (callback.data or "").split(":")
+    await _edit_callback(
+        callback,
+        "<b>Читаю свежие данные Telegram…</b>\n\nКарантин сохраняется до результата проверки.",
+        direct_quarantine_menu([], 0, int(page)),
+        answer=False,
+    )
+    try:
+        notice = await direct_messages.recheck_quarantined_recipient(int(subscriber_id))
+    except (ConflictError, NotFoundError) as exc:
+        notice = str(exc)
+    await _show_direct_quarantine(callback, direct_messages, int(page), notice=notice)
+
+
 @router.callback_query(F.data == "dm:blacklist")
 async def open_direct_blacklist(
     callback: CallbackQuery,
     state: FSMContext,
     direct_messages: DirectMessageService,
 ) -> None:
+    await _safe_callback_answer(callback)
     await state.clear()
     dashboard = await direct_messages.dashboard()
     await _edit_callback(
         callback,
         direct_blacklist_text(dashboard.blacklist_count),
         direct_blacklist_menu(),
+        answer=False,
     )
 
 
 @router.callback_query(F.data == "dm:blacklist:add")
 async def begin_direct_blacklist_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    await _remember_origin(callback, state)
     await state.set_state(DirectBlacklistState.ids)
     await _edit_callback(
         callback,
         direct_blacklist_add_prompt_text(),
         direct_cancel_menu(),
+    )
+
+
+@router.callback_query(F.data == "dm:blacklist:parse")
+async def begin_direct_blacklist_chat_parse(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _remember_origin(callback, state)
+    await state.set_state(DirectBlacklistChatParseState.chat_ref)
+    await _edit_callback(
+        callback,
+        direct_blacklist_parse_prompt_text(),
+        direct_cancel_menu(),
+    )
+
+
+@router.message(DirectBlacklistChatParseState.chat_ref)
+async def set_direct_blacklist_chat_parse_ref(message: Message, state: FSMContext) -> None:
+    chat_ref = (message.text or "").strip()
+    if not chat_ref:
+        await answer_panel_input(
+            message,
+            state,
+            "Отправьте ссылку, @username или числовой ID чата.",
+        )
+        return
+    await state.update_data(direct_blacklist_parse_chat_ref=chat_ref)
+    await state.set_state(None)
+    await answer_panel_input(
+        message, state,
+        direct_blacklist_parse_mode_text(chat_ref), reply_markup=direct_blacklist_parse_mode_menu()
+    )
+
+
+@router.callback_query(F.data.startswith("dm:blacklist:parsemode:"))
+async def run_direct_blacklist_chat_parse(
+    callback: CallbackQuery,
+    state: FSMContext,
+    blacklist_parser: ChatBlacklistParser,
+) -> None:
+    mode = (callback.data or "").rsplit(":", 1)[-1]
+    data = await state.get_data()
+    chat_ref = str(data.get("direct_blacklist_parse_chat_ref") or "")
+    if not chat_ref:
+        await _safe_callback_answer(
+            callback,
+            "Ссылка на чат не сохранена. Начните заново.",
+            show_alert=True,
+        )
+        return
+    await _safe_callback_answer(callback, "Читаю чат…")
+    await _edit_callback(
+        callback, direct_blacklist_parse_progress_text(chat_ref), None, answer=False
+    )
+    try:
+        parsed = await blacklist_parser.parse(chat_ref=chat_ref, mode=mode)
+    except (ConflictError, ValueError) as exc:
+        await _edit_callback(
+            callback,
+            f"<b>ID не собраны</b>\n\n{escape(operator_error_message(exc))}",
+            direct_blacklist_menu(),
+            answer=False,
+        )
+        return
+    await state.clear()
+    filename = f"blacklist_{parsed.mode}_{parsed.token}.txt"
+    payload = ("\n".join(str(value) for value in parsed.telegram_user_ids) + "\n").encode("utf-8")
+    await callback.message.answer_document(
+        BufferedInputFile(payload, filename=filename),
+        caption=(
+            f"ID из <code>{escape(parsed.chat_ref)}</code> · "
+            f"{len(parsed.telegram_user_ids):,} уникальных записей"
+        ),
+    )
+    await _edit_callback(
+        callback,
+        direct_blacklist_parse_result_text(
+            chat_ref=parsed.chat_ref,
+            account_label=parsed.account_label,
+            mode=parsed.mode,
+            count=len(parsed.telegram_user_ids),
+            fallback_used=parsed.fallback_used,
+            reached_limit=parsed.reached_limit,
+            joined_chat=parsed.joined_chat,
+            scan_limit=parsed.scan_limit,
+        ),
+        direct_blacklist_parse_result_menu(parsed.token),
+        answer=False,
+    )
+
+
+@router.callback_query(F.data.startswith("dm:blacklist:parseadd:"))
+async def confirm_direct_blacklist_chat_parse(
+    callback: CallbackQuery,
+    blacklist_parser: ChatBlacklistParser,
+    direct_messages: DirectMessageService,
+    subscriber_invites: SubscriberInviteService,
+) -> None:
+    token = (callback.data or "").rsplit(":", 1)[-1]
+    parsed = await blacklist_parser.take(token)
+    if parsed is None:
+        await _safe_callback_answer(
+            callback, "Этот результат уже добавлен или истёк. Соберите ID заново.", show_alert=True
+        )
+        return
+    await _safe_callback_answer(callback, "Добавляю в стоп-лист…")
+    try:
+        result = await direct_messages.add_blacklist_entries_bulk(
+            parsed.telegram_user_ids,
+            source=f"chat_blacklist:{parsed.chat_ref}",
+        )
+        await subscriber_invites.refresh_launches(result.affected_invite_launch_ids)
+    except ConflictError as exc:
+        await _edit_callback(
+            callback,
+            f"<b>Стоп-лист не обновлён</b>\n\n{escape(operator_error_message(exc))}",
+            direct_blacklist_menu(),
+            answer=False,
+        )
+        return
+    dashboard = await direct_messages.dashboard()
+    await _edit_callback(
+        callback,
+        "<b>Стоп-лист обновлён из файла чата</b>\n\n"
+        f"Прочитано уникальных ID: <b>{len(parsed.telegram_user_ids):,}</b>\n"
+        f"Добавлено новых: <b>{result.added:,}</b>\n"
+        f"Уже были в стоп-листе: <b>{result.already_present:,}</b>\n"
+        f"Отменено ожидающих задач: <b>{result.cancelled_tasks:,}</b>\n"
+        f"Всего запрещено: <b>{dashboard.blacklist_count:,}</b>",
+        direct_blacklist_menu(),
+        answer=False,
     )
 
 
@@ -15111,7 +15935,7 @@ async def open_subscriber_invite_blacklist(
         direct_blacklist_menu(
             add_callback="inv:blacklist:add",
             back_callback="inv:home",
-            back_text="⬅️ К приглашениям",
+            back_text="‹ К приглашениям",
         ),
     )
 
@@ -15120,6 +15944,7 @@ async def open_subscriber_invite_blacklist(
 async def begin_subscriber_invite_blacklist_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.update_data(direct_blacklist_origin="inv")
+    await _remember_origin(callback, state)
     await state.set_state(DirectBlacklistState.ids)
     await _edit_callback(
         callback,
@@ -15132,22 +15957,36 @@ async def begin_subscriber_invite_blacklist_add(callback: CallbackQuery, state: 
 async def add_direct_blacklist_ids(
     message: Message,
     state: FSMContext,
+    bot: Bot,
     direct_messages: DirectMessageService,
     subscriber_invites: SubscriberInviteService,
 ) -> None:
     data = await state.get_data()
     from_invites = data.get("direct_blacklist_origin") == "inv"
     try:
-        telegram_user_ids = parse_direct_blacklist_ids(message.text or "")
-        result = await direct_messages.add_blacklist_entries(telegram_user_ids)
+        content = message.text or ""
+        if message.document is not None:
+            document = message.document
+            if not (document.file_name or "").casefold().endswith(".txt"):
+                raise ValueError("отправьте стоп-лист файлом .txt")
+            if document.file_size is not None and document.file_size > MAX_BLACKLIST_IMPORT_BYTES:
+                raise ValueError("файл стоп-листа должен быть не больше 2 МБ")
+            buffer = BytesIO()
+            await bot.download(document, destination=buffer)
+            content = decode_blacklist_document(buffer.getvalue())
+        parsed = parse_blacklist_import(content)
+        result = await direct_messages.add_blacklist_entries_bulk(
+            parsed.telegram_user_ids, usernames=parsed.usernames
+        )
         await subscriber_invites.refresh_launches(result.affected_invite_launch_ids)
     except (ValueError, ConflictError) as exc:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             escape(operator_error_message(exc)),
             reply_markup=invite_cancel_menu() if from_invites else direct_cancel_menu(),
         )
         return
-    await state.clear()
     dashboard = await direct_messages.dashboard()
     cancelled = (
         f"\nОстановлено ожидавших заданий: <b>{result.cancelled_tasks:,}</b>"
@@ -15156,21 +15995,17 @@ async def add_direct_blacklist_ids(
     )
     if result.cancelled_invite_tasks:
         cancelled += f"\nВ том числе приглашений: <b>{result.cancelled_invite_tasks:,}</b>"
-    await message.answer(
-        "<b>✅ Стоп-лист обновлён</b>\n\n"
-        f"Добавлено новых ID: <b>{result.added:,}</b>\n"
+    duplicates = f"\nПовторов в списке: <b>{parsed.duplicates:,}</b>" if parsed.duplicates else ""
+    await answer_panel_input(
+        message,
+        state,
+        "<b>Стоп-лист обновлён</b>\n\n"
+        f"Добавлено новых записей: <b>{result.added:,}</b>\n"
         f"Уже были запрещены: <b>{result.already_present:,}</b>"
+        f"{duplicates}"
         f"{cancelled}\n"
         f"Всего запрещено: <b>{dashboard.blacklist_count:,}</b>",
-        reply_markup=(
-            direct_blacklist_menu(
-                add_callback="inv:blacklist:add",
-                back_callback="inv:home",
-                back_text="⬅️ К приглашениям",
-            )
-            if from_invites
-            else direct_blacklist_menu()
-        ),
+        reply_markup=invite_cancel_menu() if from_invites else direct_cancel_menu(),
     )
 
 
@@ -15185,7 +16020,8 @@ async def import_subscriber_document(
     document = message.document
     file_name = Path(document.file_name or "subscribers.jsonl").name if document else ""
     if document is None or not subscriber_file_supported(file_name):
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             "Отправьте документ <code>.jsonl</code>, <code>.jsonl.gz</code> или "
             "<code>.zip</code> с JSONL-частями.",
             reply_markup=direct_cancel_menu(),
@@ -15195,29 +16031,62 @@ async def import_subscriber_document(
         document.file_size is not None
         and document.file_size > settings.direct_messages_upload_max_bytes
     ):
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             "Файл больше настроенного лимита загрузки. Сожмите JSONL в GZIP или ZIP "
             "без изменения его строк.",
             reply_markup=direct_cancel_menu(),
         )
         return
-    progress = await message.answer(
-        "⏳ Загружаю и проверяю базу построчно. Большой файл может занять несколько минут."
-    )
+    progress = await answer_panel_input(message, state, "◷ Загружаю файл из Telegram…")
+
+    async def report_import(current: SubscriberImportProgress) -> None:
+        try:
+            await progress.edit_text(
+                subscriber_import_progress_text(
+                    total_lines=current.total_lines,
+                    valid_records=current.valid_records,
+                    added_members=current.added_members,
+                    updated_profiles=current.updated_profiles,
+                    duplicates=current.duplicates,
+                    invalid=current.invalid,
+                )
+            )
+        except TelegramAPIError:
+            logger.warning("Could not update subscriber import progress", exc_info=True)
+
     try:
         with TemporaryDirectory(prefix="proxima-subscribers-") as temporary_directory:
             destination = Path(temporary_directory) / file_name
             await bot.download(document, destination=destination)
+            await direct_messages.get_primary_subscriber_list()
+            with suppress(TelegramAPIError):
+                await progress.edit_text("◷ Файл загружен. Обрабатываю записи и сохраняю базу…")
             result = await direct_messages.import_subscribers(
                 destination,
-                list_name=subscriber_list_name(file_name),
+                # A refreshed export is an update of one common audience, not
+                # another operator-visible list.
+                list_name=PRIMARY_SUBSCRIBER_LIST_NAME,
                 source_filename=file_name,
+                on_progress=report_import,
             )
-    except (SubscriberImportError, ConflictError, OSError) as exc:
+    except (SubscriberImportError, ConflictError, OSError, SQLAlchemyError) as exc:
         await progress.edit_text(
-            f"<b>Не удалось импортировать базу</b>\n\n{escape(operator_error_message(exc))}",
+            "<b>Не удалось импортировать файл</b>\n\n"
+            f"{escape(operator_error_message(exc))}\n\n"
+            "Если база уже была загружена, её сохранённые подписчики доступны.",
             reply_markup=direct_cancel_menu(),
         )
+        return
+    except Exception:
+        logger.exception("Subscriber import failed unexpectedly")
+        with suppress(TelegramAPIError):
+            await progress.edit_text(
+                "<b>Не удалось закончить импорт</b>\n\n"
+                "Проверьте формат файла и повторите загрузку. Ранее сохранённые "
+                "подписчики доступны.",
+                reply_markup=direct_cancel_menu(),
+            )
         return
     await state.clear()
     await progress.edit_text(
@@ -15231,16 +16100,13 @@ async def open_subscriber_lists(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
-    page = max(0, int((callback.data or "").rsplit(":", 1)[-1]))
-    items, total = await direct_messages.list_subscriber_lists(page, DIRECT_MESSAGE_PAGE_SIZE)
-    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PAGE_SIZE)
-    if page > last_page:
-        page = last_page
-        items, total = await direct_messages.list_subscriber_lists(page, DIRECT_MESSAGE_PAGE_SIZE)
+    await _safe_callback_answer(callback)
+    item = await direct_messages.get_primary_subscriber_list()
     await _edit_callback(
         callback,
-        subscriber_lists_text(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
-        subscriber_lists_menu(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
+        subscriber_list_details_text(item),
+        subscriber_list_details_menu(item, 0),
+        answer=False,
     )
 
 
@@ -15249,12 +16115,13 @@ async def open_subscriber_list(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
-    _, _, raw_list_id, raw_page = (callback.data or "").split(":")
-    item = await direct_messages.get_subscriber_list(int(raw_list_id))
+    await _safe_callback_answer(callback)
+    item = await direct_messages.get_primary_subscriber_list()
     await _edit_callback(
         callback,
         subscriber_list_details_text(item),
-        subscriber_list_details_menu(item, int(raw_page)),
+        subscriber_list_details_menu(item, 0),
+        answer=False,
     )
 
 
@@ -15263,14 +16130,11 @@ async def ask_delete_subscriber_list(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
-    _, _, raw_list_id, raw_page = (callback.data or "").split(":")
-    item = await direct_messages.get_subscriber_list(int(raw_list_id))
-    await _edit_callback(
+    del direct_messages
+    await _safe_callback_answer(
         callback,
-        "<b>Удалить базу подписчиков?</b>\n\n"
-        f"База <b>{escape(item.name)}</b> содержит {item.member_count:,} записей. "
-        "Общие профили, которые используются другими базами, сохранятся.",
-        subscriber_list_delete_menu(item.id, int(raw_page)),
+        "Списки объединены в общую базу; исторические записи сохраняются для отчётов",
+        show_alert=True,
     )
 
 
@@ -15279,20 +16143,11 @@ async def confirm_delete_subscriber_list(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
-    _, _, raw_list_id, raw_page = (callback.data or "").split(":")
-    try:
-        await direct_messages.delete_subscriber_list(int(raw_list_id))
-    except ConflictError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
-        return
-    await callback.answer("База удалена")
-    page = int(raw_page)
-    items, total = await direct_messages.list_subscriber_lists(page, DIRECT_MESSAGE_PAGE_SIZE)
-    await _edit_callback(
+    del direct_messages
+    await _safe_callback_answer(
         callback,
-        subscriber_lists_text(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
-        subscriber_lists_menu(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
-        answer=False,
+        "Удаление старого списка недоступно: он нужен для истории запусков",
+        show_alert=True,
     )
 
 
@@ -15303,7 +16158,70 @@ async def begin_direct_campaign(
     direct_messages: DirectMessageService,
 ) -> None:
     await state.clear()
-    await _show_direct_list_picker(callback, direct_messages, page=0)
+    item = await direct_messages.get_primary_subscriber_list()
+    if item.status.value != "ready" or item.member_count <= 0:
+        await _safe_callback_answer(
+            callback,
+            "Сначала загрузите файл в общую базу подписчиков",
+            show_alert=True,
+        )
+        return
+    await state.update_data(direct_list_id=item.id)
+    await _remember_origin(callback, state)
+    await state.set_state(DirectCampaignCreateState.segment)
+    await _edit_callback(callback, direct_segment_text(item), direct_segment_menu(item.id))
+
+
+@router.callback_query(F.data == "dm:service:new")
+async def begin_direct_service_action(
+    callback: CallbackQuery,
+    state: FSMContext,
+    direct_messages: DirectMessageService,
+) -> None:
+    await state.clear()
+    item = await direct_messages.get_primary_subscriber_list()
+    if item.status.value != "ready" or item.member_count <= 0:
+        await _safe_callback_answer(
+            callback, "Сначала загрузите общую базу подписчиков", show_alert=True
+        )
+        return
+    await state.update_data(direct_list_id=item.id)
+    await _remember_origin(callback, state)
+    await state.set_state(DirectCampaignCreateState.service_action)
+    await _edit_callback(callback, direct_service_action_text(), direct_service_action_menu())
+
+
+@router.callback_query(
+    DirectCampaignCreateState.service_action, F.data.startswith("dm:service:set:")
+)
+async def select_direct_service_action(
+    callback: CallbackQuery,
+    state: FSMContext,
+    direct_messages: DirectMessageService,
+) -> None:
+    parts = (callback.data or "").split(":")
+    try:
+        kind, period = parts[3], int(parts[4])
+    except (IndexError, ValueError):
+        await _safe_callback_answer(callback, "Некорректное действие", show_alert=True)
+        return
+    if kind not in DIRECT_SERVICE_ACTIONS or (
+        kind == "auto_delete" and period not in AUTO_DELETE_PERIODS
+    ):
+        await _safe_callback_answer(callback, "Неизвестное действие", show_alert=True)
+        return
+    data = await state.get_data()
+    item = await direct_messages.get_subscriber_list(int(data["direct_list_id"]))
+    await state.update_data(
+        direct_operation_kind=kind,
+        direct_auto_delete_seconds=period if kind == "auto_delete" else None,
+    )
+    await state.set_state(DirectCampaignCreateState.segment)
+    await _edit_callback(
+        callback,
+        direct_segment_text(item, service_action=True),
+        direct_segment_menu(item.id, service_action=True),
+    )
 
 
 async def _show_direct_list_picker(
@@ -15312,25 +16230,20 @@ async def _show_direct_list_picker(
     *,
     page: int,
 ) -> None:
-    """Show a bounded page so a large operator account stays within Bot API limits."""
+    """Handle old list-picker buttons by opening the shared audience."""
 
-    page = max(0, page)
-    lists, total = await direct_messages.list_ready_subscriber_lists(
-        page, DIRECT_MESSAGE_PICKER_PAGE_SIZE
-    )
-    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PICKER_PAGE_SIZE)
-    if page > last_page:
-        page = last_page
-        lists, total = await direct_messages.list_ready_subscriber_lists(
-            page, DIRECT_MESSAGE_PICKER_PAGE_SIZE
+    item = await direct_messages.get_primary_subscriber_list()
+    if item.status.value != "ready" or item.member_count <= 0:
+        await _safe_callback_answer(
+            callback,
+            "Сначала загрузите файл в общую базу",
+            show_alert=True,
         )
-    if total == 0:
-        await callback.answer("Сначала импортируйте базу подписчиков", show_alert=True)
         return
     await _edit_callback(
         callback,
-        direct_list_picker_text(total, page, DIRECT_MESSAGE_PICKER_PAGE_SIZE),
-        direct_list_picker(lists, total, page, DIRECT_MESSAGE_PICKER_PAGE_SIZE),
+        direct_segment_text(item),
+        direct_segment_menu(item.id),
     )
 
 
@@ -15349,28 +16262,41 @@ async def select_direct_subscriber_list(
     state: FSMContext,
     direct_messages: DirectMessageService,
 ) -> None:
-    list_id = int((callback.data or "").rsplit(":", 1)[-1])
-    item = await direct_messages.get_subscriber_list(list_id)
+    item = await direct_messages.get_primary_subscriber_list()
     if item.status.value != "ready" or item.member_count <= 0:
-        await callback.answer("Эта база пока не готова", show_alert=True)
+        await _safe_callback_answer(callback, "Эта база пока не готова", show_alert=True)
         return
     await state.clear()
-    await state.update_data(direct_list_id=list_id)
-    await _edit_callback(callback, direct_segment_text(item), direct_segment_menu(list_id))
+    await state.update_data(direct_list_id=item.id)
+    await _remember_origin(callback, state)
+    await state.set_state(DirectCampaignCreateState.segment)
+    await _edit_callback(callback, direct_segment_text(item), direct_segment_menu(item.id))
 
 
-@router.callback_query(F.data.startswith("dm:new:seg:"))
+@router.callback_query(DirectCampaignCreateState.segment, F.data.startswith("dm:new:seg:"))
 async def select_direct_segment(callback: CallbackQuery, state: FSMContext) -> None:
     parts = (callback.data or "").split(":")
     list_id = int(parts[3])
     try:
         segment = SubscriberSegment(parts[4])
     except ValueError:
-        await callback.answer("Неизвестный сегмент", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный сегмент", show_alert=True)
+        return
+    data = await state.get_data()
+    service_action = data.get("direct_operation_kind") in DIRECT_SERVICE_ACTIONS
+    if service_action and (
+        list_id != int(data.get("direct_list_id") or 0) or segment == SubscriberSegment.NON_PREMIUM
+    ):
+        await _safe_callback_answer(
+            callback, "Выберите «Всем» или «Только Premium»", show_alert=True
+        )
         return
     await state.update_data(direct_list_id=list_id, direct_segment=segment.value)
+    await _remember_origin(callback, state)
     await state.set_state(DirectCampaignCreateState.limit)
-    await _edit_callback(callback, direct_limit_text(segment), direct_cancel_menu())
+    await _edit_callback(
+        callback, direct_limit_text(segment, service_action=service_action), direct_cancel_menu()
+    )
 
 
 @router.message(DirectCampaignCreateState.limit)
@@ -15396,20 +16322,26 @@ async def set_direct_recipient_limit(
         except ValueError:
             limit = 0
     if not 1 <= limit <= 1_000_000:
-        await message.answer(
+        await answer_panel_input(
+            message,
+            state,
             "Введите число от 1 до 1 000 000 либо слово <code>все</code>.",
             reply_markup=direct_cancel_menu(),
         )
         return
     await state.update_data(direct_recipient_limit=limit, direct_account_ids=[])
-    await state.set_state(None)
-    await message.answer(
-        direct_cooldown_text(),
+    await state.set_state(DirectCampaignCreateState.cooldown)
+    await answer_panel_input(
+        message,
+        state,
+        direct_cooldown_text(
+            service_action=data.get("direct_operation_kind") in DIRECT_SERVICE_ACTIONS
+        ),
         reply_markup=direct_cooldown_menu(),
     )
 
 
-@router.callback_query(F.data.startswith("dm:new:cooldown:"))
+@router.callback_query(DirectCampaignCreateState.cooldown, F.data.startswith("dm:new:cooldown:"))
 async def select_direct_cooldown(
     callback: CallbackQuery,
     state: FSMContext,
@@ -15418,13 +16350,13 @@ async def select_direct_cooldown(
 ) -> None:
     cooldown_days = int((callback.data or "").rsplit(":", 1)[-1])
     if cooldown_days not in {0, 7, 30, 90}:
-        await callback.answer("Неизвестный срок защиты", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный срок защиты", show_alert=True)
         return
     accounts = await repository.active_owned_accounts(
         require_authorized_session=not settings.dry_run
     )
     if not accounts:
-        await callback.answer("Нет готовых аккаунтов-отправителей", show_alert=True)
+        await _safe_callback_answer(callback, "Нет готовых аккаунтов-отправителей", show_alert=True)
         return
     await state.update_data(
         direct_contact_cooldown_days=cooldown_days,
@@ -15445,19 +16377,35 @@ async def _show_direct_account_picker(
     data = await state.get_data()
     selected = {int(value) for value in data.get("direct_account_ids", [])}
     available_ids = {int(account.id) for account in accounts}
-    selected &= available_ids
+    service_action = data.get("direct_operation_kind") in DIRECT_SERVICE_ACTIONS
+    if not service_action:
+        selected &= available_ids
     page = max(0, int(data.get("direct_account_page") or 0))
     last_page = max(0, (len(accounts) - 1) // DIRECT_MESSAGE_PICKER_PAGE_SIZE)
     page = min(page, last_page)
     await state.update_data(direct_account_ids=sorted(selected), direct_account_page=page)
+    await state.set_state(DirectCampaignCreateState.accounts)
+    restricted_count = sum(
+        1 for a in accounts if getattr(a, "spambot_status", None) == "active_restriction"
+    )
+    picker_text = direct_account_picker_text(
+        len(selected),
+        len(accounts),
+        page,
+        DIRECT_MESSAGE_PICKER_PAGE_SIZE,
+        service_action=service_action,
+        restricted_count=restricted_count,
+    )
+    missing_selected = selected - available_ids
+    if service_action and missing_selected:
+        picker_text += (
+            "\n\nВыбранные аккаунты сейчас недоступны: "
+            + ", ".join(f"#{value}" for value in sorted(missing_selected)[:10])
+            + ". Проверьте их или очистите выбор. Состав сохранён."
+        )
     await _edit_callback(
         callback,
-        direct_account_picker_text(
-            len(selected),
-            len(accounts),
-            page,
-            DIRECT_MESSAGE_PICKER_PAGE_SIZE,
-        ),
+        picker_text,
         direct_account_picker(
             accounts,
             selected,
@@ -15467,7 +16415,10 @@ async def _show_direct_account_picker(
     )
 
 
-@router.callback_query(F.data.startswith("dm:new:accounts:page:"))
+@router.callback_query(
+    DirectCampaignCreateState.accounts,
+    F.data.startswith("dm:new:accounts:page:"),
+)
 async def page_direct_accounts(
     callback: CallbackQuery,
     state: FSMContext,
@@ -15479,7 +16430,7 @@ async def page_direct_accounts(
     await _show_direct_account_picker(callback, state, repository, settings)
 
 
-@router.callback_query(F.data.startswith("dm:new:account:"))
+@router.callback_query(DirectCampaignCreateState.accounts, F.data.startswith("dm:new:account:"))
 async def toggle_direct_account(
     callback: CallbackQuery,
     state: FSMContext,
@@ -15497,7 +16448,10 @@ async def toggle_direct_account(
     await _show_direct_account_picker(callback, state, repository, settings)
 
 
-@router.callback_query(F.data.in_({"dm:new:accounts:all", "dm:new:accounts:none"}))
+@router.callback_query(
+    DirectCampaignCreateState.accounts,
+    F.data.in_({"dm:new:accounts:all", "dm:new:accounts:none"}),
+)
 async def bulk_select_direct_accounts(
     callback: CallbackQuery,
     state: FSMContext,
@@ -15507,19 +16461,56 @@ async def bulk_select_direct_accounts(
     accounts = await repository.active_owned_accounts(
         require_authorized_session=not settings.dry_run
     )
-    selected = [int(account.id) for account in accounts] if callback.data.endswith(":all") else []
+    if callback.data.endswith(":all"):
+        free = [
+            int(account.id)
+            for account in accounts
+            if getattr(account, "spambot_status", None) != "active_restriction"
+        ]
+        selected = free if free else [int(account.id) for account in accounts]
+    else:
+        selected = []
     await state.update_data(direct_account_ids=selected)
     await _show_direct_account_picker(callback, state, repository, settings)
 
 
-@router.callback_query(F.data == "dm:new:accounts:done")
+@router.callback_query(DirectCampaignCreateState.accounts, F.data == "dm:new:accounts:done")
 async def finish_direct_account_selection(
     callback: CallbackQuery,
     state: FSMContext,
+    direct_messages: DirectMessageService,
 ) -> None:
     data = await state.get_data()
     if not data.get("direct_account_ids"):
-        await callback.answer("Выберите хотя бы один аккаунт", show_alert=True)
+        await _safe_callback_answer(callback, "Выберите хотя бы один аккаунт", show_alert=True)
+        return
+    await _remember_origin(callback, state)
+    if data.get("direct_operation_kind") in DIRECT_SERVICE_ACTIONS:
+        try:
+            campaign = await direct_messages.create_campaign(
+                name=f"Автоудаление · {utc_now():%d.%m %H:%M} · {uuid4().hex[:4]}",
+                subscriber_list_id=int(data["direct_list_id"]),
+                segment=SubscriberSegment(data["direct_segment"]),
+                recipient_limit=int(data["direct_recipient_limit"]),
+                contact_cooldown_days=int(data["direct_contact_cooldown_days"]),
+                account_ids=[int(value) for value in data["direct_account_ids"]],
+                operation_kind=str(data["direct_operation_kind"]),
+                auto_delete_seconds=data.get("direct_auto_delete_seconds"),
+            )
+            view = await direct_messages.get_campaign_view(campaign.id)
+        except ConflictError as exc:
+            await _safe_callback_answer(callback, operator_error_message(exc), show_alert=True)
+            return
+        launch_token = uuid4().hex[:12]
+        await state.clear()
+        await state.update_data(
+            direct_launch_campaign_id=campaign.id, direct_launch_token=launch_token
+        )
+        await _edit_callback(
+            callback,
+            direct_campaign_confirmation_text(view),
+            direct_campaign_confirmation_menu(campaign.id, launch_token, service_action=True),
+        )
         return
     await state.set_state(DirectCampaignCreateState.content)
     await _edit_callback(callback, direct_content_prompt_text(), direct_cancel_menu())
@@ -15536,7 +16527,12 @@ async def save_direct_campaign_content(
     try:
         text, html_text, media = await _extract_broadcast_content(message, bot, settings)
     except ContentError as exc:
-        await message.answer(escape(operator_error_message(exc)), reply_markup=direct_cancel_menu())
+        await answer_panel_input(
+            message,
+            state,
+            escape(operator_error_message(exc)),
+            reply_markup=direct_cancel_menu(),
+        )
         return
     data = await state.get_data()
     list_id = int(data.get("direct_list_id") or 0)
@@ -15565,7 +16561,12 @@ async def save_direct_campaign_content(
         )
         view = await direct_messages.get_campaign_view(int(campaign.id))
     except (ConflictError, ContentError) as exc:
-        await message.answer(escape(operator_error_message(exc)), reply_markup=direct_cancel_menu())
+        await answer_panel_input(
+            message,
+            state,
+            escape(operator_error_message(exc)),
+            reply_markup=direct_cancel_menu(),
+        )
         return
     launch_token = uuid4().hex[:12]
     await state.clear()
@@ -15573,7 +16574,8 @@ async def save_direct_campaign_content(
         direct_launch_campaign_id=int(campaign.id),
         direct_launch_token=launch_token,
     )
-    await message.answer(
+    await answer_panel_input(
+        message, state,
         direct_campaign_confirmation_text(view),
         reply_markup=direct_campaign_confirmation_menu(int(campaign.id), launch_token),
     )
@@ -15584,12 +16586,18 @@ async def open_direct_campaigns(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
+    await _safe_callback_answer(callback)
     page = max(0, int((callback.data or "").rsplit(":", 1)[-1]))
     items, total = await direct_messages.list_campaigns(page, DIRECT_MESSAGE_PAGE_SIZE)
+    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PAGE_SIZE)
+    if page > last_page:
+        page = last_page
+        items, total = await direct_messages.list_campaigns(page, DIRECT_MESSAGE_PAGE_SIZE)
     await _edit_callback(
         callback,
         direct_campaigns_text(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
         direct_campaigns_menu(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
+        answer=False,
     )
 
 
@@ -15598,12 +16606,18 @@ async def open_direct_campaign(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
+    await _safe_callback_answer(callback)
     _, _, raw_campaign_id, raw_page = (callback.data or "").split(":")
     view = await direct_messages.get_campaign_view(int(raw_campaign_id))
     await _edit_callback(
         callback,
         direct_campaign_confirmation_text(view),
-        direct_campaign_details_menu(view.campaign.id, int(raw_page)),
+        direct_campaign_details_menu(
+            view.campaign.id,
+            int(raw_page),
+            service_action=view.campaign.operation_kind in DIRECT_SERVICE_ACTIONS,
+        ),
+        answer=False,
     )
 
 
@@ -15625,8 +16639,55 @@ async def confirm_saved_direct_campaign(
     await _edit_callback(
         callback,
         direct_campaign_confirmation_text(view),
-        direct_campaign_confirmation_menu(campaign_id, launch_token),
+        direct_campaign_confirmation_menu(
+            campaign_id,
+            launch_token,
+            service_action=view.campaign.operation_kind in DIRECT_SERVICE_ACTIONS,
+        ),
     )
+
+
+@router.callback_query(F.data.startswith("dm:preview:"))
+async def preview_direct_campaign(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    direct_messages: DirectMessageService,
+) -> None:
+    campaign_id = int((callback.data or "").rsplit(":", 1)[-1])
+    view = await direct_messages.get_campaign_view(campaign_id)
+    campaign = view.campaign
+    if getattr(campaign, "operation_kind", "message") in DIRECT_SERVICE_ACTIONS:
+        await _safe_callback_answer(
+            callback, "Это сервисная настройка, предпросмотра сообщения нет", show_alert=True
+        )
+        return
+    await _safe_callback_answer(callback, "Отправляю предпросмотр только вам…")
+    media = (
+        (
+            StoredMedia(
+                path=campaign.primary_media_path,
+                kind=campaign.primary_media_kind or "document",
+                name=campaign.primary_media_name or "attachment",
+                size=campaign.primary_media_size or 0,
+            ),
+        )
+        if campaign.primary_media_path
+        else ()
+    )
+    preview = BroadcastContentVariant(
+        variant_id=f"direct-{campaign.id}",
+        name=campaign.name,
+        text=campaign.primary_text,
+        html_text=campaign.primary_html,
+        media=media,
+    )
+    try:
+        await _send_variant_preview(bot, callback.from_user.id, preview, settings)
+    except (ContentError, TelegramAPIError, OSError) as exc:
+        await callback.message.answer(
+            "! <b>Предпросмотр не отправлен</b>\n" + escape(operator_error_message(exc))
+        )
 
 
 @router.callback_query(F.data.startswith("dm:launch:"))
@@ -15642,16 +16703,22 @@ async def launch_direct_campaign(
         int(data.get("direct_launch_campaign_id") or 0) != campaign_id
         or str(data.get("direct_launch_token") or "") != launch_token
     ):
-        await callback.answer("Это подтверждение уже использовано или устарело", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Это подтверждение уже использовано или устарело",
+            show_alert=True,
+        )
         return
     await state.clear()
     await _edit_callback(
         callback,
-        "<b>⏳ Формирую очередь личных сообщений…</b>",
+        "<b>Формирую очередь ЛС…</b>",
         None,
     )
     try:
-        launch = await direct_messages.launch_campaign(campaign_id, consent_confirmed=True)
+        launch = await direct_messages.launch_campaign(
+            campaign_id, consent_confirmed=True, request_key=f"dm:{campaign_id}:{launch_token}"
+        )
         view = await direct_messages.get_launch_view(int(launch.id))
     except ConflictError as exc:
         await _edit_callback(
@@ -15669,17 +16736,325 @@ async def launch_direct_campaign(
     )
 
 
+def _recipient_report_context(data: str) -> dict[str, object]:
+    _, _, kind, launch_id, filter_, page, back_page, token = data.split(":")
+    return {
+        "kind": RecipientReportKind(kind), "launch_id": int(launch_id) or None,
+        "filter": RecipientReportFilter(filter_), "page": max(0, int(page)),
+        "back_page": int(back_page), "token": token,
+    }
+
+
+def _recipient_report_query(context: dict, data: dict) -> str:
+    if context["token"] == "0":
+        return ""
+    saved = (data.get("recipient_report_queries") or {}).get(context["token"])
+    if saved is None or saved["kind"] != context["kind"] \
+            or saved["launch_id"] != context["launch_id"]:
+        raise ConflictError("Поиск устарел. Откройте список и выполните поиск заново.")
+    return saved["query"]
+
+
+async def _save_recipient_report_query(
+    state: FSMContext, context: dict, query: str, *, directory_return: dict | None = None,
+) -> str:
+    data = await state.get_data()
+    queries = dict(data.get("recipient_report_queries") or {})
+    if directory_return is None and context.get("back_page") == -1:
+        previous = queries.get(context.get("token")) or {}
+        directory_return = previous.get("directory_return")
+    token = uuid4().hex[:8]
+    queries[token] = {
+        "kind": context["kind"], "launch_id": context["launch_id"], "query": query,
+    }
+    if directory_return is not None:
+        queries[token]["directory_return"] = dict(directory_return)
+    # Retain a few searches so Back and paging cannot silently reuse another
+    # screen's query. Older buttons fail clearly when their token expires.
+    protected = {token, context.get("token")}
+    if directory_return:
+        protected.add(directory_return["token"])
+    while len(queries) > 10:
+        queries.pop(next(key for key in queries if key not in protected))
+    await state.update_data(recipient_report_queries=queries)
+    return token
+
+
+async def _load_recipient_report(context: dict, query: str, direct_messages, subscriber_invites):
+    if context["kind"] == RecipientReportKind.DIRECTORY:
+        return await direct_messages.list_subscriber_directory(page=context["page"], query=query)
+    service = (
+        direct_messages if context["kind"] == RecipientReportKind.DIRECT else subscriber_invites
+    )
+    return await service.list_recipients(
+        launch_id=context["launch_id"], result_filter=context["filter"],
+        page=context["page"], query=query,
+    )
+
+
+def _recipient_report_keyboard(report, context: dict, data: dict):
+    back_callback = None
+    saved = (data.get("recipient_report_queries") or {}).get(context["token"]) or {}
+    directory = saved.get("directory_return")
+    if context["back_page"] == -1:
+        directory = directory or {"page": 0, "back_page": 0, "token": "0"}
+        back_callback = report_callback(
+            "v", RecipientReportKind.DIRECTORY, None, RecipientReportFilter.ALL,
+            directory["page"], directory.get("back_page", 0), directory["token"],
+        )
+    return recipient_report_menu(
+        report, back_page=context["back_page"], token=context["token"],
+        back_callback=back_callback,
+    )
+
+
+def _recipient_report_home_menu(context: dict):
+    if context["kind"] == RecipientReportKind.INVITE or (
+        context["kind"] == RecipientReportKind.DIRECTORY and context["back_page"] == 1
+    ):
+        return subscriber_invites_home_menu()
+    return direct_messages_home_menu()
+
+
+@router.callback_query(F.data.startswith("rr:v:"))
+async def open_recipient_report(
+    callback: CallbackQuery, state: FSMContext,
+    direct_messages: DirectMessageService, subscriber_invites: SubscriberInviteService,
+) -> None:
+    await _safe_callback_answer(callback)
+    context = _recipient_report_context(callback.data or "")
+    data = await state.get_data()
+    try:
+        query = _recipient_report_query(context, data)
+        report = await _load_recipient_report(context, query, direct_messages, subscriber_invites)
+    except (ConflictError, NotFoundError) as exc:
+        await _remember_origin(callback, state)
+        await state.set_state(None)
+        await _edit_callback(
+            callback, escape(str(exc)), _recipient_report_home_menu(context), answer=False
+        )
+        return
+    await _remember_origin(callback, state)
+    await state.set_state(None)
+    await _edit_callback(
+        callback, recipient_report_text(report), _recipient_report_keyboard(report, context, data),
+        answer=False,
+    )
+
+
+@router.callback_query(F.data.startswith("rr:g:"))
+async def begin_recipient_report_page_jump(
+    callback: CallbackQuery,
+    state: FSMContext,
+    direct_messages: DirectMessageService,
+    subscriber_invites: SubscriberInviteService,
+) -> None:
+    await _safe_callback_answer(callback)
+    context = _recipient_report_context(callback.data or "")
+    try:
+        query = _recipient_report_query(context, await state.get_data())
+        report = await _load_recipient_report(context, query, direct_messages, subscriber_invites)
+    except (ConflictError, NotFoundError) as exc:
+        await state.set_state(None)
+        await _edit_callback(
+            callback, escape(str(exc)), _recipient_report_home_menu(context), answer=False
+        )
+        return
+    context["page"] = report.page
+    await _remember_origin(callback, state)
+    await state.update_data(recipient_report_page_jump=context)
+    await state.set_state(RecipientReportPageState.page)
+    scope = (
+        "Общая база подписчиков"
+        if report.kind == RecipientReportKind.DIRECTORY
+        else "Список получателей"
+    )
+    await _edit_callback(
+        callback,
+        "<b>Перейти к странице</b>\n\n"
+        f"{scope} · сейчас <b>{report.page + 1:,} из {report.pages:,}</b>.\n"
+        f"Отправьте номер страницы от <b>1</b> до <b>{report.pages:,}</b>."
+        + (f"\nПоиск: <code>{escape(report.query)}</code>" if report.query else ""),
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="‹ Назад к списку",
+                        callback_data=report_callback(
+                            "v",
+                            context["kind"],
+                            context["launch_id"],
+                            context["filter"],
+                            context["page"],
+                            context["back_page"],
+                            context["token"],
+                        ),
+                    )
+                ]
+            ]
+        ),
+        answer=False,
+    )
+
+
+@router.message(RecipientReportPageState.page)
+async def jump_to_recipient_report_page(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    direct_messages: DirectMessageService,
+    subscriber_invites: SubscriberInviteService,
+) -> None:
+    data = await state.get_data()
+    context = dict(data.get("recipient_report_page_jump") or {})
+    if not context:
+        await state.set_state(None)
+        await message.answer("Переход устарел. Откройте список подписчиков заново.")
+        return
+    # Numbers copied from the counter may contain thousands separators.
+    raw_input = (message.text or "").strip()
+    raw_number = re.sub(r"[ ,\u00a0\u202f]", "", raw_input)
+    if (
+        not re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:[ ,\u00a0\u202f][0-9]{3})+)", raw_input)
+        or not raw_number.isascii()
+        or not raw_number.isdecimal()
+        or len(raw_number) > 10
+        or int(raw_number) < 1
+    ):
+        await message.answer("Введите положительный номер страницы, например <code>25</code>.")
+        return
+    context["page"] = int(raw_number) - 1
+    try:
+        query = _recipient_report_query(context, data)
+        report = await _load_recipient_report(context, query, direct_messages, subscriber_invites)
+    except (ConflictError, NotFoundError) as exc:
+        await state.set_state(None)
+        await state.update_data(recipient_report_page_jump=None)
+        await message.answer(escape(str(exc)), reply_markup=_recipient_report_home_menu(context))
+        return
+    if context["page"] >= report.pages:
+        await message.answer(
+            f"В этом списке <b>{report.pages:,}</b> страниц. "
+            f"Введите число от 1 до {report.pages:,}."
+        )
+        return
+    await state.set_state(None)
+    await state.update_data(recipient_report_page_jump=None)
+    await _edit_origin(
+        bot,
+        state,
+        recipient_report_text(report),
+        _recipient_report_keyboard(report, context, await state.get_data()),
+    )
+
+
+@router.callback_query(F.data.startswith("rr:s:"))
+async def begin_recipient_report_search(callback: CallbackQuery, state: FSMContext) -> None:
+    await _safe_callback_answer(callback)
+    context = _recipient_report_context(callback.data or "")
+    try:
+        _recipient_report_query(context, await state.get_data())
+    except ConflictError as exc:
+        await state.set_state(None)
+        await _edit_callback(
+            callback, escape(str(exc)), _recipient_report_home_menu(context), answer=False
+        )
+        return
+    await _remember_origin(callback, state)
+    await state.update_data(recipient_report_search=context)
+    await state.set_state(RecipientReportSearchState.query)
+    scope = f"запуск #{context['launch_id']}" if context["launch_id"] else (
+        "общая база" if context["kind"] == RecipientReportKind.DIRECTORY else "все запуски раздела"
+    )
+    await _edit_callback(
+        callback, "<b>Поиск получателя</b>\n\n"
+        f"Область поиска: {scope}.\nВведите точный Telegram ID или username, "
+        "например <code>123456789</code> или <code>@username</code>. "
+        "Подходит и ссылка <code>https://t.me/username</code>.",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="‹ Назад к списку", callback_data=report_callback(
+                "v", context["kind"], context["launch_id"], context["filter"],
+                context["page"], context["back_page"], context["token"],
+            ),
+        )]]), answer=False,
+    )
+
+
+@router.message(RecipientReportSearchState.query)
+async def search_recipient_report(
+    message: Message, state: FSMContext, bot: Bot,
+    direct_messages: DirectMessageService, subscriber_invites: SubscriberInviteService,
+) -> None:
+    data = await state.get_data()
+    context = dict(data.get("recipient_report_search") or {})
+    if not context:
+        await state.set_state(None)
+        await message.answer("Поиск устарел. Откройте список получателей заново.")
+        return
+    try:
+        query = normalize_recipient_query(message.text or "")
+        context["page"] = 0
+        report = await _load_recipient_report(context, query, direct_messages, subscriber_invites)
+    except (ConflictError, NotFoundError) as exc:
+        await message.answer(escape(str(exc)))
+        return
+    context["token"] = await _save_recipient_report_query(state, context, query)
+    await state.set_state(None)
+    await _edit_origin(
+        bot, state, recipient_report_text(report),
+        _recipient_report_keyboard(report, context, await state.get_data()),
+    )
+
+
+@router.callback_query(F.data.startswith("rr:h:"))
+async def open_recipient_launch_history(
+    callback: CallbackQuery, state: FSMContext,
+    direct_messages: DirectMessageService, subscriber_invites: SubscriberInviteService,
+) -> None:
+    await _safe_callback_answer(callback)
+    parts = (callback.data or "").split(":")
+    if len(parts) == 6:
+        # Buttons created before directory-origin routing was introduced.
+        _, _, kind, user_id, page, token = parts
+        back_page = 0
+    else:
+        _, _, kind, user_id, page, raw_back_page, token = parts
+        back_page = int(raw_back_page)
+    context = {
+        "kind": RecipientReportKind(kind), "launch_id": None,
+        "filter": RecipientReportFilter.ALL, "page": 0, "back_page": -1,
+    }
+    query = normalize_recipient_query(user_id)
+    context["token"] = await _save_recipient_report_query(
+        state, context, query,
+        directory_return={"page": int(page), "back_page": back_page, "token": token},
+    )
+    report = await _load_recipient_report(context, query, direct_messages, subscriber_invites)
+    await _remember_origin(callback, state)
+    await state.set_state(None)
+    await _edit_callback(
+        callback, recipient_report_text(report),
+        _recipient_report_keyboard(report, context, await state.get_data()), answer=False,
+    )
+
+
 @router.callback_query(F.data.startswith("dm:launches:"))
 async def open_direct_launches(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
+    await _safe_callback_answer(callback)
     page = max(0, int((callback.data or "").rsplit(":", 1)[-1]))
     items, total = await direct_messages.list_launches(page, DIRECT_MESSAGE_PAGE_SIZE)
+    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PAGE_SIZE)
+    if page > last_page:
+        page = last_page
+        items, total = await direct_messages.list_launches(page, DIRECT_MESSAGE_PAGE_SIZE)
     await _edit_callback(
         callback,
         direct_launches_text(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
         direct_launches_menu(items, total, page, DIRECT_MESSAGE_PAGE_SIZE),
+        answer=False,
     )
 
 
@@ -15688,12 +17063,14 @@ async def open_direct_launch(
     callback: CallbackQuery,
     direct_messages: DirectMessageService,
 ) -> None:
+    await _safe_callback_answer(callback)
     _, _, raw_launch_id, raw_page = (callback.data or "").split(":")
     view = await direct_messages.get_launch_view(int(raw_launch_id))
     await _edit_callback(
         callback,
         direct_launch_details_text(view),
         direct_launch_details_menu(view, int(raw_page)),
+        answer=False,
     )
 
 
@@ -15721,7 +17098,7 @@ async def confirm_cancel_direct_launch(
     _, _, raw_launch_id, raw_page = (callback.data or "").split(":")
     cancelled = await direct_messages.cancel_launch(int(raw_launch_id))
     view = await direct_messages.get_launch_view(int(raw_launch_id))
-    await callback.answer(f"Отменено заданий: {cancelled}")
+    await _safe_callback_answer(callback, f"Отменено заданий: {cancelled}")
     await _edit_callback(
         callback,
         direct_launch_details_text(view),
@@ -15748,8 +17125,19 @@ async def open_subscriber_invites_home(callback: CallbackQuery, state: FSMContex
 async def begin_subscriber_invite(
     callback: CallbackQuery,
     state: FSMContext,
+    direct_messages: DirectMessageService,
 ) -> None:
     await state.clear()
+    item = await direct_messages.get_primary_subscriber_list()
+    if item.status.value != "ready" or item.member_count <= 0:
+        await _safe_callback_answer(
+            callback,
+            "Сначала загрузите файл в общую базу подписчиков",
+            show_alert=True,
+        )
+        return
+    await state.update_data(subscriber_invite_list_id=item.id)
+    await _remember_origin(callback, state)
     await state.set_state(SubscriberInviteCreateState.destination)
     await _edit_callback(callback, invite_destination_prompt_text(), invite_cancel_menu())
 
@@ -15760,17 +17148,17 @@ async def begin_subscriber_invite_from_list(
     state: FSMContext,
     direct_messages: DirectMessageService,
 ) -> None:
-    try:
-        list_id = int((callback.data or "").rsplit(":", 1)[1])
-        item = await direct_messages.get_subscriber_list(list_id)
-    except (IndexError, NotFoundError, ValueError):
-        await callback.answer("База больше недоступна. Обновите список баз.", show_alert=True)
-        return
+    item = await direct_messages.get_primary_subscriber_list()
     if item.status.value != "ready" or item.member_count <= 0:
-        await callback.answer("Эта база пока не готова к приглашению", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Сначала загрузите файл в общую базу подписчиков",
+            show_alert=True,
+        )
         return
     await state.clear()
-    await state.update_data(subscriber_invite_preselected_list_id=item.id)
+    await state.update_data(subscriber_invite_list_id=item.id)
+    await _remember_origin(callback, state)
     await state.set_state(SubscriberInviteCreateState.destination)
     await _edit_callback(callback, invite_destination_prompt_text(), invite_cancel_menu())
 
@@ -15784,41 +17172,30 @@ async def set_subscriber_invite_destination(
     try:
         destination_ref, destination_key = normalize_invite_destination_ref(message.text or "")
     except ValueError as exc:
-        await message.answer(escape(operator_error_message(exc)), reply_markup=invite_cancel_menu())
+        await answer_panel_input(
+            message,
+            state,
+            escape(operator_error_message(exc)),
+            reply_markup=invite_cancel_menu(),
+        )
         return
     await state.update_data(
         subscriber_invite_destination_ref=destination_ref,
         subscriber_invite_destination_key=destination_key,
     )
-    await state.set_state(None)
-    data = await state.get_data()
-    preselected_list_id = int(data.get("subscriber_invite_preselected_list_id") or 0)
-    if preselected_list_id:
-        try:
-            item = await direct_messages.get_subscriber_list(preselected_list_id)
-        except NotFoundError:
-            item = None
-        if item is not None and item.status.value == "ready" and item.member_count > 0:
-            await state.update_data(
-                subscriber_invite_list_id=item.id,
-                subscriber_invite_preselected_list_id=None,
-            )
-            await message.answer(
-                invite_segment_text(item), reply_markup=invite_segment_menu(item.id)
-            )
-            return
-        await state.update_data(subscriber_invite_preselected_list_id=None)
-    items, total = await direct_messages.list_ready_subscriber_lists(
-        0, DIRECT_MESSAGE_PICKER_PAGE_SIZE
-    )
-    if total == 0:
-        await message.answer(
-            "Сначала импортируйте готовую базу подписчиков.", reply_markup=invite_cancel_menu()
+    await state.set_state(SubscriberInviteCreateState.segment)
+    item = await direct_messages.get_primary_subscriber_list()
+    if item.status.value != "ready" or item.member_count <= 0:
+        await answer_panel_input(
+            message, state,
+            "Общая база пуста. Загрузите файл через «Личные сообщения» → «Дополнить».",
+            reply_markup=invite_cancel_menu(),
         )
         return
-    await message.answer(
-        invite_list_picker_text(total, 0, DIRECT_MESSAGE_PICKER_PAGE_SIZE),
-        reply_markup=invite_list_picker(items, total, 0, DIRECT_MESSAGE_PICKER_PAGE_SIZE),
+    await state.update_data(subscriber_invite_list_id=item.id)
+    await answer_panel_input(
+        message, state,
+        invite_segment_text(item), reply_markup=invite_segment_menu(item.id)
     )
 
 
@@ -15828,23 +17205,18 @@ async def _show_subscriber_invite_list_picker(
     *,
     page: int,
 ) -> None:
-    page = max(0, page)
-    items, total = await direct_messages.list_ready_subscriber_lists(
-        page, DIRECT_MESSAGE_PICKER_PAGE_SIZE
-    )
-    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PICKER_PAGE_SIZE)
-    if page > last_page:
-        page = last_page
-        items, total = await direct_messages.list_ready_subscriber_lists(
-            page, DIRECT_MESSAGE_PICKER_PAGE_SIZE
+    item = await direct_messages.get_primary_subscriber_list()
+    if item.status.value != "ready" or item.member_count <= 0:
+        await _safe_callback_answer(
+            callback,
+            "Сначала загрузите файл в общую базу",
+            show_alert=True,
         )
-    if total == 0:
-        await callback.answer("Сначала импортируйте готовую базу подписчиков", show_alert=True)
         return
     await _edit_callback(
         callback,
-        invite_list_picker_text(total, page, DIRECT_MESSAGE_PICKER_PAGE_SIZE),
-        invite_list_picker(items, total, page, DIRECT_MESSAGE_PICKER_PAGE_SIZE),
+        invite_segment_text(item),
+        invite_segment_menu(item.id),
     )
 
 
@@ -15863,28 +17235,30 @@ async def select_subscriber_invite_list(
     state: FSMContext,
     direct_messages: DirectMessageService,
 ) -> None:
-    list_id = int((callback.data or "").rsplit(":", 1)[-1])
-    item = await direct_messages.get_subscriber_list(list_id)
+    item = await direct_messages.get_primary_subscriber_list()
     if item.status.value != "ready" or item.member_count <= 0:
-        await callback.answer("Эта база пока не готова", show_alert=True)
+        await _safe_callback_answer(callback, "Эта база пока не готова", show_alert=True)
         return
-    await state.update_data(subscriber_invite_list_id=list_id)
-    await _edit_callback(callback, invite_segment_text(item), invite_segment_menu(list_id))
+    await state.update_data(subscriber_invite_list_id=item.id)
+    await _remember_origin(callback, state)
+    await state.set_state(SubscriberInviteCreateState.segment)
+    await _edit_callback(callback, invite_segment_text(item), invite_segment_menu(item.id))
 
 
-@router.callback_query(F.data.startswith("inv:new:seg:"))
+@router.callback_query(SubscriberInviteCreateState.segment, F.data.startswith("inv:new:seg:"))
 async def select_subscriber_invite_segment(callback: CallbackQuery, state: FSMContext) -> None:
     parts = (callback.data or "").split(":")
     try:
         list_id = int(parts[3])
         segment = SubscriberSegment(parts[4])
     except (IndexError, ValueError):
-        await callback.answer("Неизвестный сегмент", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный сегмент", show_alert=True)
         return
     await state.update_data(
         subscriber_invite_list_id=list_id,
         subscriber_invite_segment=segment.value,
     )
+    await _remember_origin(callback, state)
     await state.set_state(SubscriberInviteCreateState.limit)
     await _edit_callback(callback, invite_limit_prompt_text(segment), invite_cancel_menu())
 
@@ -15902,7 +17276,11 @@ async def set_subscriber_invite_limit(
         item = await direct_messages.get_subscriber_list(list_id)
     except (NotFoundError, ValueError):
         await state.clear()
-        await message.answer("Черновик приглашения устарел. Создайте его заново.")
+        await answer_panel_input(
+            message,
+            state,
+            "Черновик приглашения устарел. Создайте его заново.",
+        )
         return
     raw = (message.text or "").strip().casefold()
     if raw in {"все", "all"}:
@@ -15917,7 +17295,8 @@ async def set_subscriber_invite_limit(
         except ValueError:
             limit = 0
     if not 1 <= limit <= 1_000_000:
-        await message.answer(
+        await answer_panel_input(
+            message, state,
             "Введите число от 1 до 1 000 000 либо слово <code>все</code>.",
             reply_markup=invite_cancel_menu(),
         )
@@ -15926,11 +17305,16 @@ async def set_subscriber_invite_limit(
         subscriber_invite_recipient_limit=limit,
         subscriber_invite_account_ids=[],
     )
-    await state.set_state(None)
-    await message.answer(invite_cooldown_text(), reply_markup=invite_cooldown_menu())
+    await state.set_state(SubscriberInviteCreateState.cooldown)
+    await answer_panel_input(
+        message,
+        state,
+        invite_cooldown_text(),
+        reply_markup=invite_cooldown_menu(),
+    )
 
 
-@router.callback_query(F.data.startswith("inv:new:cooldown:"))
+@router.callback_query(SubscriberInviteCreateState.cooldown, F.data.startswith("inv:new:cooldown:"))
 async def select_subscriber_invite_cooldown(
     callback: CallbackQuery,
     state: FSMContext,
@@ -15939,13 +17323,17 @@ async def select_subscriber_invite_cooldown(
 ) -> None:
     cooldown_days = int((callback.data or "").rsplit(":", 1)[-1])
     if cooldown_days not in {0, 7, 30, 90}:
-        await callback.answer("Неизвестный срок защиты", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный срок защиты", show_alert=True)
         return
     accounts = await repository.active_owned_accounts(
         require_authorized_session=not settings.dry_run
     )
     if not accounts:
-        await callback.answer("Нет готовых аккаунтов-администраторов", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Нет готовых аккаунтов-администраторов",
+            show_alert=True,
+        )
         return
     await state.update_data(
         subscriber_invite_contact_cooldown_days=cooldown_days,
@@ -15972,6 +17360,7 @@ async def _show_subscriber_invite_account_picker(
     await state.update_data(
         subscriber_invite_account_ids=sorted(selected), subscriber_invite_account_page=page
     )
+    await state.set_state(SubscriberInviteCreateState.accounts)
     await _edit_callback(
         callback,
         invite_account_picker_text(
@@ -15986,7 +17375,10 @@ async def _show_subscriber_invite_account_picker(
     )
 
 
-@router.callback_query(F.data.startswith("inv:new:accounts:page:"))
+@router.callback_query(
+    SubscriberInviteCreateState.accounts,
+    F.data.startswith("inv:new:accounts:page:"),
+)
 async def page_subscriber_invite_accounts(
     callback: CallbackQuery,
     state: FSMContext,
@@ -15999,7 +17391,7 @@ async def page_subscriber_invite_accounts(
     await _show_subscriber_invite_account_picker(callback, state, repository, settings)
 
 
-@router.callback_query(F.data.startswith("inv:new:account:"))
+@router.callback_query(SubscriberInviteCreateState.accounts, F.data.startswith("inv:new:account:"))
 async def toggle_subscriber_invite_account(
     callback: CallbackQuery,
     state: FSMContext,
@@ -16017,7 +17409,10 @@ async def toggle_subscriber_invite_account(
     await _show_subscriber_invite_account_picker(callback, state, repository, settings)
 
 
-@router.callback_query(F.data.in_({"inv:new:accounts:all", "inv:new:accounts:none"}))
+@router.callback_query(
+    SubscriberInviteCreateState.accounts,
+    F.data.in_({"inv:new:accounts:all", "inv:new:accounts:none"}),
+)
 async def bulk_select_subscriber_invite_accounts(
     callback: CallbackQuery,
     state: FSMContext,
@@ -16032,7 +17427,201 @@ async def bulk_select_subscriber_invite_accounts(
     await _show_subscriber_invite_account_picker(callback, state, repository, settings)
 
 
-@router.callback_query(F.data == "inv:new:accounts:done")
+async def _show_subscriber_invite_manager_picker(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    settings: Settings,
+    *,
+    page: int,
+) -> None:
+    accounts = await repository.active_owned_accounts(
+        require_authorized_session=not settings.dry_run
+    )
+    data = await state.get_data()
+    selected_ids = [int(value) for value in data.get("subscriber_invite_account_ids", [])]
+    if not selected_ids:
+        await _safe_callback_answer(
+            callback,
+            "Сначала выберите аккаунты для приглашений",
+            show_alert=True,
+        )
+        return
+    page = min(max(0, page), max(0, (len(accounts) - 1) // DIRECT_MESSAGE_PICKER_PAGE_SIZE))
+    await state.update_data(subscriber_invite_manager_page=page)
+    await state.set_state(SubscriberInviteCreateState.manager)
+    await _edit_callback(
+        callback,
+        invite_admin_manager_text(
+            len(selected_ids), len(accounts), page, DIRECT_MESSAGE_PICKER_PAGE_SIZE
+        ),
+        invite_admin_manager_picker(
+            accounts, page=page, page_size=DIRECT_MESSAGE_PICKER_PAGE_SIZE
+        ),
+    )
+
+
+@router.callback_query(SubscriberInviteCreateState.accounts, F.data == "inv:new:accounts:prepare")
+async def begin_subscriber_invite_admin_setup(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    settings: Settings,
+) -> None:
+    await _show_subscriber_invite_manager_picker(
+        callback, state, repository, settings, page=0
+    )
+
+
+@router.callback_query(
+    SubscriberInviteCreateState.manager,
+    F.data.startswith("inv:new:managerpage:"),
+)
+async def page_subscriber_invite_manager_setup(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    settings: Settings,
+) -> None:
+    await _show_subscriber_invite_manager_picker(
+        callback,
+        state,
+        repository,
+        settings,
+        page=int((callback.data or "").rsplit(":", 1)[-1]),
+    )
+
+
+@router.callback_query(SubscriberInviteCreateState.manager, F.data.startswith("inv:new:manager:"))
+async def select_subscriber_invite_admin_manager(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    settings: Settings,
+) -> None:
+    manager_id = int((callback.data or "").rsplit(":", 1)[-1])
+    accounts = await repository.active_owned_accounts(
+        require_authorized_session=not settings.dry_run
+    )
+    manager = next((item for item in accounts if item.id == manager_id), None)
+    if manager is None:
+        await _safe_callback_answer(callback, "Этот аккаунт больше не готов", show_alert=True)
+        return
+    data = await state.get_data()
+    selected_ids = [int(value) for value in data.get("subscriber_invite_account_ids", [])]
+    await state.update_data(subscriber_invite_manager_id=manager_id)
+    await state.set_state(SubscriberInviteCreateState.admin_setup)
+    await _edit_callback(
+        callback,
+        invite_admin_setup_confirm_text(manager, len(selected_ids)),
+        invite_admin_setup_confirm_menu(),
+    )
+
+
+@router.callback_query(
+    StateFilter(SubscriberInviteCreateState.manager, SubscriberInviteCreateState.admin_setup),
+    F.data == "inv:new:accounts:back",
+)
+async def back_to_subscriber_invite_accounts(
+    callback: CallbackQuery,
+    state: FSMContext,
+    repository: AdminRepository,
+    settings: Settings,
+) -> None:
+    await _show_subscriber_invite_account_picker(callback, state, repository, settings)
+
+
+@router.callback_query(SubscriberInviteCreateState.admin_setup, F.data == "inv:new:adminsetup:run")
+async def run_subscriber_invite_admin_setup(
+    callback: CallbackQuery,
+    state: FSMContext,
+    subscriber_invites: SubscriberInviteService,
+    repository: AdminRepository,
+    settings: Settings,
+) -> None:
+    await state.set_state(SubscriberInviteCreateState.accounts)
+    data = await state.get_data()
+    manager_id = int(data.get("subscriber_invite_manager_id") or 0)
+    selected_ids = [int(value) for value in data.get("subscriber_invite_account_ids", [])]
+    destination_ref = str(data.get("subscriber_invite_destination_ref") or "")
+    if not manager_id or not selected_ids or not destination_ref:
+        await _safe_callback_answer(
+            callback,
+            "Черновик устарел. Выберите аккаунты заново.",
+            show_alert=True,
+        )
+        return
+    await _safe_callback_answer(callback, "Настраиваю права…")
+    await _edit_callback(
+        callback, invite_admin_setup_progress_text(0, len(selected_ids), 0, 0), None, answer=False
+    )
+
+    async def report(checked: int, total: int, granted: int, failed: int) -> None:
+        try:
+            await callback.message.edit_text(
+                invite_admin_setup_progress_text(checked, total, granted, failed)
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
+    try:
+        result = await subscriber_invites.prepare_invite_admins(
+            manager_id=manager_id,
+            account_ids=selected_ids,
+            destination_ref=destination_ref,
+            on_progress=report,
+        )
+    except (ConflictError, NotFoundError, ValueError) as exc:
+        await _edit_callback(
+            callback,
+            f"<b>Права не подготовлены</b>\n\n{escape(operator_error_message(exc))}",
+            invite_cancel_menu(),
+            answer=False,
+        )
+        return
+    details = "\n".join(
+        f"• {escape(label)} — {escape(reason)}" for label, reason in result.failed[:8]
+    )
+    result_title = (
+        "Симуляция подготовки прав"
+        if settings.dry_run
+        else "Права не подготовлены"
+        if not result.granted_labels
+        else "Права подготовлены частично"
+        if result.failed
+        else "Права готовы"
+    )
+    text = (
+        f"<b>{result_title}</b>\n\n"
+        f"Главный аккаунт: <b>{escape(result.manager_label)}</b>\n"
+        f"✓ Готово: <b>{len(result.granted_labels)}</b> из <b>{len(selected_ids)}</b>"
+    )
+    if details:
+        text += f"\n\n<b>Не удалось:</b>\n{details}"
+    text += "\n\nДалее сервис всё равно перепроверит права перед запуском."
+    accounts = await repository.active_owned_accounts(
+        require_authorized_session=not settings.dry_run
+    )
+    available_ids = {int(account.id) for account in accounts}
+    selected_ids = [account_id for account_id in selected_ids if account_id in available_ids]
+    await state.update_data(
+        subscriber_invite_account_ids=selected_ids, subscriber_invite_account_page=0
+    )
+    await _edit_callback(
+        callback,
+        text,
+        invite_account_picker(
+            accounts,
+            set(selected_ids),
+            page=0,
+            page_size=DIRECT_MESSAGE_PICKER_PAGE_SIZE,
+        ),
+        answer=False,
+    )
+
+
+@router.callback_query(SubscriberInviteCreateState.accounts, F.data == "inv:new:accounts:done")
 async def save_subscriber_invite_campaign(
     callback: CallbackQuery,
     state: FSMContext,
@@ -16042,7 +17631,7 @@ async def save_subscriber_invite_campaign(
     data = await state.get_data()
     selected_ids = [int(value) for value in data.get("subscriber_invite_account_ids", [])]
     if not selected_ids:
-        await callback.answer("Выберите хотя бы один аккаунт", show_alert=True)
+        await _safe_callback_answer(callback, "Выберите хотя бы один аккаунт", show_alert=True)
         return
     list_id = int(data.get("subscriber_invite_list_id") or 0)
     destination_ref = str(data.get("subscriber_invite_destination_ref") or "")
@@ -16066,7 +17655,7 @@ async def save_subscriber_invite_campaign(
         )
         view = await subscriber_invites.get_campaign_view(int(campaign.id))
     except (ConflictError, NotFoundError, ValueError) as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     token = uuid4().hex[:12]
     await state.clear()
@@ -16088,11 +17677,14 @@ async def open_subscriber_invite_campaigns(
 ) -> None:
     page = max(0, int((callback.data or "").rsplit(":", 1)[-1]))
     campaigns, total = await subscriber_invites.list_campaigns(page, DIRECT_MESSAGE_PAGE_SIZE)
-    views = [await subscriber_invites.get_campaign_view(int(item.id)) for item in campaigns]
+    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PAGE_SIZE)
+    if page > last_page:
+        page = last_page
+        campaigns, total = await subscriber_invites.list_campaigns(page, DIRECT_MESSAGE_PAGE_SIZE)
     await _edit_callback(
         callback,
-        invite_campaigns_text(views, total, page, DIRECT_MESSAGE_PAGE_SIZE),
-        invite_campaigns_menu(views, total, page, DIRECT_MESSAGE_PAGE_SIZE),
+        invite_campaigns_text(campaigns, total, page, DIRECT_MESSAGE_PAGE_SIZE),
+        invite_campaigns_menu(campaigns, total, page, DIRECT_MESSAGE_PAGE_SIZE),
     )
 
 
@@ -16145,18 +17737,57 @@ async def launch_subscriber_invite_campaign(
         int(data.get("subscriber_invite_launch_campaign_id") or 0) != campaign_id
         or str(data.get("subscriber_invite_launch_token") or "") != token
     ):
-        await callback.answer("Это подтверждение уже использовано или устарело", show_alert=True)
+        await _safe_callback_answer(
+            callback,
+            "Это подтверждение уже использовано или устарело",
+            show_alert=True,
+        )
         return
     await state.clear()
-    await _edit_callback(callback, "<b>⏳ Проверяю права и формирую очередь приглашений…</b>", None)
+    # Acknowledge before the read-only Telegram checks: a pool of accounts can
+    # take a little while, and a silent callback otherwise looks frozen.
+    await _safe_callback_answer(callback, "Проверяю выбранные аккаунты…")
+    await _edit_callback(
+        callback,
+        invite_preflight_progress_text(0, 0, 0, 0),
+        None,
+        answer=False,
+    )
+
+    last_reported = 0
+
+    async def report_preflight_progress(
+        checked: int, total: int, ready: int, unavailable: int
+    ) -> None:
+        nonlocal last_reported
+        # Telegram edits are rate-limited.  Show every account for small pools,
+        # then concise milestones while still making long checks visibly alive.
+        milestone = total <= 12 or checked == total or checked - last_reported >= 3
+        if not milestone or not isinstance(callback.message, Message):
+            return
+        last_reported = checked
+        try:
+            await callback.message.edit_text(
+                invite_preflight_progress_text(checked, total, ready, unavailable)
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
     try:
-        launch = await subscriber_invites.launch_campaign(campaign_id, consent_confirmed=True)
+        launch = await subscriber_invites.launch_campaign(
+            campaign_id,
+            consent_confirmed=True,
+            on_preflight_progress=report_preflight_progress,
+        )
         view = await subscriber_invites.get_launch_view(int(launch.id))
     except (ConflictError, NotFoundError) as exc:
         await _edit_callback(
             callback,
             f"<b>Запуск не создан</b>\n\n{escape(operator_error_message(exc))}",
-            subscriber_invites_home_menu(),
+            subscriber_invites_home_menu()
+            if isinstance(exc, NotFoundError)
+            else invite_campaign_details_menu(campaign_id, 0),
             answer=False,
         )
         return
@@ -16175,6 +17806,10 @@ async def open_subscriber_invite_launches(
 ) -> None:
     page = max(0, int((callback.data or "").rsplit(":", 1)[-1]))
     launches, total = await subscriber_invites.list_launches(page, DIRECT_MESSAGE_PAGE_SIZE)
+    last_page = max(0, (total - 1) // DIRECT_MESSAGE_PAGE_SIZE)
+    if page > last_page:
+        page = last_page
+        launches, total = await subscriber_invites.list_launches(page, DIRECT_MESSAGE_PAGE_SIZE)
     await _edit_callback(
         callback,
         invite_launches_text(launches, total, page, DIRECT_MESSAGE_PAGE_SIZE),
@@ -16220,7 +17855,7 @@ async def confirm_cancel_subscriber_invite_launch(
     _, _, raw_launch_id, raw_page = (callback.data or "").split(":")
     cancelled = await subscriber_invites.cancel_launch(int(raw_launch_id))
     view = await subscriber_invites.get_launch_view(int(raw_launch_id))
-    await callback.answer(f"Отменено заданий: {cancelled}")
+    await _safe_callback_answer(callback, f"Отменено заданий: {cancelled}")
     await _edit_callback(
         callback,
         invite_launch_text(view),
@@ -16229,12 +17864,39 @@ async def confirm_cancel_subscriber_invite_launch(
     )
 
 
+from proxima_traffic.bot.story_tagging_ui import story_router
+from proxima_traffic.bot.story_viewer_ui import story_viewer_router
+
+router.callback_query.handlers.extend(story_router.callback_query.handlers)
+router.message.handlers.extend(story_router.message.handlers)
+router.callback_query.handlers.extend(story_viewer_router.callback_query.handlers)
+router.message.handlers.extend(story_viewer_router.message.handlers)
+
+
+
 @router.message()
-async def unknown_message(message: Message) -> None:
+async def unknown_message(message: Message, raw_state: str | None = None) -> None:
+    if raw_state is not None:
+        await message.answer(
+            "Сейчас открыт мастер. Выберите вариант на его экране или отправьте данные "
+            "для текущего шага.\n\n<code>/cancel</code> — отменить ввод.",
+            reply_markup=cancel_menu(),
+        )
+        return
     await message.answer(
         "Не понял сообщение. Откройте панель кнопкой ниже или используйте "
         "<code>/help</code> для краткой справки.",
         reply_markup=main_menu(),
+    )
+
+
+
+
+@router.callback_query()
+async def unknown_callback(callback: CallbackQuery) -> None:
+    await _safe_callback_answer(
+        callback, "Эта кнопка устарела. Откройте нужный раздел заново через /admin.",
+        show_alert=True,
     )
 
 
@@ -16597,7 +18259,7 @@ async def _show_accounts(
             group_id=group_id,
         )
     except ValueError:
-        await callback.answer("Неизвестный фильтр аккаунтов", show_alert=True)
+        await _safe_callback_answer(callback, "Неизвестный фильтр аккаунтов", show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -16626,7 +18288,7 @@ async def _show_account_details(
     try:
         account = await account_service.get_account(account_id)
     except NotFoundError as exc:
-        await callback.answer(callback_error_message(exc), show_alert=True)
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     proxy_slot, shared_proxy_accounts, proxy_view = await _account_proxy_summary(
         proxy_service, account_id
@@ -16728,7 +18390,7 @@ async def _show_target_list_targets(
             )
     except (NotFoundError, ConflictError) as exc:
         if answer:
-            await callback.answer(callback_error_message(exc), show_alert=True)
+            await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
         return
     await _edit_callback(
         callback,
@@ -16810,17 +18472,34 @@ async def _edit_callback(
     *,
     answer: bool = True,
 ) -> None:
-    if answer:
-        await _safe_callback_answer(callback)
+    mark_callback_data_ready()
+    if not callback_is_current(callback):
+        if answer:
+            await _safe_callback_answer(callback)
+        return
     if not isinstance(callback.message, Message):
+        if answer:
+            await _safe_callback_answer(callback)
         return
     if isinstance(reply_markup, InlineKeyboardMarkup):
         reply_markup = polish_markup(reply_markup)
+    text = fit_panel_text(text)
+    answer_task = asyncio.create_task(_safe_callback_answer(callback)) if answer else None
+    api_started_at = start_callback_telegram_api()
     try:
         await callback.message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
+        if screen_is_uneditable(exc):
+            restored = await callback.message.answer(text, reply_markup=reply_markup)
+            if isinstance(restored, Message):
+                await remember_recovered_panel(restored)
+        elif "message is not modified" not in str(exc).lower():
             raise
+    finally:
+        record_callback_telegram_api(api_started_at, operation="edit")
+        mark_callback_screen_updated()
+        if answer_task is not None:
+            await answer_task
 
 
 async def _safe_callback_answer(
@@ -16831,26 +18510,15 @@ async def _safe_callback_answer(
 ) -> bool:
     """Acknowledge a callback while tolerating an update delayed by a restart."""
 
-    kwargs: dict[str, object] = {}
-    if text is not None:
-        kwargs["text"] = text
-    if show_alert is not None:
-        kwargs["show_alert"] = show_alert
-    try:
-        await callback.answer(**kwargs)
-    except TelegramBadRequest as exc:
-        message = str(exc).lower()
-        if "query is too old" in message or "query id is invalid" in message:
-            return False
-        raise
-    return True
+    return await acknowledge_callback(callback, text, show_alert=show_alert)
 
 
 async def _remember_origin(callback: CallbackQuery, state: FSMContext) -> None:
-    if isinstance(callback.message, Message):
+    message = getattr(callback, "message", None)
+    if isinstance(message, Message):
         await state.update_data(
-            origin_chat_id=callback.message.chat.id,
-            origin_message_id=callback.message.message_id,
+            origin_chat_id=message.chat.id,
+            origin_message_id=message.message_id,
         )
 
 
@@ -16867,16 +18535,36 @@ async def _edit_origin_data(
     chat_id = data.get("origin_chat_id")
     message_id = data.get("origin_message_id")
     if chat_id is None or message_id is None:
+        state = current_panel_state.get()
+        if state is not None:
+            markup = polish_markup(reply_markup) if isinstance(
+                reply_markup, InlineKeyboardMarkup
+            ) else reply_markup
+            restored = await bot.send_message(
+                chat_id=state.key.chat_id, text=fit_panel_text(text), reply_markup=markup,
+            )
+            if isinstance(restored, Message):
+                await remember_recovered_panel(restored)
         return
     if isinstance(reply_markup, InlineKeyboardMarkup):
         reply_markup = polish_markup(reply_markup)
-    with suppress(TelegramBadRequest):
+    text = fit_panel_text(text)
+    try:
         await bot.edit_message_text(
             chat_id=int(chat_id),
             message_id=int(message_id),
             text=text,
             reply_markup=reply_markup,
         )
+    except TelegramBadRequest as exc:
+        if screen_is_uneditable(exc):
+            restored = await bot.send_message(
+                chat_id=int(chat_id), text=text, reply_markup=reply_markup,
+            )
+            if isinstance(restored, Message):
+                await remember_recovered_panel(restored)
+        elif "message is not modified" not in str(exc).lower():
+            raise
 
 
 def _page_from(parts: list[str]) -> int:
@@ -16885,3 +18573,6 @@ def _page_from(parts: list[str]) -> int:
     with suppress(ValueError):
         return max(0, int(parts[2]))
     return 0
+
+
+

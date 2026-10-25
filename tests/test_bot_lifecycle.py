@@ -28,7 +28,7 @@ async def test_ready_notification_reaches_available_administrators(caplog) -> No
     assert bot.sent == [
         (
             1,
-            "🟢 <b>Proxima перезапущен и готов к работе.</b>\n\n"
+            "✓ <b>Proxima перезапущен.</b>\n\n"
             "Панель управления запущена. Очередь рассылок и реакций включена.\n\n"
             + bot_main._RESTART_UPDATE_NOTICE,
         )

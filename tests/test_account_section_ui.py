@@ -91,13 +91,10 @@ def test_account_menu_visually_separates_navigation_checks_profile_and_import() 
     menu = accounts_menu(page)
     rows = [[button.text for button in row] for row in menu.inline_keyboard]
 
-    assert ["── Навигация ──"] in rows
-    assert ["── Проверка ──"] in rows
-    assert ["── Оформление профиля ──"] in rows
-    assert ["── Добавление ──"] in rows
-    assert ["🎛 Все", "🗂 Группы"] in rows
-    assert ["🎲 Имена", "📝 Описания"] in rows
-    assert ["📥 Импорт", "➕ Без сессии"] in rows
+    assert not any(button.callback_data == "noop" for row in menu.inline_keyboard for button in row)
+    assert ["Все", "Группы"] in rows
+    assert ["⇄ Имена", "Описания"] in rows
+    assert ["↓ Импорт", "＋ Без сессии"] in rows
 
 
 def test_account_group_member_picker_and_details_have_safe_callbacks() -> None:
@@ -293,7 +290,7 @@ def test_bulk_profile_scope_ui_limits_changes_to_ready_accounts_and_preserves_na
     assert "Новая поставка августа</b> · готово 7 из 9" in scope_text
     assert "Требуют проверки" not in scope_text
     assert "ОБЛАСТЬ · Новая поставка августа · ДОСТУПНО 0 АККАУНТОВ" in catalog
-    assert "СМЕШАННЫЕ · Новая поставка августа · АККАУНТОВ 1" in preview
+    assert "Смешанные · Новая поставка августа · Аккаунтов: <b>1</b>" in preview
     assert "account:profile:scope:names:all" in _callbacks(catalog_menu)
     assert "account:names:preview:mixed:0:0" in _callbacks(confirmation)
     assert "account:profile:scope:names:all" in _callbacks(confirmation)

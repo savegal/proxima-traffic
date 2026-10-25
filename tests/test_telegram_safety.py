@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -226,20 +227,25 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
     assert admin_required.code == "account_missing_admin_rights"
 
     peer_flood = gateway._map_rpc_error(errors.PeerFloodError(None), context="send")
-    assert isinstance(peer_flood, TemporaryGatewayError)
+    assert isinstance(peer_flood, PermanentGatewayError)
     assert peer_flood.code == "account_restricted"
-    assert peer_flood.retry_after is not None
+    assert peer_flood.retry_after is None
 
     frozen_account = gateway._map_rpc_error(
         errors.RPCError(None, "USER_FROZEN", 403), context="send"
     )
-    assert isinstance(frozen_account, TemporaryGatewayError)
+    assert isinstance(frozen_account, PermanentGatewayError)
     assert frozen_account.code == "account_restricted"
 
     slow_mode = gateway._map_rpc_error(errors.SlowModeWaitError(None, 17), context="send")
     assert isinstance(slow_mode, TemporaryGatewayError)
     assert slow_mode.code == "slow_mode"
     assert slow_mode.retry_after == 17
+
+    short_flood = gateway._map_rpc_error(errors.FloodWaitError(None, 17), context="send")
+    assert isinstance(short_flood, TemporaryGatewayError)
+    assert short_flood.code == "flood_wait"
+    assert short_flood.retry_after == 500
 
     gateway._settings.max_flood_wait_seconds = 10
     long_flood = gateway._map_rpc_error(errors.FloodWaitError(None, 90_000), context="send")
@@ -348,7 +354,7 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
         errors.FrozenParticipantMissingError(None),
         context="send",
     )
-    assert isinstance(frozen_account, TemporaryGatewayError)
+    assert isinstance(frozen_account, PermanentGatewayError)
     assert frozen_account.code == "account_restricted"
 
     lost_after_send = gateway._map_rpc_error(errors.ChannelPrivateError(None), context="verify")
@@ -417,7 +423,7 @@ def test_telegram_rpc_errors_are_classified_by_blast_radius(tmp_path) -> None:
         errors.ForbiddenError(None, "FORBIDDEN", 403), context="direct_message"
     )
     assert isinstance(unknown_direct_forbidden, PermanentGatewayError)
-    assert unknown_direct_forbidden.code == "recipient_route_blocked"
+    assert unknown_direct_forbidden.code == "telegram_forbidden"
 
     malformed_request = gateway._map_rpc_error(
         errors.RPCError(None, "MESSAGE_TOO_LONG", 400), context="send"
@@ -477,10 +483,39 @@ async def test_folder_preflight_normalizes_frozen_account_error(tmp_path) -> Non
         telegram_peer_id=5200,
     )
 
-    with pytest.raises(TemporaryGatewayError) as raised:
+    with pytest.raises(PermanentGatewayError) as raised:
         await gateway._resolve_preflight_entity(object(), 51, target)
 
     assert raised.value.code == "account_restricted"
+
+
+@pytest.mark.parametrize("context", ["send", "direct_message", "subscriber_invite"])
+@pytest.mark.parametrize(
+    "rpc",
+    [
+        errors.PeerFloodError(None),
+        errors.FrozenMethodInvalidError(None),
+        errors.UserRestrictedError(None),
+        errors.RPCError(None, "PEER_FLOOD", 400),
+        errors.RPCError(None, "USER_FROZEN", 403),
+    ],
+)
+def test_account_refusals_have_no_invented_retry_time(tmp_path, context, rpc):
+    settings = _settings(tmp_path, "no-invented-wait.db")
+    settings.account_restriction_cooldown_hours = 0
+    gateway = _gateway(settings)
+    refusal = gateway._map_rpc_error(rpc, context=context)
+    assert refusal.code == "account_restricted"
+    assert refusal.retryable is False
+    assert refusal.retry_after is None
+
+
+def test_operator_can_opt_into_a_local_restriction_pause(tmp_path):
+    settings = _settings(tmp_path, "opt-in-wait.db")
+    settings.account_restriction_cooldown_hours = 1
+    refusal = _gateway(settings)._map_rpc_error(errors.PeerFloodError(None), context="send")
+    assert refusal.retryable is True
+    assert refusal.retry_after == 3600
 
 
 @pytest.mark.asyncio
@@ -566,33 +601,22 @@ async def test_delivery_verification_detects_missing_message(tmp_path) -> None:
     assert request.random_id == gateway._message_random_id("stable-delivery-key")
 
 
-async def test_duplicate_random_id_recovers_already_delivered_message(tmp_path) -> None:
+@pytest.mark.parametrize("html_text", [None, "<b>hello</b>"])
+async def test_duplicate_random_id_does_not_adopt_a_matching_history_message(
+    tmp_path, html_text
+) -> None:
     gateway = _gateway(_settings(tmp_path, "duplicate-delivery.db"))
-
-    sent = await gateway._send(
-        DuplicateDeliveryClient(),
-        types.InputPeerSelf(),
-        "hello",
-        None,
-        "stable-idempotency-key",
-    )
-
-    assert sent.message_id == 778
-
-
-async def test_duplicate_recovery_uses_the_rendered_html_text(tmp_path) -> None:
-    gateway = _gateway(_settings(tmp_path, "duplicate-formatted-delivery.db"))
-
-    sent = await gateway._send(
-        DuplicateDeliveryClient(),
-        types.InputPeerSelf(),
-        "plain fallback text",
-        None,
-        "stable-formatted-idempotency-key",
-        html_text="<b>hello</b>",
-    )
-
-    assert sent.message_id == 778
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._send(
+            DuplicateDeliveryClient(),
+            types.InputPeerSelf(),
+            "hello",
+            None,
+            "stable-idempotency-key",
+            html_text=html_text,
+        )
+    assert raised.value.code == "delivery_unconfirmed"
+    assert raised.value.external_message_id is None
 
 
 async def test_telethon_parser_preserves_premium_emoji_entities(tmp_path) -> None:
@@ -610,7 +634,7 @@ async def test_telethon_parser_preserves_premium_emoji_entities(tmp_path) -> Non
     assert custom[0].document_id == emoji_id
 
 
-async def test_duplicate_recovery_reuses_the_first_durable_attempt_time(tmp_path) -> None:
+async def test_confirmed_durable_receipt_prevents_a_second_telegram_send(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'durable-receipt.db'}")
     await database.create_schema()
     try:
@@ -621,10 +645,11 @@ async def test_duplicate_recovery_reuses_the_first_durable_attempt_time(tmp_path
             receipt = await session.scalar(select(TelegramDeliveryReceipt))
             assert receipt is not None
             receipt.first_attempt_at = utc_now() - timedelta(minutes=10)
+            receipt.external_message_id = 778
             await session.commit()
-
+        client = SimpleNamespace(get_messages=AsyncMock(return_value=SimpleNamespace(id=778)))
         sent = await gateway._send(
-            DuplicateDeliveryClient(),
+            client,
             types.InputPeerSelf(),
             "hello",
             None,
@@ -632,6 +657,7 @@ async def test_duplicate_recovery_reuses_the_first_durable_attempt_time(tmp_path
         )
 
         assert sent.message_id == 778
+        client.get_messages.assert_awaited_once()
         async with database.session_factory() as session:
             receipt = await session.scalar(select(TelegramDeliveryReceipt))
             assert receipt is not None
@@ -1198,7 +1224,7 @@ async def test_channel_comment_anchors_first_and_follow_up_replies(tmp_path) -> 
     gateway = _channel_gateway(_settings(tmp_path, "channel-anchor.db"))
     client = object()
     channel = SimpleNamespace(broadcast=True)
-    discussion_entity = SimpleNamespace(megagroup=True, broadcast=False)
+    discussion_entity = types.InputPeerChannel(123456, 987654)
     sent_calls: list[dict[str, object]] = []
 
     async def ensure_client(account_id: int) -> object:
@@ -1278,9 +1304,83 @@ async def test_channel_comment_anchors_first_and_follow_up_replies(tmp_path) -> 
 
     assert first.thread_root_message_id == 700
     assert reply.thread_root_message_id == 700
+    assert first.discussion_peer_id == -1000000123456
+    assert first.discussion_access_hash == 987654
+    assert reply.discussion_peer_id == first.discussion_peer_id
     assert sent_calls[0]["reply_to_message_id"] == 700
     assert sent_calls[1]["reply_to_message_id"] == first.message_id
     assert sent_calls[0]["error_context"] == "channel_comment"
+
+
+@pytest.mark.parametrize("outcome", ["joined", "join_throttled", "flood_wait", "disabled"])
+async def test_broadcast_membership_preparation_preserves_join_limits(tmp_path, outcome) -> None:
+    settings = _settings(tmp_path, "broadcast-prepare.db").model_copy(
+        update={"account_auto_join": outcome != "disabled"}
+    )
+    gateway = _channel_gateway(settings)
+    gateway._entity_cache = {}
+    gateway._joined = set()
+    entity = types.Channel(
+        id=701,
+        title="Broadcast target",
+        photo=types.ChatPhotoEmpty(),
+        date=utc_now(),
+        broadcast=False,
+        megagroup=True,
+        access_hash=702,
+    )
+
+    class JoinClient(DiscussionMembershipClient):
+        async def __call__(self, request):
+            if outcome == "flood_wait" and isinstance(
+                request, functions.channels.JoinChannelRequest
+            ):
+                self.requests.append(request)
+                raise errors.FloodWaitError(None, capture=720)
+            return await super().__call__(request)
+
+    client = JoinClient()
+    gateway._ensure_client = AsyncMock(return_value=client)
+    gateway._resolve_entity = AsyncMock(return_value=entity)
+    join_limit = AsyncMock()
+    if outcome == "join_throttled":
+        join_limit.side_effect = TemporaryGatewayError(
+            "join throttled", retry_after=600, code="join_throttled"
+        )
+    gateway._enforce_join_limit = join_limit
+    record_join = AsyncMock()
+    gateway._account_service = SimpleNamespace(record_join=record_join)
+    account = Account(id=91)
+    target = Target(id=92, chat_ref="@broadcast_target")
+
+    if outcome in {"joined", "disabled"}:
+        changed = await gateway.prepare_broadcast_target(account=account, target=target)
+        assert changed is (outcome == "joined")
+        assert await gateway.prepare_broadcast_target(account=account, target=target) is False
+    else:
+        with pytest.raises(TemporaryGatewayError) as raised:
+            await gateway.prepare_broadcast_target(account=account, target=target)
+        assert raised.value.code == outcome
+        if outcome == "flood_wait":
+            assert raised.value.retry_after >= 720
+        else:
+            assert raised.value.retry_after == 600
+        assert (account.id, target.chat_ref) not in gateway._joined
+
+    if outcome == "disabled":
+        gateway._ensure_client.assert_not_awaited()
+        join_limit.assert_not_awaited()
+        assert not client.requests
+    else:
+        join_limit.assert_awaited_once_with(account.id)
+        expected = [functions.channels.GetParticipantRequest]
+        if outcome != "join_throttled":
+            expected.append(functions.channels.JoinChannelRequest)
+        assert [type(request) for request in client.requests] == expected
+    if outcome == "joined":
+        record_join.assert_awaited_once_with(account.id)
+    else:
+        record_join.assert_not_awaited()
 
 
 async def test_channel_comment_joins_linked_discussion_under_normal_limits(tmp_path) -> None:
@@ -1397,6 +1497,64 @@ async def test_delivery_verification_rejects_message_empty(tmp_path) -> None:
     assert raised.value.code == "post_deleted_by_moderation"
 
 
+async def test_direct_delivery_requires_visible_outgoing_message(tmp_path) -> None:
+    settings = _settings(tmp_path, "direct-confirm.db").model_copy(
+        update={"account_delivery_verify_confirm_delay_seconds": 0}
+    )
+    gateway = _gateway(settings)
+    client = SimpleNamespace(
+        get_messages=AsyncMock(return_value=SimpleNamespace(id=777, out=False))
+    )
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._verify_direct_delivery(client, types.InputPeerSelf(), 777)
+    assert raised.value.code == "delivery_unconfirmed"
+    assert client.get_messages.await_count == 2
+
+    client.get_messages.return_value = SimpleNamespace(id=777, out=True)
+    await gateway._verify_direct_delivery(client, types.InputPeerSelf(), 777)
+    with pytest.raises(PermanentGatewayError) as mismatched:
+        await gateway._verify_direct_delivery(
+            client, types.InputPeerSelf(), 777, expected_text="prepared message"
+        )
+    assert mismatched.value.code == "delivery_unconfirmed"
+    client.get_messages.return_value = SimpleNamespace(
+        id=777, out=True, message="prepared message", media=object()
+    )
+    await gateway._verify_direct_delivery(
+        client, types.InputPeerSelf(), 777,
+        expected_text="prepared message", expect_media=True,
+    )
+
+
+async def test_invite_requires_confirmed_participant(tmp_path) -> None:
+    gateway = _gateway(_settings(tmp_path, "invite-confirm.db"))
+    destination = types.InputChannel(channel_id=100, access_hash=200)
+    profile = types.User(id=300, access_hash=400)
+    missing = AsyncMock(side_effect=errors.UserNotParticipantError(None))
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._verify_subscriber_invite(missing, destination, profile)
+    assert raised.value.code == "invite_delivery_unconfirmed"
+    assert missing.await_count == 2
+
+    left = AsyncMock(
+        return_value=SimpleNamespace(
+            participant=types.ChannelParticipantLeft(peer=types.PeerUser(300))
+        )
+    )
+    with pytest.raises(PermanentGatewayError) as left_result:
+        await gateway._verify_subscriber_invite(left, destination, profile)
+    assert left_result.value.code == "invite_delivery_unconfirmed"
+
+    confirmed = AsyncMock(
+        return_value=SimpleNamespace(
+            participant=types.ChannelParticipant(user_id=300, date=utc_now())
+        )
+    )
+    await gateway._verify_subscriber_invite(confirmed, destination, profile)
+    request = confirmed.await_args.args[0]
+    assert isinstance(request.participant, types.InputPeerUser)
+
+
 async def test_delivery_verification_preserves_moderation_notice(tmp_path) -> None:
     gateway = _gateway(_settings(tmp_path, "delivery-notice.db"))
 
@@ -1411,6 +1569,124 @@ async def test_delivery_verification_preserves_moderation_notice(tmp_path) -> No
 
     assert raised.value.code == "post_deleted_by_moderation"
     assert "подпишитесь" in raised.value.safe_message
+
+
+@pytest.mark.parametrize(
+    "rpc_error",
+    [
+        errors.ChannelPrivateError(None),
+        errors.FloodWaitError(None, capture=720),
+        errors.MessageIdInvalidError(None),
+    ],
+)
+async def test_readback_error_after_acceptance_is_a_terminal_unknown(tmp_path, rpc_error):
+    gateway = _gateway(_settings(tmp_path, "readback-unknown.db"))
+    client = SimpleNamespace(get_messages=AsyncMock(side_effect=rpc_error))
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._verify_delivery(client, types.InputPeerSelf(), 777)
+    assert raised.value.code == "delivery_unconfirmed"
+    assert raised.value.external_message_id == 777
+    assert raised.value.retryable is False
+    assert isinstance(raised.value.__cause__, (PermanentGatewayError, TemporaryGatewayError))
+
+
+async def test_invitation_readback_preserves_a_flood_wait_cause(tmp_path):
+    gateway = _gateway(_settings(tmp_path, "invite-readback-flood.db"))
+    client = AsyncMock(side_effect=errors.FloodWaitError(None, capture=720))
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._verify_subscriber_invite(
+            client,
+            types.InputChannel(channel_id=123, access_hash=124),
+            types.User(id=125, access_hash=126),
+        )
+    assert raised.value.code == "invite_delivery_unconfirmed"
+    assert isinstance(raised.value.__cause__, TemporaryGatewayError)
+    assert raised.value.__cause__.code == "flood_wait"
+    assert raised.value.__cause__.retry_after >= 720
+
+
+async def test_unexpected_readback_record_does_not_prove_deletion(tmp_path):
+    gateway = _gateway(_settings(tmp_path, "wrong-readback.db"))
+    client = SimpleNamespace(get_messages=AsyncMock(return_value=SimpleNamespace(id=778)))
+    with pytest.raises(PermanentGatewayError) as raised:
+        await gateway._verify_delivery(client, types.InputPeerSelf(), 777)
+    assert raised.value.code == "delivery_unconfirmed"
+    assert raised.value.external_message_id == 777
+
+
+@pytest.mark.parametrize("kind", ["text", "media", "contact", "album"])
+@pytest.mark.parametrize("response", ["network_error", "missing_id", "duplicate_id"])
+async def test_ambiguous_send_response_never_becomes_a_retry_or_success(
+    tmp_path, monkeypatch, kind, response
+):
+    from telethon import utils
+
+    from proxima_traffic.content import new_stored_contact
+
+    gateway = _gateway(_settings(tmp_path, "ambiguous-send.db"))
+    requests = []
+
+    async def request_call(request):
+        if isinstance(request, functions.messages.UploadMediaRequest):
+            return object()
+        requests.append(request)
+        if response == "missing_id":
+            return SimpleNamespace(updates=[])
+        if response == "duplicate_id":
+            raise errors.RandomIdDuplicateError(None)
+        raise OSError("send response lost")
+
+    client = AsyncMock(side_effect=request_call)
+    monkeypatch.setattr(
+        gateway,
+        "_prepare_uploaded_media",
+        AsyncMock(
+            return_value=types.InputMediaPhoto(
+                id=types.InputPhoto(id=1, access_hash=1, file_reference=b"ref")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        utils,
+        "get_input_media",
+        lambda _: types.InputMediaPhoto(
+            id=types.InputPhoto(id=1, access_hash=1, file_reference=b"ref")
+        ),
+    )
+    with pytest.raises(PermanentGatewayError) as raised:
+        if kind == "text":
+            await gateway._send(client, types.InputPeerSelf(), "Test", None, "text-key")
+        elif kind == "media":
+            await gateway._send_media(
+                client,
+                types.InputPeerSelf(),
+                "Test",
+                None,
+                "media-key",
+                html_text=None,
+                media_path="test.jpg",
+                media_kind="photo",
+            )
+        elif kind == "contact":
+            await gateway._send_contact(
+                client,
+                types.InputPeerSelf(),
+                new_stored_contact(phone_number="+15550001111", first_name="Test"),
+                None,
+                "contact-key",
+            )
+        else:
+            await gateway._send_album(
+                client,
+                types.InputPeerSelf(),
+                "Test",
+                None,
+                "album-key",
+                html_text=None,
+                media_items=[("one.jpg", "photo"), ("two.jpg", "photo")],
+            )
+    assert raised.value.code == "delivery_unconfirmed"
+    assert len(requests) == 1
 
 
 async def test_membership_gate_joins_button_channels_and_clicks_verify_once(tmp_path) -> None:
@@ -1728,6 +2004,82 @@ async def test_delayed_verification_prioritizes_removed_post_over_later_chat_ban
     assert permission_checked is False
 
 
+@pytest.mark.parametrize(
+    ("responses", "expected_code"),
+    [
+        ([None, None], "comment_missing"),
+        ([
+            types.MessageEmpty(id=101, peer_id=types.PeerChannel(123)),
+            types.MessageEmpty(id=101, peer_id=types.PeerChannel(123)),
+        ], "comment_missing"),
+        ([None, SimpleNamespace(id=101)], None),
+        ([SimpleNamespace(id=101)], None),
+        ([OSError("network failure")], "network_error"),
+        ([errors.ChannelPrivateError(None)], "account_chat_access_lost"),
+        ([errors.MessageIdInvalidError(None)], "delivery_unconfirmed"),
+        ([SimpleNamespace(id=999)], "delivery_unconfirmed"),
+    ],
+)
+async def test_comment_observation_distinguishes_absence_from_unavailable_reads(
+    tmp_path, responses, expected_code
+) -> None:
+    settings = _settings(tmp_path, "comment-observe.db").model_copy(update={
+        "account_delivery_verify_enabled": False,
+        "account_delivery_verify_confirm_delay_seconds": 0,
+    })
+    gateway = _channel_gateway(settings)
+    peer = types.InputPeerChannel(123, 456)
+    client = SimpleNamespace(
+        get_entity=AsyncMock(return_value=peer),
+        get_messages=AsyncMock(side_effect=responses),
+    )
+    gateway._ensure_client = AsyncMock(return_value=client)
+    gateway._resolve_entity = AsyncMock(side_effect=AssertionError("must use original peer"))
+    gateway._ensure_discussion_membership = AsyncMock(
+        side_effect=AssertionError("read-only monitoring must never join")
+    )
+    gateway._ensure_can_send = lambda entity: pytest.fail("a read needs no send permission")
+    arguments = {
+        "account": Account(id=1, label="observer", ownership_confirmed=True),
+        "channel_ref": "@a_channel_that_now_has_another_discussion",
+        "channel_post_id": 100,
+        "message_id": 101,
+        "discussion_peer_id": -1000000000123,
+        "discussion_access_hash": 456,
+    }
+    if expected_code is None:
+        await gateway.verify_channel_comment(**arguments)
+    else:
+        with pytest.raises((PermanentGatewayError, TemporaryGatewayError)) as caught:
+            await gateway.verify_channel_comment(**arguments)
+        assert caught.value.code == expected_code
+    assert client.get_entity.await_args.args == (peer,)
+    assert client.get_messages.await_count == len(responses)
+    gateway._ensure_discussion_membership.assert_not_awaited()
+    gateway._resolve_entity.assert_not_awaited()
+
+
+@pytest.mark.parametrize("missing", ["discussion_peer_id", "discussion_access_hash"])
+async def test_comment_observation_with_missing_peer_metadata_is_unavailable(
+    tmp_path, missing
+) -> None:
+    gateway = _channel_gateway(_settings(tmp_path, "missing-comment-peer.db"))
+    gateway._ensure_client = AsyncMock(side_effect=AssertionError("insufficient context"))
+    arguments = {
+        "account": Account(id=1, label="observer", ownership_confirmed=True),
+        "channel_ref": "@original_channel",
+        "channel_post_id": 100,
+        "message_id": 101,
+        "discussion_peer_id": -1000000000123,
+        "discussion_access_hash": 456,
+    }
+    arguments[missing] = None
+    with pytest.raises(PermanentGatewayError) as caught:
+        await gateway.verify_channel_comment(**arguments)
+    assert caught.value.code == "comment_verification_unavailable"
+    gateway._ensure_client.assert_not_awaited()
+
+
 def test_message_random_id_is_stable_and_key_specific(tmp_path) -> None:
     gateway = _gateway(_settings(tmp_path, "random-id.db"))
 
@@ -2000,7 +2352,7 @@ async def test_client_connect_rpc_failure_is_normalized_and_client_is_closed(
     assert created and created[0].disconnected is True
 
 
-async def test_corrupted_stored_session_is_normalized_as_unauthorized(tmp_path) -> None:
+async def test_corrupted_stored_session_is_not_a_confirmed_telegram_revocation(tmp_path) -> None:
     from proxima_traffic.accounts import AccountImportError
 
     class AccountServiceStub:
@@ -2015,11 +2367,32 @@ async def test_corrupted_stored_session_is_normalized_as_unauthorized(tmp_path) 
     with pytest.raises(PermanentGatewayError) as raised:
         await gateway._build_client(78)
 
-    assert raised.value.code == "account_unauthorized"
+    assert raised.value.code == "session_material_invalid"
     assert "импортируйте её заново" in str(raised.value)
 
 
-async def test_album_uploads_media_before_send_multi_media(tmp_path, monkeypatch) -> None:
+def test_sent_message_receipt_ignores_unrelated_updates() -> None:
+    unrelated = SimpleNamespace(message=SimpleNamespace(id=9999, out=True))
+    result = SimpleNamespace(updates=[unrelated, types.UpdateMessageID(id=8000, random_id=123)])
+    assert TelethonGateway._sent_message_id(result, 123) == 8000
+    assert TelethonGateway._sent_message_id(result, 456) is None
+    assert TelethonGateway._sent_message_ids(result, {123, 456}) == [8000]
+    assert TelethonGateway._sent_message_ids(SimpleNamespace(id=9999), {123, 456}) == []
+
+
+@pytest.mark.parametrize(
+    "complete_receipt,missing_ids,expected_code",
+    [
+        (True, set(), None),
+        (False, set(), "delivery_unconfirmed"),
+        (True, {8000}, "album_partial_missing"),
+        (True, {8000, 8001}, "post_deleted_by_moderation"),
+        (True, set(), "cancelled_before_send"),
+    ],
+)
+async def test_album_uploads_media_before_send_multi_media(
+    tmp_path, monkeypatch, complete_receipt, missing_ids, expected_code
+) -> None:
     from telethon import utils
 
     gateway = _gateway(_settings(tmp_path, "album-upload.db"))
@@ -2051,11 +2424,15 @@ async def test_album_uploads_media_before_send_multi_media(tmp_path, monkeypatch
                 updates=[
                     types.UpdateMessageID(id=8000 + index, random_id=item.random_id)
                     for index, item in enumerate(request.multi_media)
+                    if complete_receipt or index == 0
                 ]
+                + [SimpleNamespace(message=SimpleNamespace(id=9999, out=True))]
             )
 
         async def get_messages(self, entity: object, *, ids: int):
             del entity
+            if ids in missing_ids:
+                return None
             return SimpleNamespace(id=ids)
 
     client = AlbumClient()
@@ -2067,22 +2444,48 @@ async def test_album_uploads_media_before_send_multi_media(tmp_path, monkeypatch
         )
 
     monkeypatch.setattr(utils, "get_input_media", finalize_media)
-    sent = await gateway._send_album(
-        client,
-        types.InputPeerSelf(),
-        "album caption",
-        None,
-        "album-idempotency",
-        html_text=None,
-        media_items=[("one.jpg", "photo"), ("two.jpg", "photo")],
-    )
+
+    async def before_send():
+        assert len(client.upload_requests) == 2
+        assert client.send_request is None
+        if expected_code == "cancelled_before_send":
+            from proxima_traffic.services import RunCancelled
+
+            raise RunCancelled("Stopped before RPC")
+
+    async def send_album():
+        return await gateway._send_album(
+            client,
+            types.InputPeerSelf(),
+            "album caption",
+            None,
+            "album-idempotency",
+            html_text=None,
+            media_items=[("one.jpg", "photo"), ("two.jpg", "photo")],
+            before_send=before_send,
+        )
+
+    if expected_code is None:
+        sent = await send_album()
+        assert sent.message_id == 8001
+        assert sent.message_ids == (8000, 8001)
+    else:
+        with pytest.raises(PermanentGatewayError) as raised:
+            await send_album()
+        assert raised.value.code == expected_code
+        if not complete_receipt:
+            assert raised.value.external_message_id == 8000
+        elif missing_ids:
+            assert raised.value.external_message_ids == (8000, 8001)
 
     assert len(client.upload_requests) == 2
+    if expected_code == "cancelled_before_send":
+        assert client.send_request is None
+        return
     assert isinstance(client.send_request, functions.messages.SendMultiMediaRequest)
     assert all(
         isinstance(item.media, types.InputMediaPhoto) for item in client.send_request.multi_media
     )
-    assert sent.message_id == 8001
 
 
 async def test_uncertain_album_never_adopts_an_unrelated_caption_match(

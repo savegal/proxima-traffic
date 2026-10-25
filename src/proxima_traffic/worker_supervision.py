@@ -7,6 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from html import escape
 
 from proxima_traffic.models import ensure_utc, utc_now
 
@@ -27,6 +28,14 @@ class WorkerHealthSnapshot:
     last_error: str | None
     started_at: datetime | None = None
 
+    def is_ready(self, *, max_stale_seconds: float, now: datetime | None = None) -> bool:
+        reference = ensure_utc(self.last_success_at or self.started_at)
+        return bool(
+            self.state == "running"
+            and reference is not None
+            and (now or utc_now()) - reference <= timedelta(seconds=max(1.0, max_stale_seconds))
+        )
+
 
 class WorkerSupervisor:
     """Keeps worker failures visible, alerts operators and restarts crashed tasks."""
@@ -37,10 +46,12 @@ class WorkerSupervisor:
         alert_sender: WorkerAlertSender | None = None,
         alert_cooldown_seconds: float = 300.0,
         restart_delay_seconds: float = 5.0,
+        alert_timeout_seconds: float = 5.0,
     ) -> None:
         self._alert_sender = alert_sender
         self._alert_cooldown = timedelta(seconds=max(1.0, alert_cooldown_seconds))
         self._restart_delay = max(0.1, restart_delay_seconds)
+        self._alert_timeout = max(0.01, alert_timeout_seconds)
         self._stop_event = asyncio.Event()
         self._states: dict[str, _WorkerHealthState] = {}
 
@@ -72,14 +83,10 @@ class WorkerSupervisor:
         if not self._states:
             return True
         now = utc_now()
-        maximum_age = timedelta(seconds=max(1.0, max_stale_seconds))
-        for state in self._states.values():
-            if state.state != "running":
-                return False
-            reference = ensure_utc(state.last_success_at or state.started_at)
-            if reference is None or now - reference > maximum_age:
-                return False
-        return True
+        return all(
+            snapshot.is_ready(max_stale_seconds=max_stale_seconds, now=now)
+            for snapshot in self.snapshots()
+        )
 
     async def _run(self, name: str, runner: WorkerRunner) -> None:
         while not self._stop_event.is_set():
@@ -138,12 +145,13 @@ class WorkerSupervisor:
             return
         health.last_alert_at = now
         try:
-            await self._alert_sender(
-                "⚠️ <b>Фоновый worker деградировал</b>\n"
-                f"Сервис: <code>{name}</code>\n"
-                f"Статус: <b>{state}</b>\n"
-                f"Ошибка: <code>{health.last_error}</code>"
-            )
+            async with asyncio.timeout(self._alert_timeout):
+                await self._alert_sender(
+                    "! <b>Фоновый обработчик требует внимания</b>\n"
+                    f"Сервис: <code>{escape(name)}</code>\n"
+                    f"Статус: <b>{escape(state)}</b>\n"
+                    f"Ошибка: <code>{escape(health.last_error)}</code>"
+                )
         except Exception:  # noqa: BLE001 - monitoring must not kill the worker it observes
             logger.exception("Could not send health alert for worker %s", name)
 

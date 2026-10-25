@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -28,6 +28,7 @@ from proxima_traffic.content import (
     serialize_content_variants,
     validate_spintax,
 )
+from proxima_traffic.db import is_transient_sqlite_lock
 from proxima_traffic.dialogues import (
     DialogueStep,
     parse_dialogue_steps,
@@ -37,6 +38,7 @@ from proxima_traffic.failure_policy import (
     ACCOUNT_FATAL_CODES,
     ACCOUNT_TARGET_BLOCK_CODES,
     ACCOUNT_TEMPORARY_CODES,
+    CAMPAIGN_NON_RETRYABLE_CODES,
     OBSERVED_TARGET_FAILURE_CODES,
     failure_code,
 )
@@ -46,6 +48,7 @@ from proxima_traffic.gateways import (
     MessageGateway,
     PermanentGatewayError,
     SentMessage,
+    TemporaryGatewayError,
 )
 from proxima_traffic.mentions import (
     HIDDEN_MENTION_MAXIMUM,
@@ -135,8 +138,9 @@ def _launch_membership(anchor: CampaignRun) -> object:
     return CampaignRun.launch_key.is_(None) & (CampaignRun.request_key == anchor.request_key)
 
 
-class RunCancelled(DomainError):
-    pass
+class RunCancelled(DomainError, PermanentGatewayError):
+    def __init__(self, message: str) -> None:
+        PermanentGatewayError.__init__(self, message, code="cancelled_before_send")
 
 
 class LeaseLostError(ConflictError):
@@ -310,6 +314,12 @@ class CampaignRunner:
             f"proxima-send-reservation-{id(self)}",
             default=None,
         )
+        self._send_attempt_started: ContextVar[bool] = ContextVar(
+            f"proxima-send-attempt-{id(self)}", default=False
+        )
+        self._other_account_action_started: ContextVar[bool] = ContextVar(
+            f"proxima-other-account-action-{id(self)}", default=False
+        )
 
     def _cfg(self, name: str, default: float | int) -> float | int:
         if self._settings is None:
@@ -318,11 +328,11 @@ class CampaignRunner:
 
     @property
     def _pace_min_seconds(self) -> float:
-        return max(0.0, float(self._cfg("account_pace_min_seconds", 0.0)))
+        return max(0.0, float(self._cfg("account_pace_min_seconds", 60.0)))
 
     @property
     def _pace_max_seconds(self) -> float:
-        return max(self._pace_min_seconds, float(self._cfg("account_pace_max_seconds", 0.0)))
+        return max(self._pace_min_seconds, float(self._cfg("account_pace_max_seconds", 600.0)))
 
     @property
     def _account_auto_join(self) -> bool:
@@ -335,27 +345,45 @@ class CampaignRunner:
         if run.cancel_requested:
             raise RunCancelled("cancellation requested")
 
+        async def deliver_current() -> CampaignRun:
+            latest_run, latest_campaign, latest_target, latest_sender, _ = await self._load_context(
+                run_id, lease_token
+            )
+            if latest_run.cancel_requested:
+                raise RunCancelled("cancellation requested before sending")
+            if latest_sender.id != sender.id:
+                raise LeaseLostError("Отправитель изменился во время ожидания блокировки")
+            if latest_campaign.mode == CampaignMode.BROADCAST:
+                return await self._send_broadcast(
+                    latest_run, latest_campaign, latest_sender, latest_target
+                )
+            return await self._send_dialogue_step(
+                latest_run, latest_campaign, latest_sender, latest_target
+            )
+
         try:
             if campaign.mode == CampaignMode.BROADCAST:
                 if self._is_smart_run(run):
                     return await self._run_with_broadcast_locks(
                         int(sender.id),
                         int(target.id),
-                        lambda: self._send_broadcast(run, campaign, sender, target),
+                        deliver_current,
                     )
                 return await self._run_with_account_lock(
                     int(sender.id),
-                    lambda: self._send_broadcast(run, campaign, sender, target),
+                    deliver_current,
+                    track_send_attempt=True,
                 )
             if self._is_smart_run(run):
                 return await self._run_with_broadcast_locks(
                     int(sender.id),
                     int(target.id),
-                    lambda: self._send_dialogue_step(run, campaign, sender, target),
+                    deliver_current,
                 )
             return await self._run_with_account_lock(
                 int(sender.id),
-                lambda: self._send_dialogue_step(run, campaign, sender, target),
+                deliver_current,
+                track_send_attempt=True,
             )
         except AccountSendDeferred as exc:
             async with self._session_factory() as session:
@@ -375,6 +403,7 @@ class CampaignRunner:
         operation: Callable[[], Awaitable[T]],
         *,
         reserve_send: bool = True,
+        track_send_attempt: bool = False,
     ) -> T:
         """Serialize one process's sends per account so pacing/cooldowns are rechecked."""
         async with self._account_locks_guard:
@@ -385,7 +414,7 @@ class CampaignRunner:
         async with lock:
             if not reserve_send:
                 return await operation()
-            async with self._account_send_slot(account_id):
+            async with self._account_send_slot(account_id, track_send_attempt=track_send_attempt):
                 return await operation()
 
     async def run_account_operation(
@@ -412,11 +441,15 @@ class CampaignRunner:
         return max(120.0, step_timeout + heartbeat * 2)
 
     @asynccontextmanager
-    async def _account_send_slot(self, account_id: int):
+    async def _account_send_slot(self, account_id: int, *, track_send_attempt: bool = False):
         token, resume_at = await self._claim_account_send_slot(account_id)
         if token is None:
             raise AccountSendDeferred(resume_at or utc_now() + timedelta(seconds=1))
         context_token = self._send_reservation.set((account_id, token))
+        # Campaigns can finish this step by waiting for chat activity. Only an
+        # outbound attempt or membership change should start another interval.
+        attempt_token = self._send_attempt_started.set(not track_send_attempt)
+        action_token = self._other_account_action_started.set(False)
         heartbeat_stop = asyncio.Event()
         reservation_lost = asyncio.Event()
         owner_task = asyncio.current_task()
@@ -439,11 +472,21 @@ class CampaignRunner:
                 raise LeaseLostError("account send reservation was lost") from None
             raise
         finally:
+            pace_account = (
+                self._send_attempt_started.get() or self._other_account_action_started.get()
+            )
+            self._other_account_action_started.reset(action_token)
+            self._send_attempt_started.reset(attempt_token)
             self._send_reservation.reset(context_token)
             heartbeat_stop.set()
             with suppress(asyncio.CancelledError):
                 await heartbeat_task
-            await self._release_account_send_slot(account_id, token)
+            await self._release_account_send_slot(account_id, token, pace_account=pace_account)
+
+    def _mark_account_send_attempt(self, account_id: int) -> None:
+        reservation = self._send_reservation.get()
+        if reservation is not None and reservation[0] == account_id:
+            self._send_attempt_started.set(True)
 
     async def _claim_account_send_slot(
         self,
@@ -551,7 +594,24 @@ class CampaignRunner:
         if owner_task is not None and not owner_task.done():
             owner_task.cancel()
 
-    async def _release_account_send_slot(self, account_id: int, token: str) -> None:
+    async def _release_account_send_slot(
+        self, account_id: int, token: str, *, pace_account: bool = True
+    ) -> None:
+        now = utc_now()
+        values: dict[str, object] = {
+            "send_reservation_token": None,
+            "send_reservation_until": None,
+        }
+        if pace_account and self._pacing_enabled:
+            # Failed attempts also contact Telegram. Keep the next recipient
+            # behind the same account-wide interval without counting a delivery.
+            values["next_send_at"] = case(
+                (
+                    or_(Account.next_send_at.is_(None), Account.next_send_at <= now),
+                    now + timedelta(seconds=self._pace_delay_seconds()),
+                ),
+                else_=Account.next_send_at,
+            )
         async with self._session_factory() as session:
             await session.execute(
                 update(Account)
@@ -559,7 +619,7 @@ class CampaignRunner:
                     Account.id == account_id,
                     Account.send_reservation_token == token,
                 )
-                .values(send_reservation_token=None, send_reservation_until=None)
+                .values(**values)
             )
             await session.commit()
 
@@ -571,26 +631,44 @@ class CampaignRunner:
         account_id: int,
         *,
         operation_key: str | None = None,
+        keep_reservation: bool = True,
     ) -> bool:
         """Count a secondary Telegram action once under daily pacing rules."""
         async with self._session_factory() as session:
-            if operation_key:
-                receipt_key = hashlib.sha256(operation_key.encode("utf-8")).hexdigest()
-                inserted = await session.execute(
-                    insert(AccountSendReceipt)
-                    .values(
-                        operation_key_hash=receipt_key,
-                        account_id=account_id,
-                        created_at=utc_now(),
-                    )
-                    .on_conflict_do_nothing(index_elements=[AccountSendReceipt.operation_key_hash])
-                )
-                if inserted.rowcount != 1:
-                    await session.rollback()
-                    return False
-            await self._record_account_send(session, account_id)
+            recorded = await self._record_account_send_once(
+                session,
+                account_id,
+                operation_key=operation_key,
+                release_reservation=not keep_reservation,
+            )
             await session.commit()
-            return True
+            return recorded
+
+    async def _record_account_send_once(
+        self,
+        session: AsyncSession,
+        account_id: int,
+        *,
+        operation_key: str | None,
+        release_reservation: bool = False,
+    ) -> bool:
+        """Commit quota and its idempotency receipt in the caller's transaction."""
+        if operation_key:
+            inserted = await session.execute(
+                insert(AccountSendReceipt)
+                .values(
+                    operation_key_hash=hashlib.sha256(operation_key.encode("utf-8")).hexdigest(),
+                    account_id=account_id,
+                    created_at=utc_now(),
+                )
+                .on_conflict_do_nothing(index_elements=[AccountSendReceipt.operation_key_hash])
+            )
+            if inserted.rowcount != 1:
+                return False
+        await self._record_account_send(
+            session, account_id, release_reservation=release_reservation
+        )
+        return True
 
     async def handle_external_account_failure(self, account_id: int, exc: BaseException) -> None:
         await self._handle_account_failure(account_id, exc)
@@ -660,12 +738,27 @@ class CampaignRunner:
             ):
                 return False
             run = await session.get(CampaignRun, action.run_id)
+            campaign = await session.get(Campaign, run.campaign_id) if run is not None else None
             if (
                 run is None
+                or campaign is None
+                or not campaign.enabled
                 or run.membership_gate_retry_count >= 1
                 or run.cancel_requested
-                or run.status == RunStatus.RUNNING
+                or run.status in {RunStatus.RUNNING, RunStatus.CANCELLED, RunStatus.FAILED}
+                or self._repeat_window_expired(run)
             ):
+                return False
+            newer_cycle = await session.scalar(
+                select(CampaignRun.id)
+                .where(
+                    _launch_membership(run),
+                    CampaignRun.target_id == run.target_id,
+                    CampaignRun.cycle_index > run.cycle_index,
+                )
+                .limit(1)
+            )
+            if newer_cycle is not None:
                 return False
             has_later_step = await session.scalar(
                 select(ActionLog.id)
@@ -697,8 +790,20 @@ class CampaignRunner:
                 or action.delayed_delivery_lease_token != delayed_delivery_token
                 or run.membership_gate_retry_count >= 1
                 or run.cancel_requested
-                or run.status == RunStatus.RUNNING
+                or run.status in {RunStatus.RUNNING, RunStatus.CANCELLED, RunStatus.FAILED}
+                or self._repeat_window_expired(run)
             ):
+                return False
+            newer_cycle = await session.scalar(
+                select(CampaignRun.id)
+                .where(
+                    _launch_membership(run),
+                    CampaignRun.target_id == run.target_id,
+                    CampaignRun.cycle_index > run.cycle_index,
+                )
+                .limit(1)
+            )
+            if newer_cycle is not None:
                 return False
             has_later_step = await session.scalar(
                 select(ActionLog.id)
@@ -710,7 +815,7 @@ class CampaignRunner:
                 .limit(1)
             )
             campaign = await session.get(Campaign, run.campaign_id)
-            if has_later_step is not None or campaign is None:
+            if has_later_step is not None or campaign is None or not campaign.enabled:
                 return False
             if campaign.mode == CampaignMode.BROADCAST:
                 if (
@@ -732,6 +837,8 @@ class CampaignRunner:
                 elif retry_step_index == 1:
                     run.reply_message_id = None
 
+            action.delayed_delivery_status = "missing"
+            action.delayed_delivery_error_code = "post_deleted_by_moderation"
             action.status = ActionStatus.FAILED
             action.error_code = "membership_gate_recovered"
             action.error = (
@@ -784,7 +891,7 @@ class CampaignRunner:
                 target_lock = asyncio.Lock()
                 self._target_locks[target_id] = target_lock
         async with target_lock:
-            return await self._run_with_account_lock(account_id, operation)
+            return await self._run_with_account_lock(account_id, operation, track_send_attempt=True)
 
     async def _load_context(
         self, run_id: int, lease_token: str
@@ -801,6 +908,12 @@ class CampaignRunner:
             campaign = await session.get(Campaign, run.campaign_id)
             if campaign is None:
                 raise ConflictError("campaign is missing")
+            gateway_mode = getattr(self._gateway, "simulated", None)
+            if isinstance(gateway_mode, bool):
+                if run.simulated_snapshot is None:
+                    raise RunCancelled("Режим старой задачи не сохранён; создайте новый запуск")
+                if run.simulated_snapshot != gateway_mode:
+                    raise RunCancelled("Тестовый / реальный режим изменился; нужен новый запуск")
             target = await session.get(Target, run.target_id)
             self._validate_config(campaign, target)
             self._validate_run_payload(run, campaign)
@@ -853,15 +966,14 @@ class CampaignRunner:
         deferred = await self._defer_if_unavailable(run, sender.id)
         if deferred is not None:
             return deferred
-        visibility_deferred = await self._defer_for_visibility(
-            run,
-            campaign,
-            sender,
-            target,
-        )
-        if visibility_deferred is not None:
-            return visibility_deferred
         try:
+            await self._validate_broadcast_route(sender.id, target.id)
+            prepared = await self._prepare_broadcast_target(run, sender, target)
+            if prepared is not None:
+                return prepared
+            visibility_deferred = await self._defer_for_visibility(run, campaign, sender, target)
+            if visibility_deferred is not None:
+                return visibility_deferred
             sent = await self._send_broadcast_content(
                 run,
                 campaign,
@@ -872,6 +984,13 @@ class CampaignRunner:
                 text=primary_text,
             )
         except Exception as exc:
+            if (
+                failure_code(exc, "") == "post_deleted_by_moderation"
+                and not self._send_attempt_started.get()
+            ):
+                # Activity inspection observed an older publication disappearing.
+                # Its original action was already updated; this step never sent.
+                raise
             refreshed_membership = await self._retry_stale_auto_join_membership(
                 run=run,
                 account_id=sender.id,
@@ -904,25 +1023,35 @@ class CampaignRunner:
 
         async with self._session_factory() as session:
             stored = await self._require_running_run(session, run.id, run.lease_token)
+            if sent.message_id <= 0:
+                raise PermanentGatewayError(
+                    "Нет подтверждённого ID сообщения", code="delivery_unconfirmed"
+                )
+            stored.dispatch_started_at = None
+            stored.dispatch_account_id = None
+            stored.dispatch_idempotency_key = None
+            stored.simulated_snapshot = sent.simulated
             completed_at = utc_now()
             stored.primary_message_id = sent.message_id
-            stored.status = RunStatus.SUCCEEDED
+            stored.status = RunStatus.CANCELLED if stored.cancel_requested else RunStatus.SUCCEEDED
             stored.error = None
             stored.error_code = None
             stored.finished_at = completed_at
-            await self._finalize_broadcast_hidden_mentions(
-                session,
-                stored,
-                delivered_at=completed_at,
-            )
+            if sent.simulated is not True:
+                await self._finalize_broadcast_hidden_mentions(
+                    session, stored, delivered_at=completed_at
+                )
+            else:
+                await self._release_broadcast_mention_reservations(session, run_ids=[stored.id])
             self._release_lease(stored)
-            await self._record_account_send(session, sender.id)
-            await self._record_target_success(
-                session,
-                target.id,
-                account_id=sender.id,
-                message_id=sent.message_id,
-            )
+            if sent.simulated is not True:
+                await self._record_account_send_once(
+                    session, sender.id, operation_key=self._campaign_step_key(run)
+                )
+            if sent.simulated is not True:
+                await self._record_target_success(
+                    session, target.id, account_id=sender.id, message_id=sent.message_id
+                )
             await self._schedule_next_timer_repeat(
                 session,
                 stored,
@@ -938,7 +1067,11 @@ class CampaignRunner:
                     target_id=target.id,
                     kind=ActionKind.PRIMARY_MESSAGE,
                     status=ActionStatus.SUCCEEDED,
+                    simulated=sent.simulated,
                     external_message_id=sent.message_id,
+                    external_message_ids_json=json.dumps(
+                        list(getattr(sent, "message_ids", ()) or (sent.message_id,))
+                    ),
                     text=primary_text,
                     attempt_number=stored.attempt_count,
                     lease_token=run.lease_token,
@@ -1126,6 +1259,7 @@ class CampaignRunner:
         next_media = next_variant.media[0] if next_variant.media else None
         next_run = CampaignRun(
             campaign_id=run.campaign_id,
+            simulated_snapshot=run.simulated_snapshot,
             target_id=target_id,
             sender_account_id=next_account_id,
             cycle_index=run.cycle_index + 1,
@@ -1272,6 +1406,7 @@ class CampaignRunner:
         run.launch_key = launch_key
         next_run = CampaignRun(
             campaign_id=run.campaign_id,
+            simulated_snapshot=run.simulated_snapshot,
             target_id=target_id,
             sender_account_id=first_account_id,
             cycle_index=run.cycle_index + 1,
@@ -1328,6 +1463,16 @@ class CampaignRunner:
     ) -> CampaignRun | None:
         """Continue a broadcast with another selected sender after a permanent account loss."""
         code = str(getattr(exc, "code", None) or "")
+        if getattr(exc, "external_message_id", None) is not None:
+            # A receipt may refer to a post already accepted by Telegram.
+            return None
+        if (
+            code in {"account_restricted", "peer_flood"}
+            and float(self._cfg("account_restriction_cooldown_hours", 0.0)) == 0
+        ):
+            # An explicit refusal without an expiry is terminal for this task;
+            # don't bounce it between senders or invent a retry time.
+            return None
         auto_sender_failover = (
             run.auto_sender_failover_snapshot
             if run.auto_sender_failover_snapshot is not None
@@ -1340,6 +1485,9 @@ class CampaignRunner:
         )
         if not auto_sender_failover or code not in failover_codes:
             return None
+
+        if isinstance(exc, GatewayError):
+            await self._clear_campaign_dispatch(run)
 
         # A chat ban belongs to the pair, not to the whole account. Persist it
         # before selecting a replacement so this and future launches never pick
@@ -1429,6 +1577,8 @@ class CampaignRunner:
                         target_id=target_id,
                         kind=ActionKind.PRIMARY_MESSAGE,
                         status=ActionStatus.FAILED,
+                        simulated=self._failure_delivery_mode(),
+                        error_code=code,
                         text=self._primary_text(run, campaign),
                         error=safe_error_message(exc),
                         attempt_number=run.attempt_count,
@@ -1467,6 +1617,8 @@ class CampaignRunner:
                     target_id=target_id,
                     kind=ActionKind.PRIMARY_MESSAGE,
                     status=ActionStatus.FAILED,
+                    simulated=self._failure_delivery_mode(),
+                    error_code=code,
                     text=self._primary_text(run, campaign),
                     error=safe_error_message(exc),
                     attempt_number=run.attempt_count,
@@ -1565,6 +1717,79 @@ class CampaignRunner:
             and state.membership_error_code == "target_not_joined"
         )
 
+    async def _prepare_broadcast_target(
+        self, run: CampaignRun, account: Account, target: Target
+    ) -> CampaignRun | None:
+        preparer = getattr(self._gateway, "prepare_broadcast_target", None)
+        if not self._account_auto_join or not callable(preparer):
+            return None
+        try:
+            joined = await preparer(account=account, target=target)
+        except GatewayError as exc:
+            if failure_code(exc, "") in {"network_error", "rpc_error", "delivery_unconfirmed"}:
+                self._other_account_action_started.set(True)
+            raise
+        if not joined:
+            return None
+        self._other_account_action_started.set(True)
+        now = utc_now()
+        async with self._session_factory() as session:
+            timing = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.account_id == account.id,
+                    TargetAccountState.target_id == target.id,
+                )
+            )
+            if timing is None:
+                timing = TargetAccountState(account_id=account.id, target_id=target.id)
+                session.add(timing)
+            timing.membership_status = MembershipStatus.MEMBER
+            timing.membership_checked_at = now
+            timing.membership_error_code = None
+            timing.can_send = True
+            timing.send_blocked = False
+            timing.blocked_reason = None
+            timing.last_error = None
+            stored_account = await session.get(Account, account.id)
+            resume_at = now + timedelta(seconds=self._pace_delay_seconds())
+            if stored_account is not None:
+                current = ensure_utc(stored_account.next_send_at)
+                if current is not None:
+                    resume_at = max(resume_at, current)
+                stored_account.next_send_at = resume_at
+            return await self._defer_run(session, run, resume_at, reason="join_completed")
+
+    async def _validate_broadcast_route(self, account_id: int, target_id: int) -> None:
+        """Check queued routes again before reading activity or sending a post."""
+        async with self._session_factory() as session:
+            state = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.account_id == account_id,
+                    TargetAccountState.target_id == target_id,
+                )
+            )
+        if state is None or self._broadcast_route_is_eligible(state):
+            return
+        # Pending requests need a fresh Telegram check to discover approval.
+        if state.membership_status == MembershipStatus.JOIN_PENDING:
+            return
+        if (
+            self._account_auto_join
+            and state.membership_status == MembershipStatus.NOT_MEMBER
+            and state.blocked_reason in {None, "target_not_joined"}
+            and state.membership_error_code in {None, "target_not_joined"}
+        ):
+            return
+        code = state.blocked_reason or state.membership_error_code
+        if state.membership_status == MembershipStatus.NOT_MEMBER and not code:
+            code = "target_not_joined"
+        if code not in ACCOUNT_TARGET_BLOCK_CODES | ACCOUNT_FATAL_CODES | {"target_unavailable"}:
+            code = "account_send_forbidden" if state.can_send is False else "target_unavailable"
+        raise PermanentGatewayError(
+            state.last_error or "сохранённая проверка не подтверждает доступ отправителя к чату",
+            code=code,
+        )
+
     async def _send_primary(
         self,
         run: CampaignRun,
@@ -1585,6 +1810,7 @@ class CampaignRunner:
         if deferred is not None:
             return deferred
         try:
+            self._mark_account_send_attempt(primary.id)
             sent = await self._gateway.send_message(
                 account=primary,
                 target=target,
@@ -1630,6 +1856,7 @@ class CampaignRunner:
                     target_id=target.id,
                     kind=ActionKind.PRIMARY_MESSAGE,
                     status=ActionStatus.SUCCEEDED,
+                    simulated=sent.simulated,
                     external_message_id=sent.message_id,
                     text=primary_text,
                     attempt_number=stored.attempt_count,
@@ -1675,15 +1902,37 @@ class CampaignRunner:
         step = steps[step_index]
         if sender.id != step.account_id:
             raise ConflictError("текущий аккаунт не соответствует шагу диалога")
-        if step_index == 0:
-            if self._repeat_window_expired(run):
-                return await self._cancel_expired_timer_run(run)
-            visibility_deferred = await self._defer_for_visibility(
+        if step_index == 0 and self._repeat_window_expired(run):
+            return await self._cancel_expired_timer_run(run)
+        deferred = await self._defer_if_unavailable(run, sender.id)
+        if deferred is not None:
+            return deferred
+        try:
+            await self._validate_broadcast_route(sender.id, target.id)
+            prepared = await self._prepare_broadcast_target(run, sender, target)
+        except GatewayError as exc:
+            handled = await self._on_send_failure(
                 run,
-                campaign,
-                sender,
-                target,
+                sender.id,
+                target.id,
+                ActionKind.PRIMARY_MESSAGE if step_index == 0 else ActionKind.REPLY_MESSAGE,
+                step.text,
+                None,
+                exc,
             )
+            if handled is not None:
+                return handled
+            raise
+        if prepared is not None:
+            return prepared
+        if step_index == 0:
+            try:
+                visibility_deferred = await self._defer_for_visibility(
+                    run, campaign, sender, target
+                )
+            except GatewayError as exc:
+                await self.handle_observed_gateway_failure(sender.id, target.id, exc)
+                raise
             if visibility_deferred is not None:
                 return visibility_deferred
         reply_to_message_id = (
@@ -1693,9 +1942,6 @@ class CampaignRunner:
         )
         if step_index > 0 and step.reply_to_previous and reply_to_message_id is None:
             raise ConflictError("для ответа не найдено предыдущее сообщение")
-        deferred = await self._defer_if_unavailable(run, sender.id)
-        if deferred is not None:
-            return deferred
         if reply_to_message_id is not None:
             await self._ensure_reply_anchor_still_exists(
                 account=sender,
@@ -1725,6 +1971,7 @@ class CampaignRunner:
                     raise ConflictError(
                         "настроенный шлюз не поддерживает форматирование или медиа в цепочках"
                     )
+                await self._mark_campaign_dispatch(run, sender.id, target.id, idempotency_key)
                 sent = await self._gateway.send_message(
                     account=sender,
                     target=target,
@@ -1733,6 +1980,9 @@ class CampaignRunner:
                     reply_to_message_id=reply_to_message_id,
                 )
             else:
+                dispatch_kwargs = await self._campaign_dispatch_kwargs(
+                    run, sender.id, target.id, idempotency_key
+                )
                 sent = await content_sender(
                     account=sender,
                     target=target,
@@ -1743,6 +1993,7 @@ class CampaignRunner:
                     media_path=step.media_path,
                     media_kind=step.media_kind,
                     media_name=step.media_name,
+                    **dispatch_kwargs,
                 )
         except Exception as exc:
             handled = await self._on_send_failure(
@@ -1760,6 +2011,14 @@ class CampaignRunner:
 
         async with self._session_factory() as session:
             stored = await self._require_running_run(session, run.id, run.lease_token)
+            if sent.message_id <= 0:
+                raise PermanentGatewayError(
+                    "Нет подтверждённого ID сообщения", code="delivery_unconfirmed"
+                )
+            stored.dispatch_started_at = None
+            stored.dispatch_account_id = None
+            stored.dispatch_idempotency_key = None
+            stored.simulated_snapshot = sent.simulated
             completed_at = utc_now()
             stored.dialogue_last_message_id = sent.message_id
             if step_index == 0:
@@ -1786,13 +2045,14 @@ class CampaignRunner:
                 stored.status = RunStatus.SUCCEEDED
                 stored.finished_at = completed_at
             self._release_lease(stored)
-            await self._record_account_send(session, sender.id)
-            await self._record_target_success(
-                session,
-                target.id,
-                account_id=sender.id,
-                message_id=sent.message_id,
-            )
+            if sent.simulated is not True:
+                await self._record_account_send_once(
+                    session, sender.id, operation_key=self._campaign_step_key(run)
+                )
+            if sent.simulated is not True:
+                await self._record_target_success(
+                    session, target.id, account_id=sender.id, message_id=sent.message_id
+                )
             if stored.status == RunStatus.SUCCEEDED:
                 await self._schedule_next_timer_repeat(
                     session,
@@ -1809,7 +2069,11 @@ class CampaignRunner:
                     target_id=target.id,
                     kind=kind,
                     status=ActionStatus.SUCCEEDED,
+                    simulated=sent.simulated,
                     external_message_id=sent.message_id,
+                    external_message_ids_json=json.dumps(
+                        list(getattr(sent, "message_ids", ()) or (sent.message_id,))
+                    ),
                     reply_to_message_id=reply_to_message_id,
                     text=step_text,
                     attempt_number=run.attempt_count,
@@ -1906,6 +2170,7 @@ class CampaignRunner:
             message_id=run.primary_message_id,
         )
         try:
+            self._mark_account_send_attempt(reply.id)
             sent = await self._gateway.send_message(
                 account=reply,
                 target=target,
@@ -1949,6 +2214,7 @@ class CampaignRunner:
                     target_id=target.id,
                     kind=ActionKind.REPLY_MESSAGE,
                     status=ActionStatus.SUCCEEDED,
+                    simulated=sent.simulated,
                     external_message_id=sent.message_id,
                     reply_to_message_id=run.primary_message_id,
                     text=reply_text,
@@ -1972,6 +2238,7 @@ class CampaignRunner:
         """Return a resume time for soft throttles that should defer without burning attempts."""
         code = getattr(exc, "code", None)
         if code not in {
+            "account_pacing",
             "chat_timer",
             "join_throttled",
             "join_request_pending",
@@ -2046,7 +2313,17 @@ class CampaignRunner:
         exc: BaseException,
     ) -> CampaignRun | None:
         """Handle a failed send. Returns a deferred run for soft throttles, else None."""
+        if isinstance(exc, RunCancelled):
+            raise exc
         resume_at = self._throttle_resume_at(exc)
+        if (
+            isinstance(exc, GatewayError)
+            and resume_at is None
+            and failure_code(exc) != "delivery_unconfirmed"
+            and getattr(exc, "external_message_id", None) is None
+            and failure_code(exc) not in {"post_deleted_by_moderation", "album_partial_missing"}
+        ):
+            await self._clear_campaign_dispatch(run)
         if resume_at is not None:
             reason = str(getattr(exc, "code", None) or "throttle")
             if reason == "join_request_pending":
@@ -2054,6 +2331,10 @@ class CampaignRunner:
             if getattr(exc, "code", None) == "flood_wait":
                 await self._handle_account_failure(account_id, exc)
             async with self._session_factory() as session:
+                account = await session.get(Account, account_id)
+                cooldown = ensure_utc(account.cooldown_until) if account is not None else None
+                if cooldown is not None:
+                    resume_at = max(resume_at, cooldown)
                 deferred = await self._defer_run(session, run, resume_at, reason=reason)
             if deferred is None:
                 raise RunCancelled("cancellation requested")
@@ -2073,6 +2354,7 @@ class CampaignRunner:
                         text=text,
                         reply_to_message_id=reply_to_message_id,
                         deleted_message_id=getattr(exc, "external_message_id", None),
+                        deleted_message_ids=getattr(exc, "external_message_ids", ()),
                         recovery=recovery,
                     )
                     if deferred is not None:
@@ -2085,6 +2367,7 @@ class CampaignRunner:
                         f"membership gate recovery failed: {recovery.error or 'unknown error'}",
                         code="post_deleted_by_moderation",
                         external_message_id=getattr(exc, "external_message_id", None),
+                        external_message_ids=getattr(exc, "external_message_ids", ()),
                     )
         await self._record_action_failure(
             run_id=run.id,
@@ -2094,20 +2377,30 @@ class CampaignRunner:
             text=text,
             reply_to_message_id=reply_to_message_id,
             error=safe_error_message(exc),
-            error_code=str(getattr(exc, "code", None) or "") or None,
+            error_code=failure_code(
+                exc,
+                "delivery_unconfirmed"
+                if self._send_attempt_started.get()
+                else "preparation_failed",
+            ),
             external_message_id=getattr(exc, "external_message_id", None),
             attempt_number=run.attempt_count,
             lease_token=run.lease_token,
+            external_message_ids=getattr(exc, "external_message_ids", ()),
         )
-        if (
-            getattr(exc, "code", None) == "post_deleted_by_moderation"
-            and getattr(exc, "external_message_id", None) is not None
-        ):
-            # Telegram accepted the post before moderation removed it. It still
-            # consumes the account's daily workload and must count toward limits.
-            async with self._session_factory() as session:
-                await self._record_account_send(session, account_id)
-                await session.commit()
+        if self._send_attempt_started.get() and failure_code(exc, "") in {
+            "post_deleted_by_moderation",
+            "delivery_unconfirmed",
+            "album_partial_missing",
+        }:
+            # Accepted and uncertain attempts consume quota, never a success count.
+            await self.record_external_account_send(
+                account_id,
+                operation_key=self._campaign_step_key(run),
+            )
+        if isinstance(exc.__cause__, GatewayError):
+            await self._record_target_failure(account_id, target_id, exc.__cause__)
+            await self._handle_account_failure(account_id, exc.__cause__)
         await self._record_target_failure(account_id, target_id, exc)
         await self._handle_account_failure(account_id, exc)
         return None
@@ -2162,6 +2455,7 @@ class CampaignRunner:
         reply_to_message_id: int | None,
         deleted_message_id: int | None,
         recovery: MembershipGateRecovery,
+        deleted_message_ids: tuple[int, ...] = (),
     ) -> CampaignRun | None:
         """Persist the completed gate flow and one five-minute retry of this step."""
 
@@ -2173,6 +2467,37 @@ class CampaignRunner:
             if stored.membership_gate_retry_count >= 1:
                 return None
             stored.membership_gate_retry_count = 1
+            session.add(
+                ActionLog(
+                    run_id=stored.id,
+                    account_id=account_id,
+                    target_id=target_id,
+                    kind=kind,
+                    status=ActionStatus.FAILED,
+                    simulated=self._failure_delivery_mode(),
+                    external_message_id=deleted_message_id,
+                    external_message_ids_json=json.dumps(list(deleted_message_ids))
+                    if deleted_message_ids
+                    else None,
+                    delayed_delivery_status="missing",
+                    delayed_delivery_checked_at=utc_now(),
+                    reply_to_message_id=reply_to_message_id,
+                    text=text,
+                    error=(
+                        "subscription gate resolved: "
+                        f"{recovery.notice or 'Telegram inline buttons'}"
+                    ),
+                    error_code="membership_gate_recovered",
+                    attempt_number=run.attempt_count,
+                    lease_token=run.lease_token,
+                )
+            )
+            await self._record_account_send_once(
+                session, account_id, operation_key=self._campaign_step_key(run)
+            )
+            stored.dispatch_started_at = None
+            stored.dispatch_account_id = None
+            stored.dispatch_idempotency_key = None
             if stored.cancel_requested:
                 stored.status = RunStatus.CANCELLED
                 stored.finished_at = utc_now()
@@ -2206,26 +2531,6 @@ class CampaignRunner:
                 await session.refresh(stored)
                 return stored
 
-            session.add(
-                ActionLog(
-                    run_id=stored.id,
-                    account_id=account_id,
-                    target_id=target_id,
-                    kind=kind,
-                    status=ActionStatus.FAILED,
-                    external_message_id=deleted_message_id,
-                    reply_to_message_id=reply_to_message_id,
-                    text=text,
-                    error=(
-                        "subscription gate resolved: "
-                        f"{recovery.notice or 'Telegram inline buttons'}"
-                    ),
-                    error_code="membership_gate_recovered",
-                    attempt_number=run.attempt_count,
-                    lease_token=run.lease_token,
-                )
-            )
-            await self._record_account_send(session, account_id)
             stored.status = RunStatus.QUEUED
             stored.error = None
             stored.error_code = "membership_gate_retry"
@@ -2278,7 +2583,9 @@ class CampaignRunner:
             return self._pace_max_seconds
         return random.uniform(self._pace_min_seconds, self._pace_max_seconds)
 
-    async def _record_account_send(self, session: AsyncSession, account_id: int) -> None:
+    async def _record_account_send(
+        self, session: AsyncSession, account_id: int, *, release_reservation: bool = False
+    ) -> None:
         """Update per-account pacing, daily counters and micro-breaks after a delivery."""
         account = await session.get(Account, account_id)
         if account is None:
@@ -2321,11 +2628,15 @@ class CampaignRunner:
                 cooldown_reason = "daily_limit"
 
         if next_send_at is not None:
-            account.next_send_at = next_send_at
+            current_next = ensure_utc(account.next_send_at)
+            if current_next is None or next_send_at > current_next:
+                account.next_send_at = next_send_at
         if cooldown_until is not None:
-            account.cooldown_until = cooldown_until
-            account.cooldown_reason = cooldown_reason
-        if reservation is not None and reservation[0] == account_id:
+            current_cooldown = ensure_utc(account.cooldown_until)
+            if current_cooldown is None or cooldown_until > current_cooldown:
+                account.cooldown_until = cooldown_until
+                account.cooldown_reason = cooldown_reason
+        if release_reservation and reservation is not None and reservation[0] == account_id:
             account.send_reservation_token = None
             account.send_reservation_until = None
 
@@ -2434,6 +2745,7 @@ class CampaignRunner:
             return
         log_filters = [
             ActionLog.target_id == target_id,
+            ActionLog.simulated.is_not(True),
             ActionLog.kind == ActionKind.PRIMARY_MESSAGE,
         ]
         reset_at = ensure_utc(target.quality_reset_at)
@@ -2462,6 +2774,7 @@ class CampaignRunner:
             await session.scalar(
                 select(func.count(ActionLog.id)).where(
                     ActionLog.target_id == target_id,
+                    ActionLog.simulated.is_not(True),
                     ActionLog.status == ActionStatus.FAILED,
                     ActionLog.error_code == "post_deleted_by_moderation",
                 )
@@ -2497,7 +2810,7 @@ class CampaignRunner:
         if moderation_deletions:
             score = 0
             detail = target.last_error or "публикация исчезла после подтверждённой отправки"
-            reasons.append(f"модерация удаляет публикации: {detail}")
+            reasons.append(f"публикации исчезают после отправки: {detail}")
         if unavailable_failures:
             score = 0
             reasons.append("Telegram подтвердил, что чат недоступен или не принимает сообщения")
@@ -2645,7 +2958,7 @@ class CampaignRunner:
             if moderation_count:
                 score = 0
                 detail = target.last_error or "публикация исчезла после отправки"
-                reasons.append(f"модерация удаляет публикации: {detail}")
+                reasons.append(f"публикации исчезают после отправки: {detail}")
             if unavailable_count:
                 score = 0
                 reasons.append("Telegram подтвердил глобальную недоступность чата")
@@ -2874,6 +3187,7 @@ class CampaignRunner:
             )
             if has_rich_content:
                 raise ConflictError("configured gateway does not support formatted media content")
+            await self._mark_campaign_dispatch(run, account.id, target.id, idempotency_key)
             return await self._gateway.send_message(
                 account=account,
                 target=target,
@@ -2907,6 +3221,9 @@ class CampaignRunner:
             user_ids=mention_ids,
             message_limit=message_limit,
         )
+        dispatch_kwargs = await self._campaign_dispatch_kwargs(
+            run, account.id, target.id, idempotency_key
+        )
         return await sender(
             account=account,
             target=target,
@@ -2933,7 +3250,106 @@ class CampaignRunner:
             ),
             media_items=media_items,
             contact=contact,
+            **dispatch_kwargs,
         )
+
+    async def _campaign_dispatch_kwargs(
+        self,
+        run: CampaignRun,
+        account_id: int,
+        target_id: int,
+        key: str,
+    ) -> dict:
+        async def before_send() -> None:
+            await self._mark_campaign_dispatch(run, account_id, target_id, key)
+
+        if getattr(self._gateway, "supports_campaign_dispatch_hook", False):
+            return {"before_send": before_send}
+        await before_send()
+        return {}
+
+    @classmethod
+    def _campaign_step_key(cls, run: CampaignRun) -> str:
+        index = max(int(run.dialogue_step_index or 0), 1 if run.next_step == RunStep.REPLY else 0)
+        suffix = "primary" if index == 0 else "reply" if index == 1 else f"dialogue:{index}"
+        return cls._transport_idempotency_key(run, f"{run.request_key}:{suffix}")
+
+    async def _mark_campaign_dispatch(
+        self,
+        run: CampaignRun,
+        account_id: int,
+        target_id: int,
+        key: str,
+    ) -> None:
+        """Persist the last cancellation check immediately before Telegram's send RPC."""
+        now = utc_now()
+        async with self._session_factory() as session:
+            account = await session.get(Account, account_id)
+            try:
+                self._validate_sender(account, require_live_session=self._require_live_session())
+            except ConflictError as exc:
+                raise PermanentGatewayError(str(exc), code="sender_unavailable") from exc
+            resume_at = self._account_resume_at(account)
+            if resume_at is not None and resume_at > now:
+                raise TemporaryGatewayError(
+                    "Аккаунт получил паузу до начала отправки",
+                    code="account_pacing",
+                    retry_after=max(1, int((resume_at - now).total_seconds()) + 1),
+                )
+            campaign = await session.get(Campaign, run.campaign_id)
+            if campaign is None or not campaign.enabled:
+                raise RunCancelled("Рассылка выключена до отправки")
+            target = await session.get(Target, target_id)
+            try:
+                self._validate_config(campaign, target)
+            except ConflictError as exc:
+                raise RunCancelled(str(exc)) from exc
+            # The run retains its selected chat. Editing a source list controls
+            # future launches; explicit stop and target quarantine fence this run.
+            marked = await session.execute(
+                update(CampaignRun)
+                .where(
+                    CampaignRun.id == run.id,
+                    CampaignRun.status == RunStatus.RUNNING,
+                    CampaignRun.lease_token == run.lease_token,
+                    CampaignRun.lease_until > now,
+                    CampaignRun.cancel_requested.is_(False),
+                    CampaignRun.campaign_id.in_(
+                        select(Campaign.id).where(Campaign.enabled.is_(True))
+                    ),
+                )
+                .values(
+                    dispatch_started_at=now,
+                    dispatch_account_id=account_id,
+                    dispatch_idempotency_key=key,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            if marked.rowcount != 1:
+                current = await session.get(CampaignRun, run.id)
+                if current is None or current.lease_token != run.lease_token:
+                    raise LeaseLostError("Право выполнения задачи потеряно до отправки")
+                raise RunCancelled("Рассылка остановлена до отправки сообщения")
+        if getattr(self._gateway, "simulated", None) is not True:
+            self._mark_account_send_attempt(account_id)
+
+    async def _clear_campaign_dispatch(self, run: CampaignRun) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(CampaignRun)
+                .where(
+                    CampaignRun.id == run.id,
+                    CampaignRun.lease_token == run.lease_token,
+                    CampaignRun.status == RunStatus.RUNNING,
+                )
+                .values(
+                    dispatch_started_at=None,
+                    dispatch_account_id=None,
+                    dispatch_idempotency_key=None,
+                )
+            )
+            await session.commit()
 
     async def _resolve_broadcast_hidden_mentions(
         self,
@@ -2955,20 +3371,34 @@ class CampaignRunner:
             return ()
         async with self._session_factory() as session:
             excluded_user_ids = await load_mention_exclusion_user_ids(session)
+        maximum_count = min(
+            HIDDEN_MENTION_MAXIMUM, hidden_mention_capacity(text, message_limit=message_limit)
+        )
         if run.hidden_mention_user_ids_snapshot_json is not None:
             parsed = self._parse_hidden_mention_snapshot(
                 run.hidden_mention_user_ids_snapshot_json,
                 exclude_user_ids=excluded_user_ids,
             )
+            parsed = parsed[:maximum_count] if eligible else ()
+            if len(parsed) < HIDDEN_MENTION_MINIMUM:
+                parsed = ()
+            checker = getattr(self._gateway, "filter_mentionable_user_ids", None)
+            if checker is not None:
+                try:
+                    parsed = await checker(account=account, user_ids=parsed)
+                    if len(parsed) < HIDDEN_MENTION_MINIMUM:
+                        parsed = ()
+                except Exception as exc:  # noqa: BLE001 - send the post without unchecked mentions
+                    if failure_code(exc) in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES:
+                        raise
+                    logger.info("Could not recheck hidden mention usernames for run %s", run.id)
+                    parsed = ()
             if run.hidden_mention_resolved_count != len(parsed):
                 await self._update_broadcast_hidden_mention_snapshot(run, parsed)
             return parsed
 
         reason: str | None = None
         candidates: tuple[int, ...] = ()
-        maximum_count = min(
-            HIDDEN_MENTION_MAXIMUM, hidden_mention_capacity(text, message_limit=message_limit)
-        )
         if not eligible:
             reason = "content_does_not_support_mentions"
         elif maximum_count < HIDDEN_MENTION_MINIMUM:
@@ -2991,6 +3421,8 @@ class CampaignRunner:
                     if len(candidates) < HIDDEN_MENTION_MINIMUM:
                         reason = "fewer_than_five_eligible_members"
                 except Exception as exc:  # noqa: BLE001 - a member list must not block delivery
+                    if failure_code(exc) in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES:
+                        raise
                     logger.info(
                         "Hidden mentions were skipped for campaign run %s: %s",
                         run.id,
@@ -3330,6 +3762,36 @@ class CampaignRunner:
                 ),
                 primary_account_id=campaign.primary_account_id,
                 primary_text=cls._primary_text(run, campaign),
+                primary_html=cls._primary_content_value(
+                    run,
+                    campaign,
+                    "primary_html_snapshot",
+                    "primary_html",
+                ),
+                primary_media_path=cls._primary_content_value(
+                    run,
+                    campaign,
+                    "primary_media_path_snapshot",
+                    "primary_media_path",
+                ),
+                primary_media_kind=cls._primary_content_value(
+                    run,
+                    campaign,
+                    "primary_media_kind_snapshot",
+                    "primary_media_kind",
+                ),
+                primary_media_name=cls._primary_content_value(
+                    run,
+                    campaign,
+                    "primary_media_name_snapshot",
+                    "primary_media_name",
+                ),
+                primary_media_size=cls._primary_content_value(
+                    run,
+                    campaign,
+                    "primary_media_size_snapshot",
+                    "primary_media_size",
+                ),
                 reply_account_id=campaign.reply_account_id,
                 reply_text=cls._reply_text(run, campaign),
                 reply_delay_seconds=cls._reply_delay_seconds(run, campaign),
@@ -3349,6 +3811,15 @@ class CampaignRunner:
         dialogue_step: int,
     ) -> int:
         """Queue optional ordinary reactions without affecting source delivery."""
+        if (
+            run.cancel_requested
+            or run.status == RunStatus.CANCELLED
+            or run.simulated_snapshot is True
+        ):
+            return 0
+        enabled = await session.scalar(select(Campaign.enabled).where(Campaign.id == campaign.id))
+        if not enabled:
+            return 0
         if (
             not campaign.reactions_enabled
             or campaign.reaction_count < 1
@@ -3711,6 +4182,10 @@ class CampaignRunner:
                         exc=exc,
                     )
                     raise
+                if failure_code(exc, "") in (
+                    ACCOUNT_FATAL_CODES | ACCOUNT_TARGET_BLOCK_CODES | {"target_unavailable"}
+                ):
+                    raise
                 await self.handle_observed_gateway_failure(account.id, target.id, exc)
                 if strict_threshold:
                     async with self._session_factory() as session:
@@ -3773,6 +4248,10 @@ class CampaignRunner:
                     message_id=last_message_id,
                     exc=exc,
                 )
+                raise
+            if failure_code(exc, "") in (
+                ACCOUNT_FATAL_CODES | ACCOUNT_TARGET_BLOCK_CODES | {"target_unavailable"}
+            ):
                 raise
             await self.handle_observed_gateway_failure(account.id, target.id, exc)
             if strict_threshold:
@@ -3848,6 +4327,9 @@ class CampaignRunner:
             if action is None:
                 return
             error = safe_error_message(exc)[:2000]
+            action.delayed_delivery_status = "missing"
+            action.delayed_delivery_error = error
+            action.delayed_delivery_error_code = "post_deleted_by_moderation"
             action.status = ActionStatus.FAILED
             action.error_code = "post_deleted_by_moderation"
             action.error = error
@@ -3961,6 +4443,9 @@ class CampaignRunner:
         reason: str,
     ) -> CampaignRun | None:
         stored = await self._require_running_run(session, run.id, run.lease_token)
+        stored.dispatch_started_at = None
+        stored.dispatch_account_id = None
+        stored.dispatch_idempotency_key = None
         if stored.cancel_requested:
             return None
         repeat_until = ensure_utc(stored.repeat_until)
@@ -4030,7 +4515,10 @@ class CampaignRunner:
                 trigger="send_restriction",
                 force=True,
             )
-            if result is not None:
+            # A positive @SpamBot restriction already persisted its own pause.
+            # A "free" response does not invalidate the RPC refusal. Without
+            # a supplied expiry, report that refusal rather than invent 24h.
+            if result is not None and result.is_restricted:
                 return
         async with self._session_factory() as session:
             account = await session.get(Account, account_id)
@@ -4044,12 +4532,21 @@ class CampaignRunner:
                 account.last_error = safe_error_message(exc)[:500]
                 event = "account.auto_disabled"
             elif code in {"peer_flood", "account_restricted"}:
-                hours = float(self._cfg("account_restriction_cooldown_hours", 24.0))
-                account.cooldown_until = now + timedelta(hours=hours)
-                account.cooldown_reason = code
+                hours = float(self._cfg("account_restriction_cooldown_hours", 0.0))
+                if hours > 0:
+                    resume_at = now + timedelta(hours=hours)
+                    current_cooldown = ensure_utc(account.cooldown_until)
+                    if current_cooldown is None or current_cooldown < resume_at:
+                        account.cooldown_until = resume_at
+                        account.cooldown_reason = code
+                else:
+                    event = "account.send_refused"
                 account.last_error = safe_error_message(exc)[:500]
             elif code == "flood_wait":
-                retry_after = int(getattr(exc, "retry_after", None) or 60)
+                retry_after = max(
+                    int(self._cfg("flood_min_pause_seconds", 500)),
+                    int(getattr(exc, "retry_after", None) or 0),
+                )
                 resume_at = now + timedelta(seconds=retry_after)
                 current_cooldown = ensure_utc(account.cooldown_until)
                 if current_cooldown is None or current_cooldown < resume_at:
@@ -4086,6 +4583,10 @@ class CampaignRunner:
             )
             await session.commit()
 
+    def _failure_delivery_mode(self) -> bool | None:
+        mode = getattr(self._gateway, "simulated", None)
+        return mode if isinstance(mode, bool) else None
+
     async def _record_action_failure(
         self,
         *,
@@ -4100,6 +4601,7 @@ class CampaignRunner:
         external_message_id: int | None,
         attempt_number: int,
         lease_token: str | None,
+        external_message_ids: tuple[int, ...] = (),
     ) -> None:
         async with self._session_factory() as session:
             current = await session.get(CampaignRun, run_id)
@@ -4116,7 +4618,19 @@ class CampaignRunner:
                     target_id=target_id,
                     kind=kind,
                     status=ActionStatus.FAILED,
+                    delayed_delivery_status="partial_missing"
+                    if error_code == "album_partial_missing"
+                    else "missing"
+                    if error_code == "post_deleted_by_moderation"
+                    else None,
+                    delayed_delivery_checked_at=utc_now()
+                    if error_code in {"post_deleted_by_moderation", "album_partial_missing"}
+                    else None,
+                    simulated=self._failure_delivery_mode(),
                     external_message_id=external_message_id,
+                    external_message_ids_json=json.dumps(list(external_message_ids))
+                    if external_message_ids
+                    else None,
                     reply_to_message_id=reply_to_message_id,
                     text=text,
                     error=error[:2000],
@@ -4180,6 +4694,11 @@ class CampaignRunner:
                     campaign.dialogue_steps_json,
                     primary_account_id=campaign.primary_account_id,
                     primary_text=campaign.primary_text,
+                    primary_html=campaign.primary_html,
+                    primary_media_path=campaign.primary_media_path,
+                    primary_media_kind=campaign.primary_media_kind,
+                    primary_media_name=campaign.primary_media_name,
+                    primary_media_size=campaign.primary_media_size,
                     reply_account_id=campaign.reply_account_id,
                     reply_text=campaign.reply_text,
                     reply_delay_seconds=campaign.reply_delay_seconds,
@@ -4357,7 +4876,9 @@ class RunQueue:
         preflight_max_age_seconds: int = 3600,
         proxy_service: ProxyService | None = None,
         campaign_id_scope: frozenset[int] | None = None,
+        delivery_mode: bool | None = None,
     ) -> None:
+        self._delivery_mode = delivery_mode
         self._session_factory = session_factory
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
@@ -4378,6 +4899,7 @@ class RunQueue:
             frozenset(campaign_id_scope) if campaign_id_scope is not None else None
         )
         self._claim_lock = asyncio.Lock()
+        self._account_runner: CampaignRunner | None = None
 
     async def enqueue(self, campaign_id: int, request_key: str) -> CampaignRun:
         runs = await self.enqueue_campaign(campaign_id, request_key)
@@ -4424,6 +4946,11 @@ class RunQueue:
                         campaign.dialogue_steps_json,
                         primary_account_id=campaign.primary_account_id,
                         primary_text=campaign.primary_text,
+                        primary_html=campaign.primary_html,
+                        primary_media_path=campaign.primary_media_path,
+                        primary_media_kind=campaign.primary_media_kind,
+                        primary_media_name=campaign.primary_media_name,
+                        primary_media_size=campaign.primary_media_size,
                         reply_account_id=campaign.reply_account_id,
                         reply_text=campaign.reply_text,
                         reply_delay_seconds=campaign.reply_delay_seconds,
@@ -4625,7 +5152,8 @@ class RunQueue:
                         preflight_skip_code is None
                         and independent
                         and self._preflight_required
-                        and forced_account_id not in preflight_ready_accounts.get(
+                        and forced_account_id
+                        not in preflight_ready_accounts.get(
                             target.id,
                             frozenset(),
                         )
@@ -4808,6 +5336,7 @@ class RunQueue:
                         capacity_window_target_ids.add(int(target.id))
                     run = CampaignRun(
                         campaign_id=campaign_id,
+                        simulated_snapshot=self._delivery_mode,
                         target_id=target.id,
                         request_key=key,
                         launch_key=request_key,
@@ -5132,6 +5661,11 @@ class RunQueue:
                     campaign.dialogue_steps_json,
                     primary_account_id=campaign.primary_account_id,
                     primary_text=campaign.primary_text,
+                    primary_html=campaign.primary_html,
+                    primary_media_path=campaign.primary_media_path,
+                    primary_media_kind=campaign.primary_media_kind,
+                    primary_media_name=campaign.primary_media_name,
+                    primary_media_size=campaign.primary_media_size,
                     reply_account_id=campaign.reply_account_id,
                     reply_text=campaign.reply_text,
                     reply_delay_seconds=campaign.reply_delay_seconds,
@@ -5380,14 +5914,51 @@ class RunQueue:
                 raise NotFoundError("run not found")
             if lease_token is not None and run.lease_token != lease_token:
                 raise LeaseLostError("cannot update a run owned by a newer lease")
+            if run.dispatch_started_at is not None and error_code in {
+                "step_timeout",
+                "unhandled_execution_error",
+                "cancelled",
+                "lease_expired",
+            }:
+                error_code = "delivery_unconfirmed"
+                error = (
+                    "Операция прервана после начала отправки; "
+                    "исход Telegram неизвестен, повтор запрещён"
+                )
+                permanent = True
+            elif run.dispatch_started_at is None and error_code == "step_timeout":
+                error_code = "preparation_timeout"
+                error = "Подготовка не завершилась вовремя; запрос отправки ещё не начался"
+                permanent = False
+            elif run.dispatch_started_at is None and error_code == "unhandled_execution_error":
+                error_code = "preparation_failed"
+            if run.dispatch_started_at is not None and error_code == "delivery_unconfirmed":
+                await self._record_uncertain_dispatch(session, run, error)
+            if (
+                run.dispatch_started_at is not None
+                and error_code == "delivery_unconfirmed"
+                and run.simulated_snapshot is not True
+                and self._account_runner is not None
+            ):
+                if run.dispatch_account_id is not None and run.dispatch_idempotency_key:
+                    await self._account_runner._record_account_send_once(
+                        session,
+                        run.dispatch_account_id,
+                        operation_key=run.dispatch_idempotency_key,
+                    )
             now = utc_now()
             run.error = error[:2000]
             run.error_code = (error_code or "execution_error")[:100]
+            if run.error_code == "cancelled" and run.dispatch_started_at is None:
+                run.cancel_requested = True
             run.lease_owner = None
             run.lease_token = None
             run.lease_until = None
             run.heartbeat_at = None
-            if run.cancel_requested:
+            if run.cancel_requested and run.error_code not in {
+                "delivery_unconfirmed",
+                "cancelled_outcome_unknown",
+            }:
                 run.status = RunStatus.CANCELLED
                 run.finished_at = now
             elif permanent or run.attempt_count >= run.max_attempts:
@@ -5409,6 +5980,10 @@ class RunQueue:
                         )
                 run.status = RunStatus.QUEUED
                 run.scheduled_for = now + timedelta(seconds=retry_delay)
+            if run.error_code != "delivery_unconfirmed":
+                run.dispatch_started_at = None
+                run.dispatch_account_id = None
+                run.dispatch_idempotency_key = None
             if run.status in {RunStatus.CANCELLED, RunStatus.FAILED}:
                 if run.error_code in {
                     "delivery_unconfirmed",
@@ -5470,6 +6045,43 @@ class RunQueue:
             await session.commit()
             await session.refresh(run)
             return run
+
+    @staticmethod
+    async def _record_uncertain_dispatch(
+        session: AsyncSession,
+        run: CampaignRun,
+        error: str,
+    ) -> None:
+        if run.dispatch_account_id is None:
+            return
+        exists = await session.scalar(
+            select(ActionLog.id)
+            .where(
+                ActionLog.run_id == run.id,
+                ActionLog.lease_token == run.lease_token,
+                ActionLog.error_code == "delivery_unconfirmed",
+            )
+            .limit(1)
+        )
+        if exists is not None:
+            return
+        session.add(
+            ActionLog(
+                run_id=run.id,
+                account_id=run.dispatch_account_id,
+                target_id=run.target_id,
+                kind=ActionKind.PRIMARY_MESSAGE
+                if run.next_step == RunStep.PRIMARY
+                else ActionKind.REPLY_MESSAGE,
+                status=ActionStatus.FAILED,
+                simulated=run.simulated_snapshot,
+                text="",
+                error=error[:2000],
+                error_code="delivery_unconfirmed",
+                attempt_number=run.attempt_count,
+                lease_token=run.lease_token,
+            )
+        )
 
     async def cancel_launch(self, anchor_run_id: int) -> int:
         """Cancel every pending task created by the same campaign launch."""
@@ -5774,6 +6386,11 @@ class RunQueue:
                     select(CampaignRun).where(
                         _launch_membership(anchor),
                         CampaignRun.status == RunStatus.FAILED,
+                        CampaignRun.dispatch_started_at.is_(None),
+                        or_(
+                            CampaignRun.error_code.is_(None),
+                            CampaignRun.error_code.not_in(CAMPAIGN_NON_RETRYABLE_CODES),
+                        ),
                     )
                 )
             )
@@ -6210,9 +6827,7 @@ class RunQueue:
             ]
             if self._campaign_id_scope is not None:
                 expired_filters.append(CampaignRun.campaign_id.in_(self._campaign_id_scope))
-            expired = list(
-                await session.scalars(select(CampaignRun).where(*expired_filters))
-            )
+            expired = list(await session.scalars(select(CampaignRun).where(*expired_filters)))
             recovered = 0
             for run in expired:
                 values: dict[str, object] = {
@@ -6222,7 +6837,36 @@ class RunQueue:
                     "heartbeat_at": None,
                     "updated_at": now,
                 }
-                if run.cancel_requested:
+                if run.dispatch_started_at is not None:
+                    accepted_failure = (
+                        await session.execute(
+                            select(ActionLog.error_code, ActionLog.error)
+                            .where(
+                                ActionLog.run_id == run.id,
+                                ActionLog.lease_token == run.lease_token,
+                                ActionLog.external_message_id.is_not(None),
+                                ActionLog.error_code.in_(
+                                    ["post_deleted_by_moderation", "album_partial_missing"]
+                                ),
+                            )
+                            .order_by(ActionLog.id.desc())
+                            .limit(1)
+                        )
+                    ).first()
+                    values.update(
+                        status=RunStatus.FAILED,
+                        error_code=accepted_failure[0]
+                        if accepted_failure
+                        else "delivery_unconfirmed",
+                        error=accepted_failure[1]
+                        if accepted_failure
+                        else (
+                            "Процесс прервался после начала отправки; "
+                            "исход Telegram неизвестен, повтор запрещён"
+                        ),
+                        finished_at=now,
+                    )
+                elif run.cancel_requested:
                     values.update(
                         status=RunStatus.FAILED,
                         error=(
@@ -6254,6 +6898,20 @@ class RunQueue:
                 )
                 changed = int(result.rowcount or 0)
                 recovered += changed
+                if changed and values.get("error_code") == "delivery_unconfirmed":
+                    await self._record_uncertain_dispatch(session, run, str(values["error"]))
+                if (
+                    changed
+                    and run.dispatch_started_at is not None
+                    and run.simulated_snapshot is not True
+                    and self._account_runner is not None
+                ):
+                    if run.dispatch_account_id is not None and run.dispatch_idempotency_key:
+                        await self._account_runner._record_account_send_once(
+                            session,
+                            run.dispatch_account_id,
+                            operation_key=run.dispatch_idempotency_key,
+                        )
                 if changed and values.get("status") == RunStatus.FAILED:
                     await hold_uncertain_campaign_mention_reservations(
                         session,
@@ -6293,6 +6951,7 @@ class QueueWorker:
         concurrency: int = 1,
     ) -> None:
         self._queue = queue
+        queue._account_runner = runner
         self._runner = runner
         self._worker_id = worker_id
         self._poll_seconds = poll_seconds
@@ -6445,6 +7104,18 @@ class QueueWorker:
                 processed = await self.process_next()
             except asyncio.CancelledError:
                 raise
+            except OperationalError as exc:
+                if is_transient_sqlite_lock(exc):
+                    logger.warning("Campaign worker waits for a busy SQLite writer")
+                    await asyncio.sleep(0.5)
+                    continue
+                self._failed_steps += 1
+                self._last_error = "worker loop iteration failed"
+                self._last_processed_at = utc_now().isoformat()
+                logger.exception("Queue worker loop iteration failed")
+                if reporter is not None:
+                    await reporter(exc)
+                processed = None
             except Exception as exc:  # noqa: BLE001 - keep the durable worker alive after infra failures
                 self._failed_steps += 1
                 self._last_error = "worker loop iteration failed"

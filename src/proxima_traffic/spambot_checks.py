@@ -13,6 +13,7 @@ from typing import Protocol
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from proxima_traffic.account_state import apply_flood_pause, locked_account, session_fingerprint
 from proxima_traffic.failure_policy import ACCOUNT_FATAL_CODES, failure_code
 from proxima_traffic.models import (
     Account,
@@ -126,11 +127,16 @@ class SpamBotCheckService:
                     select(Account.id)
                     .where(
                         Account.status.in_((AccountStatus.ACTIVE, AccountStatus.PAUSED)),
+                        Account.session_source != AccountSessionSource.NONE,
+                        Account.session_encrypted.is_not(None),
                         or_(
                             Account.spambot_checked_at.is_(None),
                             Account.spambot_checked_at <= now - minimum,
                             (
-                                (Account.status == AccountStatus.PAUSED)
+                                (
+                                    (Account.status == AccountStatus.PAUSED)
+                                    | (Account.cooldown_reason == "flood_wait")
+                                )
                                 & Account.cooldown_until.is_not(None)
                                 & (Account.cooldown_until <= now)
                             ),
@@ -210,11 +216,23 @@ class SpamBotCheckService:
                         return SpamBotBulkCheckEntry(
                             account_id=account_id,
                             label=label,
-                            status=account.spambot_status if account is not None else None,
+                            status="error",
                             parser_signal=(
                                 account.spambot_parser_signal if account is not None else None
                             ),
                         )
+                except Exception as exc:  # noqa: BLE001 - one account must not abort a batch
+                    logger.warning(
+                        "Bulk SpamBot check failed for account %s: %s",
+                        account_id,
+                        type(exc).__name__,
+                    )
+                    return SpamBotBulkCheckEntry(
+                        account_id=account_id,
+                        label=label,
+                        status="error",
+                        parser_signal="check_failed",
+                    )
                 finally:
                     await report_progress()
 
@@ -275,13 +293,18 @@ class SpamBotCheckService:
             account = await session.get(Account, account_id)
             if account is None:
                 return None
+            expected_fingerprint = session_fingerprint(account)
             now = utc_now()
+            cooldown = ensure_utc(account.cooldown_until)
+            if account.cooldown_reason == "flood_wait" and cooldown and cooldown > now:
+                return None
             checked_at = ensure_utc(account.spambot_checked_at)
             if (
                 not force
                 and account.spambot_status == "error"
                 and checked_at is not None
                 and now - checked_at < timedelta(seconds=self._minimum_interval_seconds)
+                and not (account.cooldown_reason == "flood_wait" and cooldown and cooldown <= now)
             ):
                 return None
             cached = self._recent_result(account, now=now, force=force)
@@ -298,7 +321,9 @@ class SpamBotCheckService:
                 type(exc).__name__,
                 failure_code(exc, "spambot_check_failed"),
             )
-            await self._record_gateway_error(account_id, trigger=trigger, error=exc)
+            await self._record_gateway_error(
+                account_id, trigger=trigger, error=exc, expected_fingerprint=expected_fingerprint
+            )
             return None
         if not isinstance(result, SpamBotResult):
             logger.warning("@SpamBot gateway returned an invalid result for account %s", account_id)
@@ -306,9 +331,12 @@ class SpamBotCheckService:
                 account_id,
                 trigger=trigger,
                 error=TypeError("invalid @SpamBot gateway result"),
+                expected_fingerprint=expected_fingerprint,
             )
             return None
-        return await self._persist_result(account_id, result, trigger=trigger)
+        return await self._persist_result(
+            account_id, result, trigger=trigger, expected_fingerprint=expected_fingerprint
+        )
 
     def _recent_result(
         self,
@@ -344,7 +372,35 @@ class SpamBotCheckService:
             raw_reply_permission = snapshot.get("allows_reply_to_inbound")
             if isinstance(raw_reply_permission, bool):
                 allows_reply_to_inbound = raw_reply_permission
-        restricted_until = ensure_utc(account.cooldown_until)
+        restricted_until = None
+        if isinstance(snapshot, dict):
+            try:
+                raw_until = snapshot.get("restricted_until")
+                restricted_until = (
+                    ensure_utc(datetime.fromisoformat(str(raw_until))) if raw_until else None
+                )
+                raw_recheck = snapshot.get("recheck_at")
+                recheck_at = (
+                    ensure_utc(datetime.fromisoformat(str(raw_recheck))) if raw_recheck else None
+                )
+            except (TypeError, ValueError):
+                recheck_at = None
+            if recheck_at is not None and recheck_at <= now:
+                return None
+        if restricted_until is None and account.cooldown_reason in SPAMBOT_REASONS:
+            restricted_until = ensure_utc(account.cooldown_until)
+        if (
+            status is SpamBotStatus.TEMPORARY_RESTRICTION
+            and restricted_until
+            and restricted_until <= now
+        ):
+            return None
+        if (
+            account.cooldown_reason in SPAMBOT_REASONS
+            and account.cooldown_until
+            and ensure_utc(account.cooldown_until) <= now
+        ):
+            return None
         return SpamBotResult(
             status=status,
             raw_text="",
@@ -360,11 +416,15 @@ class SpamBotCheckService:
         result: SpamBotResult,
         *,
         trigger: str,
+        expected_fingerprint: str | None = None,
     ) -> SpamBotResult | None:
         now = utc_now()
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
-            if account is None:
+            account = await locked_account(session, account_id)
+            if account is None or (
+                expected_fingerprint is not None
+                and session_fingerprint(account) != expected_fingerprint
+            ):
                 return None
             if (
                 result.status is SpamBotStatus.TEMPORARY_RESTRICTION
@@ -381,11 +441,28 @@ class SpamBotCheckService:
                     restriction_scope=result.restriction_scope,
                     allows_reply_to_inbound=result.allows_reply_to_inbound,
                 )
+            prior_cooldown = ensure_utc(account.cooldown_until)
+            prior_reason = account.cooldown_reason
+            prior_disabled = (
+                account.status == AccountStatus.DISABLED and prior_reason not in SPAMBOT_REASONS
+            )
+            recheck_at = ensure_utc(result.restricted_until)
+            if result.status in {
+                SpamBotStatus.ACTIVE_RESTRICTION,
+                SpamBotStatus.RESTRICTION_UNCLEAR,
+            }:
+                recheck_at = now + timedelta(
+                    seconds=max(60, int(self._cfg("spambot_unknown_cooldown_seconds", 7200)))
+                )
             account.spambot_checked_at = now
             account.spambot_status = result.status.value
             account.spambot_parser_signal = result.parser_signal
             account.spambot_response_json = json.dumps(
                 {
+                    "restricted_until": result.restricted_until.isoformat()
+                    if result.restricted_until
+                    else None,
+                    "recheck_at": recheck_at.isoformat() if recheck_at else None,
                     "text": result.raw_text,
                     "button_rows": [list(row) for row in result.button_rows],
                     "format_entities": [list(entity) for entity in result.format_entities],
@@ -397,12 +474,31 @@ class SpamBotCheckService:
             )
             event_type = "account.spambot_checked"
             if result.status is SpamBotStatus.FREE:
-                if (
-                    account.status == AccountStatus.PAUSED
-                    and account.cooldown_reason in SPAMBOT_REASONS
+                if not account.operator_paused and (
+                    (
+                        account.status == AccountStatus.PAUSED
+                        and account.cooldown_reason in SPAMBOT_REASONS
+                    )
+                    or (
+                        account.status == AccountStatus.DISABLED
+                        and account.cooldown_reason == "spambot_permanent_ban"
+                        and account.authorized
+                        and account.session_source != AccountSessionSource.NONE
+                    )
                 ):
                     account.status = AccountStatus.ACTIVE
                 if account.cooldown_reason in SPAMBOT_REASONS:
+                    account.cooldown_until = None
+                    account.cooldown_reason = None
+                if (
+                    account.status in {AccountStatus.ACTIVE, AccountStatus.PAUSED}
+                    and account.cooldown_reason
+                    in {"flood_wait", "flood_escalation", "peer_flood", "account_restricted"}
+                    and (prior_cooldown is None or prior_cooldown <= now)
+                ):
+                    account.status = (
+                        AccountStatus.PAUSED if account.operator_paused else AccountStatus.ACTIVE
+                    )
                     account.cooldown_until = None
                     account.cooldown_reason = None
                 if account.last_error and account.last_error.startswith("@SpamBot:"):
@@ -452,12 +548,23 @@ class SpamBotCheckService:
                     account.status == AccountStatus.PAUSED
                     and account.cooldown_reason == LEGACY_UNKNOWN_REASON
                 ):
-                    account.status = AccountStatus.ACTIVE
+                    account.status = (
+                        AccountStatus.PAUSED if account.operator_paused else AccountStatus.ACTIVE
+                    )
                     account.cooldown_until = None
                     account.cooldown_reason = None
                     if account.last_error and account.last_error.startswith("@SpamBot:"):
                         account.last_error = None
                 event_type = "account.spambot_unknown"
+            # A SpamBot observation must not shorten an unrelated FloodWait,
+            # revive a revoked session, or erase an operator's pause.
+            if prior_disabled:
+                account.status = AccountStatus.DISABLED
+            if prior_reason not in SPAMBOT_REASONS and prior_cooldown and prior_cooldown > now:
+                new_cooldown = ensure_utc(account.cooldown_until)
+                if new_cooldown is None or new_cooldown < prior_cooldown:
+                    account.cooldown_until = prior_cooldown
+                    account.cooldown_reason = prior_reason
             session.add(
                 AuditEvent(
                     actor="spambot",
@@ -491,10 +598,14 @@ class SpamBotCheckService:
         *,
         trigger: str,
         error: BaseException,
+        expected_fingerprint: str | None = None,
     ) -> None:
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
-            if account is None:
+            account = await locked_account(session, account_id)
+            if account is None or (
+                expected_fingerprint is not None
+                and session_fingerprint(account) != expected_fingerprint
+            ):
                 return
             account.spambot_checked_at = utc_now()
             account.spambot_status = "error"
@@ -524,11 +635,17 @@ class SpamBotCheckService:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+            if code == "flood_wait":
+                apply_flood_pause(
+                    account,
+                    float(getattr(error, "retry_after", 0) or 0),
+                    minimum=float(self._cfg("flood_min_pause_seconds", 500)),
+                )
             if code in ACCOUNT_FATAL_CODES:
                 account.status = AccountStatus.DISABLED
                 account.authorized = False
                 account.cooldown_until = None
-                account.cooldown_reason = None
+                account.cooldown_reason = code
                 safe_message = str(getattr(error, "safe_message", None) or error)
                 account.last_error = safe_message[:500]
             session.add(

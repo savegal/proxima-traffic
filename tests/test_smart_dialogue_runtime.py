@@ -10,6 +10,7 @@ from sqlalchemy import select
 from proxima_traffic.bot.renderers import launch_details_text
 from proxima_traffic.bot.repository import AdminRepository
 from proxima_traffic.config import Settings
+from proxima_traffic.dialogues import parse_dialogue_steps
 from proxima_traffic.gateways import ChatActivity, PermanentGatewayError, SentMessage
 from proxima_traffic.main import create_app
 from proxima_traffic.models import (
@@ -32,7 +33,7 @@ class DialogueActivityGateway:
     async def send_message(self, **kwargs: object) -> SentMessage:
         self.latest_message_id += 1
         self.calls.append(kwargs)
-        return SentMessage(message_id=self.latest_message_id)
+        return SentMessage(message_id=self.latest_message_id, simulated=False)
 
     async def inspect_activity(self, **kwargs: object) -> ChatActivity:
         return ChatActivity(
@@ -45,7 +46,7 @@ class MediaDialogueGateway(DialogueActivityGateway):
     async def send_content(self, **kwargs: object) -> SentMessage:
         self.latest_message_id += 1
         self.calls.append(kwargs)
-        return SentMessage(message_id=self.latest_message_id)
+        return SentMessage(message_id=self.latest_message_id, simulated=False)
 
 
 class DeletedDialogueAnchorGateway(DialogueActivityGateway):
@@ -146,6 +147,29 @@ async def _make_due(app: object, run_id: int) -> None:
         await session.commit()
 
 
+def test_default_dialogue_first_step_keeps_primary_html_and_media() -> None:
+    steps = parse_dialogue_steps(
+        None,
+        primary_account_id=1,
+        primary_text="Первое сообщение",
+        primary_html="<b>Первое сообщение</b>",
+        primary_media_path="uploads/first-photo.jpg",
+        primary_media_kind="photo",
+        primary_media_name="first-photo.jpg",
+        primary_media_size=512,
+        reply_account_id=2,
+        reply_text="Второе сообщение",
+        reply_delay_seconds=60,
+    )
+
+    assert steps[0].html_text == "<b>Первое сообщение</b>"
+    assert steps[0].media_path == "uploads/first-photo.jpg"
+    assert steps[0].media_kind == "photo"
+    assert steps[0].media_name == "first-photo.jpg"
+    assert steps[0].media_size == 512
+    assert steps[1].media_path is None
+
+
 @pytest.mark.asyncio
 async def test_smart_dialogue_repeats_only_after_complete_chain(tmp_path: Path) -> None:
     gateway = DialogueActivityGateway()
@@ -189,8 +213,8 @@ async def test_smart_dialogue_repeats_only_after_complete_chain(tmp_path: Path) 
         repository = AdminRepository(app.state.database.session_factory)
         launch, launch_runs = await repository.get_launch(successor.id)
         report = launch_details_text(launch, launch_runs)
-        assert "УМНЫЙ ДИАЛОГ" in report
-        assert "Реально отправлено сообщений: <b>2</b>" in report
+        assert "Умный диалог" in report
+        assert "Отправлено и подтверждено: <b>2</b>" in report
         assert "Завершено диалогов: <b>1</b>" in report
         assert "Продолжаются или ждут: <b>1</b>" in report
     finally:

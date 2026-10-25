@@ -10,6 +10,7 @@ from proxima_traffic.bot.error_handling import (
 from proxima_traffic.content import ContentError
 from proxima_traffic.proxies import ProxyRouteUnavailable
 from proxima_traffic.services import NotFoundError
+from proxima_traffic.subscriber_import import SubscriberImportError
 
 
 def test_operator_error_never_exposes_internal_exception_for_bad_input() -> None:
@@ -19,6 +20,7 @@ def test_operator_error_never_exposes_internal_exception_for_bad_input() -> None
     assert "База данных" in _operator_error(OperationalError("SELECT 1", {}, RuntimeError("busy")))
     assert "Временная ошибка сети" in _operator_error(ConnectionError("socket details"))
     assert "Spintax" in _operator_error(ContentError("Spintax: лишняя скобка"))
+    assert "JSON" in _operator_error(SubscriberImportError("некорректный JSON"))
 
 
 def test_callback_error_is_short_and_never_exposes_transport_details() -> None:

@@ -221,14 +221,35 @@ class DirectBlacklistState(StatesGroup):
     ids = State()
 
 
+class DirectBlacklistChatParseState(StatesGroup):
+    chat_ref = State()
+
+
 class DirectCampaignCreateState(StatesGroup):
+    service_action = State()
+    segment = State()
+    cooldown = State()
+    accounts = State()
     limit = State()
     content = State()
 
 
 class SubscriberInviteCreateState(StatesGroup):
+    segment = State()
+    cooldown = State()
+    accounts = State()
+    manager = State()
+    admin_setup = State()
     destination = State()
     limit = State()
+
+
+class RecipientReportSearchState(StatesGroup):
+    query = State()
+
+
+class RecipientReportPageState(StatesGroup):
+    page = State()
 
 
 class ProxyAssignState(StatesGroup):
@@ -258,3 +279,28 @@ class ProxyAutoAssignState(StatesGroup):
 class ProxyGroupCreateState(StatesGroup):
     name = State()
     description = State()
+
+
+class StoryTaggingCreateState(StatesGroup):
+    name = State()
+    subscriber_list = State()
+    media = State()
+    caption = State()
+    tags_per_story = State()
+    total_tags = State()
+    accounts = State()
+    confirm = State()
+
+
+class StoryViewerCreateState(StatesGroup):
+    name = State()
+    subscriber_list = State()
+    send_reaction = State()
+    reaction_emoji = State()
+    delay_range = State()
+    daily_limit = State()
+    max_targets = State()
+    accounts = State()
+    confirm = State()
+
+

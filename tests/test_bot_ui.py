@@ -1,8 +1,9 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from aiogram.enums import ChatType
-from aiogram.types import CallbackQuery, Chat, Message
+from aiogram.types import CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from proxima_traffic.accounts import (
     AccountArchiveEntry,
@@ -11,6 +12,7 @@ from proxima_traffic.accounts import (
     AccountCheckResult,
     AccountImportError,
 )
+from proxima_traffic.bot import keyboards as keyboard_factories
 from proxima_traffic.bot.app import create_dispatcher
 from proxima_traffic.bot.channel_comment_ui import (
     channel_comment_account_picker,
@@ -27,6 +29,8 @@ from proxima_traffic.bot.direct_message_ui import (
     direct_account_picker,
     direct_account_picker_text,
     direct_blacklist_menu,
+    direct_campaign_confirmation_menu,
+    direct_campaign_details_menu,
     direct_cooldown_menu,
     direct_launch_details_menu,
     direct_launch_details_text,
@@ -47,6 +51,8 @@ from proxima_traffic.bot.handlers import (
     _import_account_archive_message,
     _order_sender_picker_text,
     _parse_channel_comment_refs,
+    preview_direct_campaign,
+    router,
 )
 from proxima_traffic.bot.keyboards import (
     account_avatar_delete_confirmation,
@@ -174,10 +180,13 @@ from proxima_traffic.bot.repository import (
 from proxima_traffic.bot.subscriber_invite_ui import (
     invite_account_picker,
     invite_cooldown_menu,
+    invite_destination_prompt_text,
     invite_list_picker,
+    invite_preflight_progress_text,
     subscriber_invites_home_menu,
     subscriber_invites_home_text,
 )
+from proxima_traffic.bot.ui import MAX_INLINE_BUTTON_TEXT_LENGTH, polish_markup
 from proxima_traffic.channel_comments import ChannelCommentReactionSummary, ChannelCommentRuleView
 from proxima_traffic.config import Settings
 from proxima_traffic.content import BroadcastContentVariant, StoredContact, StoredMedia
@@ -376,6 +385,40 @@ def test_subscriber_list_shortcuts_keep_direct_message_and_invite_actions_togeth
     assert "dm:new:list:57" in callbacks
     assert "inv:new:fromlist:57" in callbacks
     assert all(len(value.encode("utf-8")) <= 64 for value in callbacks)
+
+
+async def test_direct_preview_goes_to_operator_only(monkeypatch) -> None:
+    sent: list[tuple[int, str]] = []
+
+    async def acknowledge(*args, **kwargs) -> None:
+        del args, kwargs
+
+    async def send_preview(bot, chat_id, variant, settings) -> None:
+        del bot, settings
+        sent.append((chat_id, variant.text))
+
+    class DirectMessages:
+        async def get_campaign_view(self, campaign_id: int):
+            assert campaign_id == 7
+            return SimpleNamespace(
+                campaign=SimpleNamespace(
+                    id=7,
+                    name="Prepared message",
+                    primary_text="Hello there",
+                    primary_html=None,
+                    primary_media_path=None,
+                )
+            )
+
+    monkeypatch.setattr("proxima_traffic.bot.handlers._safe_callback_answer", acknowledge)
+    monkeypatch.setattr("proxima_traffic.bot.handlers._send_variant_preview", send_preview)
+    callback = SimpleNamespace(data="dm:preview:7", from_user=SimpleNamespace(id=42))
+    await preview_direct_campaign(callback, object(), object(), DirectMessages())
+    assert sent == [(42, "Hello there")]
+
+    for menu in (direct_campaign_confirmation_menu(7, "token"), direct_campaign_details_menu(7, 0)):
+        callbacks = [button.callback_data for row in menu.inline_keyboard for button in row]
+        assert "dm:preview:7" in callbacks
 
 
 async def test_sensitive_account_import_message_is_deleted() -> None:
@@ -636,8 +679,8 @@ def test_campaign_card_separates_check_only_from_checked_launch_path() -> None:
         for button in row
     }
 
-    assert buttons["🚀 Проверить и перейти к запуску"] == "campaign:run:ask:95:2"
-    assert buttons["🩺 Проверить доступ без запуска"] == "campaign:preflight:95:2"
+    assert buttons["↗ Проверить и перейти к запуску"] == "campaign:run:ask:95:2"
+    assert buttons["⌕ Проверить доступ без запуска"] == "campaign:preflight:95:2"
 
 
 def test_broadcast_reactions_do_not_require_a_dialogue_reply_account() -> None:
@@ -820,9 +863,9 @@ def test_participant_reaction_card_is_clear_and_hides_empty_error() -> None:
 
     assert "примерно 1 из 10 новых сообщений" in details
     assert "Только эти аккаунты" in details
-    assert "строго из выбранного набора" in overview
+    assert "только выбранные аккаунты" in overview
     assert "Последняя ошибка" not in details
-    assert "Авто-реакции в чатах" in overview
+    assert "Реакции участникам" in overview
 
 
 def test_operator_errors_show_plain_reason_and_next_action() -> None:
@@ -962,7 +1005,7 @@ def test_long_dialogues_expose_every_reaction_step_and_full_count_range() -> Non
     assert "Реакций будет меньше настройки" in comment_text
 
 
-def test_inline_callback_contracts_fit_telegram_limit() -> None:
+async def test_inline_callback_contracts_fit_telegram_limit() -> None:
     account = Account(
         id=123,
         label="Primary",
@@ -1133,7 +1176,6 @@ def test_inline_callback_contracts_fit_telegram_limit() -> None:
         campaign_smart_interval_presets(),
         campaign_smart_duration_presets(cancel_callback="cschedule:cancel"),
         campaign_smart_interval_presets(cancel_callback="cschedule:cancel"),
-        campaign_repeat_interval_presets("crepeat"),
         campaign_repeat_interval_presets("cschedule"),
         campaign_repeat_count_presets("crepeat"),
         campaign_repeat_count_presets("cschedule"),
@@ -1162,6 +1204,15 @@ def test_inline_callback_contracts_fit_telegram_limit() -> None:
         campaign_run_confirmation(789, 0),
         campaign_stop_all_confirmation(),
         settings_menu(),
+        keyboard_factories.order_engagement_menu({}),
+        keyboard_factories.account_about_bulk_confirmation(clear=True),
+        keyboard_factories.account_about_bulk_confirmation(clear=False),
+        keyboard_factories.account_picker([account], "primary"),
+        keyboard_factories.account_picker([account], "reply"),
+        keyboard_factories.order_activity_check_presets(),
+        keyboard_factories.order_visibility_presets(),
+        order_target_picker(Page([target], 1, 7, 21)),
+        order_target_list_picker(Page([target_list], 1, 7, 21)),
     ]
     callback_data = [
         button.callback_data
@@ -1177,8 +1228,36 @@ def test_inline_callback_contracts_fit_telegram_limit() -> None:
     button_labels = [
         button.text for markup in markups for row in markup.inline_keyboard for button in row
     ]
-    assert all(not label.startswith("‹ ") for label in button_labels)
+    assert all(not label.startswith("⬅️ ") for label in button_labels)
     assert not ({"Отмена", "Отменить", "Назад", "Обновить"} & set(button_labels))
+    unmatched = []
+    for value in set(callback_data):
+        event = CallbackQuery(
+            id="route-contract",
+            from_user={"id": 1, "is_bot": False, "first_name": "Operator"},
+            chat_instance="route-contract",
+            data=value,
+            message=Message(
+                message_id=1,
+                date=datetime.now(UTC),
+                chat=Chat(id=1, type="private"),
+            ),
+        )
+        for handler in router.callback_query.handlers:
+            if handler.callback.__name__ == "unknown_callback":
+                continue
+            raw_state = None
+            for item in handler.filters or []:
+                raw_state = getattr(item.callback, "state", raw_state)
+                states = getattr(item.callback, "states", ())
+                if states:
+                    raw_state = getattr(states[0], "state", states[0])
+            matched, _ = await handler.check(event, raw_state=raw_state)
+            if matched:
+                break
+        else:
+            unmatched.append(value)
+    assert unmatched == [], f"Buttons without a registered handler: {unmatched}"
 
 
 def test_order_audience_always_offers_safe_list_creation() -> None:
@@ -1223,7 +1302,7 @@ def test_bad_target_card_explains_rating_and_manual_restore() -> None:
     assert "ошибок 4" in text
     assert "банов 2" in text
     assert "успешно только 1 из 5" in text
-    assert menu.inline_keyboard[0][0].text == "♻️ Вернуть чат в работу"
+    assert menu.inline_keyboard[0][0].text == "↻ Вернуть чат в работу"
     assert menu.inline_keyboard[0][0].callback_data == "target:quality:restore:91:0:bad"
 
 
@@ -1273,7 +1352,7 @@ def test_target_list_catalog_has_filters_bulk_actions_and_preserves_context() ->
         if button.callback_data
     }
 
-    assert "ФИЛЬТР: С ОШИБКАМИ" in text
+    assert "Фильтр: с ошибками" in text
     assert "Страница <b>13/13</b>" in text
     assert "показано <b>121–128</b>" in text
     assert "tlf:55:2:enabled:0" in callbacks
@@ -1342,11 +1421,11 @@ def test_contact_variant_has_clear_card_controls_and_report_label() -> None:
         if button.callback_data
     ]
 
-    assert "📇 контакт" in list_text
+    assert "контакт" in list_text
     assert "нативная карточка Telegram" in detail_text
     assert "+79991234567" in detail_text
-    assert "✏️ Изменить контакт" in labels
-    assert "➕ Добавить медиа в альбом" not in labels
+    assert "✎ Изменить контакт" in labels
+    assert "＋ Добавить медиа в альбом" not in labels
     assert any(value.startswith("campaign:variant:contact:edit:") for value in callbacks)
     assert all(len(value.encode("utf-8")) <= 64 for value in callbacks)
 
@@ -1453,8 +1532,8 @@ def test_media_only_order_is_ready_and_explains_its_next_action() -> None:
     text = order_draft_text(draft)
 
     assert "order:launch" in callbacks
-    assert "✅ Пост · голосовое" in labels
-    assert "🟢 Черновик готов к проверке" in text
+    assert "✓ Пост · голосовое" in labels
+    assert "Черновик готов к проверке" in text
     assert "будет отправлено только вложение" in text
 
 
@@ -1472,12 +1551,17 @@ def test_home_screens_give_a_next_step_and_consistent_workflow_context() -> None
         succeeded_tasks=0,
         failed_tasks=0,
         skipped_tasks=0,
+        simulated=True,
     )
 
     assert "Следующий шаг" in direct_messages_home_text(dashboard)
     assert "Импортируйте первую базу" in direct_messages_home_text(dashboard)
+    assert "Текущий режим: симуляция" in direct_messages_home_text(dashboard)
+    assert "Отправлено и подтверждено: <b>0</b>" in direct_messages_home_text(dashboard)
     assert "Как это работает" in subscriber_invites_home_text()
-    assert "вашей базы" in subscriber_invites_home_text()
+    assert "общей базы" in subscriber_invites_home_text()
+    assert "Добавлять участников" in invite_destination_prompt_text()
+    assert "Проверено аккаунтов: <b>2/5</b>" in invite_preflight_progress_text(2, 5, 1, 1)
     assert "Как это работает" in channel_comments_text([], 0)
     assert "С чего начать" in channel_comments_text([], 0)
     assert "Как это работает" in participant_reactions_text([], 0)
@@ -1528,7 +1612,7 @@ def test_ready_order_still_requires_a_separate_launch_confirmation() -> None:
     assert "12 чатов × 2 аккаунтов" in confirmation_text
     assert "сообщения попадут в очередь только после успешной проверки" in confirmation_text
     assert any(
-        button.text == "🔎 Проверить готовность"
+        button.text == "⌕ Проверить готовность"
         for row in confirmation.inline_keyboard
         for button in row
     )
@@ -1544,10 +1628,10 @@ def test_order_menu_defaults_to_an_active_distributed_broadcast() -> None:
     markup = order_draft_menu(draft)
     labels = [button.text for row in markup.inline_keyboard for button in row]
 
-    assert "🤖 Умный выбор · 1 поток/чат" in labels
-    assert "♻️ Активная · до 24 ч" in labels
-    assert "👁 После 10 новых сообщ." in labels
-    assert "✅ ⚡ Активная" in labels
+    assert "≈ Умный выбор · 1 поток/чат" in labels
+    assert "↻ Активная · до 24 ч" in labels
+    assert "После 10 новых сообщ." in labels
+    assert "✓ ↗ Активная" in labels
     assert "Активная рассылка · повторять до конца срока" in order_draft_text(draft)
     assert "Активная рассылка выбрана по умолчанию" in order_type_text()
     callbacks = {
@@ -1560,7 +1644,7 @@ def test_order_menu_defaults_to_an_active_distributed_broadcast() -> None:
     schedule_labels = [
         button.text for row in order_schedule_mode_menu(draft).inline_keyboard for button in row
     ]
-    assert "✅ ♻️ Активная · до 24 ч" in schedule_labels
+    assert "✓ ↻ Активная · до 24 ч" in schedule_labels
 
 
 def test_sender_picker_explains_the_selected_mode_and_first_pass_volume() -> None:
@@ -1674,9 +1758,9 @@ def test_preflight_result_exposes_a_safe_cached_launch_confirmation() -> None:
 
     assert "подтвердите запуск готовых направлений кнопкой ниже" in text
     assert "Повторной Telegram-проверки не будет" in text
-    assert "Зачем нужна эта проверка" in text
+    assert "Что дальше" in text
     assert "без публикаций и вступлений" in text
-    assert "campaign:run:confirm:91:2" in callbacks
+    assert any(value.startswith("campaign:run:confirm:91:2:") for value in callbacks)
 
 
 def test_active_order_mode_is_explicit_and_supports_twelve_messages() -> None:
@@ -1690,7 +1774,7 @@ def test_active_order_mode_is_explicit_and_supports_twelve_messages() -> None:
     labels = [button.text for button in buttons]
     callbacks = {button.callback_data for button in buttons if button.callback_data}
 
-    assert "✅ ♻️ Активная · до 24 ч" in labels
+    assert "✓ ↻ Активная · до 24 ч" in labels
     assert {"order:schedule:set:once", "order:schedule:set:active"} <= callbacks
     assert "10 новых сообщений после нашего поста" in order_advanced_text(active)
     assert "не пытается угадывать" in order_advanced_text(active)
@@ -1752,7 +1836,7 @@ def test_dashboard_explicitly_reports_dry_run() -> None:
     )
     assert "Тестовый режим" in text
     assert "Аккаунты" in text
-    assert "<b>🟢 Всё готово к отправке</b>" in text
+    assert "<b>Всё готово к отправке</b>" in text
     assert "Сейчас" in text
     assert "За всё время" in text
 
@@ -1790,6 +1874,47 @@ def test_worker_campaign_scope_is_visible_in_dashboard_and_campaigns() -> None:
     assert "Другие запуски не начнутся" in campaigns
 
 
+@pytest.mark.parametrize("reference", ["success", "start", "missing"])
+def test_dashboard_does_not_claim_ready_with_stale_worker_health(reference) -> None:
+    old = datetime.now(UTC) - timedelta(seconds=120)
+    snapshot = WorkerHealthSnapshot(
+        name="campaigns",
+        state="running",
+        consecutive_failures=0,
+        restart_count=0,
+        last_success_at=old if reference == "success" else None,
+        last_error=None,
+        started_at=old if reference == "start" else None,
+    )
+    stats = DashboardStats(
+        accounts_total=1,
+        accounts_active=1,
+        targets_total=1,
+        targets_approved=1,
+        target_lists_total=0,
+        templates_total=1,
+        campaigns_total=1,
+        queued_runs=0,
+        running_runs=0,
+        succeeded_runs=0,
+        failed_runs=0,
+    )
+    text = dashboard_text(
+        stats,
+        dry_run=True,
+        worker_health=(snapshot,),
+        worker_readiness_max_stale_seconds=30,
+    )
+    assert "Всё готово к отправке" not in text
+    assert "нет свежего подтверждения работы" in text
+    assert "Работают: <b>0/1</b>" in text
+    if reference != "missing":
+        fresh_text = dashboard_text(
+            stats, dry_run=True, worker_health=(snapshot,), worker_readiness_max_stale_seconds=300
+        )
+        assert "Всё готово к отправке" in fresh_text
+
+
 def test_dashboard_shows_degraded_background_worker_with_last_error() -> None:
     text = dashboard_text(
         DashboardStats(
@@ -1820,7 +1945,7 @@ def test_dashboard_shows_degraded_background_worker_with_last_error() -> None:
         ),
     )
 
-    assert "Фоновые сервисы деградировали" in text
+    assert "Фоновые сервисы требуют внимания" in text
     assert "participant-reactions" in text
     assert "database unavailable &lt;retry&gt;" in text
 
@@ -1862,9 +1987,9 @@ def test_account_profile_card_shows_telegram_name_and_avatar() -> None:
     assert "Аватар Telegram: <b>установлен</b>" in details
     assert "За 24 часа: <b>143/200</b>" in details
     assert "осталось <b>57</b>" in details
-    assert "🟢 рабочий" in details
+    assert "рабочий" in details
     assert "Прокси проверен:" in details
-    assert "Текущий аватар: <b>🟢 установлен</b>" in avatar
+    assert "Текущий аватар: <b>установлен</b>" in avatar
     callbacks = {
         button.callback_data
         for row in account_details_menu(account, 0, has_proxy=True).inline_keyboard
@@ -2100,16 +2225,16 @@ def test_reworked_bot_ui_is_operator_friendly_and_escapes_values() -> None:
     assert "/cancel" in wizard
 
     menu = main_menu()
-    assert menu.inline_keyboard[0][0].text == "🚀 Создать рассылку"
+    assert menu.inline_keyboard[0][0].text == "＋ Новая рассылка в чаты"
     assert menu.inline_keyboard[0][0].callback_data == "order:new"
     menu_callbacks = {button.callback_data for row in menu.inline_keyboard for button in row}
     assert "comments:home:0" in menu_callbacks
     menu_labels = {button.text for row in menu.inline_keyboard for button in row}
     assert {
-        "💬 Автокомментарии",
-        "👍 Авто-реакции в чатах",
-        "📝 Шаблоны",
-        "⚙️ Настройки и сервис",
+        "Автокомментарии",
+        "Реакции участникам",
+        "Шаблоны",
+        "Сервис и настройки",
     } <= menu_labels
     guide_callbacks = {
         button.callback_data for row in guide_menu().inline_keyboard for button in row
@@ -2125,8 +2250,8 @@ def test_reworked_bot_ui_is_operator_friendly_and_escapes_values() -> None:
 def test_campaign_schedule_pickers_explain_continuous_mode_and_default_interval() -> None:
     create_mode = campaign_repeat_mode_picker()
     create_labels = [button.text for row in create_mode.inline_keyboard for button in row]
-    assert "1️⃣ Одноразовая · один пост в чат" in create_labels
-    assert "♻️ Умная непрерывная" in create_labels
+    assert "Одноразовая · один пост в чат" in create_labels
+    assert "↻ Умная непрерывная" in create_labels
 
     interval_picker = campaign_smart_interval_presets()
     default_button = next(
@@ -2180,12 +2305,12 @@ def test_campaign_run_confirmation_text_matches_mode() -> None:
     broadcast_text = campaign_run_confirmation_text(broadcast)
     dialogue_text = campaign_run_confirmation_text(dialogue)
 
-    assert "📢 посты в чатах" in broadcast_text
+    assert "посты в чатах" in broadcast_text
     assert "24 ч." in broadcast_text
     assert "3</b> проходов" in broadcast_text
     assert "2 ч." in broadcast_text
     assert "Задержка ответа" not in broadcast_text
-    assert "💬 диалог" in dialogue_text
+    assert "диалог" in dialogue_text
     assert "90 сек." in dialogue_text
     assert "окно отправки" not in dialogue_text
     assert "автоматически проверит доступ" in broadcast_text
@@ -2241,8 +2366,8 @@ def test_campaign_launch_not_ready_text_explains_a_telegram_safety_pause() -> No
 
     text = campaign_launch_not_ready_text(summary)
 
-    assert "Telegram временно ограничил отправку" in text
-    assert "Обычный запуск их пропустит" in text
+    assert "аккаунты пока заняты" in text
+    assert "Кнопка планирования ниже сохранит задачи" in text
     assert "21.08.2026 20:08 UTC" in text
 
 
@@ -2312,6 +2437,26 @@ def test_campaign_launch_review_discloses_partial_audience_before_queueing() -> 
     assert any("Подтвердить запуск готовых направлений (3)" in button for button in buttons)
 
 
+def test_deferred_review_shows_queue_option_instead_of_zero_sends() -> None:
+    checked_at = datetime(2026, 10, 8, 13, 17, tzinfo=UTC)
+    campaign = Campaign(
+        id=7, name="BDF4F", mode=CampaignMode.BROADCAST,
+        sender_mode=BroadcastSenderMode.INDEPENDENT, repeat_count=1, smart_timer_mode=True,
+    )
+    summary = CampaignPreflightSummary(
+        campaign_id=7, account_count=2, target_count=8, checked_pairs=16, ready_pairs=4,
+        member_targets=4, joinable_targets=4, blocked_targets=0, unavailable_targets=0,
+        oldest_checked_at=checked_at, newest_checked_at=checked_at, auto_join_enabled=True,
+        independent_mode=True, routable_pairs=16, ready_now_pairs=0, ready_now_targets=0,
+        deferred_pairs=16, earliest_resume_at=checked_at + timedelta(hours=1),
+    )
+    text = campaign_launch_review_text(campaign, summary, planned_tasks=0)
+    assert "Запуск можно сохранить в очередь" in text
+    assert "в очередь войдёт отправок: <b>16</b>" in text
+    assert "В очередь ничего не будет поставлено" not in text
+    assert "На безопасной паузе Telegram" not in text
+
+
 def test_direct_launch_screen_treats_pacing_as_normal_and_surfaces_proxy_action() -> None:
     launch = DirectLaunch(
         id=31,
@@ -2340,6 +2485,7 @@ def test_direct_launch_screen_treats_pacing_as_normal_and_surfaces_proxy_action(
         cancelled=0,
         last_error_code="account_pacing",
         last_error_status=DirectMessageTaskStatus.QUEUED,
+        next_scheduled_for=datetime(2026, 8, 13, 12, 15, tzinfo=UTC),
     )
     proxy_view = DirectLaunchView(
         launch=launch,
@@ -2354,6 +2500,7 @@ def test_direct_launch_screen_treats_pacing_as_normal_and_surfaces_proxy_action(
         last_error_code="proxy_unavailable",
         last_error_status=DirectMessageTaskStatus.FAILED,
         last_error_account_label="Doris Cunningham",
+        issues=((DirectMessageTaskStatus.SKIPPED, "recipient_paid_message_required", 2),),
     )
 
     pacing_text = direct_launch_details_text(pacing_view)
@@ -2365,10 +2512,15 @@ def test_direct_launch_screen_treats_pacing_as_normal_and_surfaces_proxy_action(
     }
 
     assert "штатная пауза" in pacing_text
+    assert "Сообщение людям" in pacing_text
+    assert "Hello" in pacing_text
+    assert "13.08 12:15 UTC" in pacing_text
+    assert "доступные аккаунты" in pacing_text
     assert "Последняя ситуация" not in pacing_text
     assert "Технически:" not in pacing_text
     assert "При старте не включены" in pacing_text
     assert "menu:proxies:0" in proxy_callbacks
+    assert "получатель принимает только платные сообщения" in direct_launch_details_text(proxy_view)
 
 
 def test_smart_dialogue_has_complete_schedule_controls() -> None:
@@ -2446,7 +2598,7 @@ def test_smart_dialogue_has_complete_schedule_controls() -> None:
     detail_labels = {
         button.text for row in campaign_details_menu(campaign, 0).inline_keyboard for button in row
     }
-    assert "✓ ⚡ Активная" in detail_labels
+    assert "✓ ↗ Активная" in detail_labels
 
     dialogue_schedule_callbacks = {
         button.callback_data
@@ -2612,12 +2764,12 @@ def test_launch_ui_groups_tasks_and_reports_progress() -> None:
     assert "чат #99" in details
     assert "Cannot send &lt;message&gt;" in details
     assert "Последние публикации" in details
-    assert 'href="https://t.me/public_room/777"' in details
+    assert 'href="https://t.me/public_room/777"' not in details
     assert "Что будет дальше" in details
     assert "Next room" in details
     assert "проход 2/2" in details
     details_menu = launch_details_menu(launch, 0)
-    assert details_menu.inline_keyboard[0][0].text == "🔄 Обновить отчёт"
+    assert details_menu.inline_keyboard[0][0].text == "↻ Обновить отчёт"
     assert details_menu.inline_keyboard[0][1].callback_data == "campaign:details:4:0"
     assert "Остановить отправку" in details_menu.inline_keyboard[1][0].text
 
@@ -2697,7 +2849,7 @@ def test_launch_report_explains_reaction_configuration_and_outcome() -> None:
     assert "Реакции к публикациям" in report
     assert "Настроено: <b>2</b> на публикацию · реакция <b>🔥</b>" in report
     assert "подтверждено Telegram: 1" in report
-    assert "⏭ пропущено <b>1</b>" in report
+    assert "›› пропущено <b>1</b>" in report
     assert "Фактически поставлено: 👍 × <b>1</b>" in report
     assert "использован другой emoji" in report
     assert "Последняя причина реакции" in report
@@ -2723,6 +2875,11 @@ def test_timer_driven_launch_ui_reports_live_posts_distribution_and_failover() -
         active_until=now + timedelta(hours=24),
         no_timer_interval_seconds=15 * 60,
         auto_sender_failover=True,
+        publications=(ActionLog(
+            id=30, run_id=21, account_id=1, target_id=101,
+            kind=ActionKind.PRIMARY_MESSAGE, status=ActionStatus.SUCCEEDED,
+            simulated=False, external_message_id=501, text="Advertisement", created_at=now,
+        ),),
         sent_publications=1,
         next_scheduled_for=now + timedelta(minutes=2),
         target_count=2,
@@ -2866,15 +3023,15 @@ def test_timer_driven_launch_ui_reports_live_posts_distribution_and_failover() -
         targets,
     )
 
-    assert "опубликовано <b>1</b> · в работе <b>2</b>" in list_card
+    assert "успешных шагов <b>1</b> · в работе <b>2</b>" in list_card
     assert "Always-on ads &lt;live&gt;" in list_card
     smart_menu = launches_menu(Page([launch], 0, 7, 1))
-    assert "отправлено 1" in smart_menu.inline_keyboard[0][0].text
+    assert "успешных шагов 1" in smart_menu.inline_keyboard[0][0].text
     assert "Статус:" in details
-    assert "Реально отправлено: <b>1</b>" in details
+    assert "Отправлено и подтверждено: <b>1</b>" in details
     assert "Охват направлений: <b>1/2</b>" in details
     assert "Сбоев отдельных попыток: <b>1</b>" in details
-    assert "📇 Запись к Алисе" in details
+    assert "Запись к Алисе" in details
     assert "Если в чате нет таймера: каждые <b>15 мин.</b>" in details
     assert "Последние публикации" in details
     assert "10.07 · 13:00 (Asia/Jerusalem)" in details
@@ -2885,7 +3042,7 @@ def test_timer_driven_launch_ui_reports_live_posts_distribution_and_failover() -
     assert chat_section.index("Second ads") < chat_section.index("First ads")
     assert "Primary &lt;one&gt;" in details and "Reserve two" in details
     assert "Таймеры по парам аккаунт × чат" in details
-    assert "⛔ исключён из этого чата" in details
+    assert "× исключён из этого чата" in details
     assert "Автозамены · 1" in details
     assert "аккаунт больше не авторизован" in details
     assert "Последние сбои отправки" in details
@@ -3024,14 +3181,37 @@ def test_keyboard_theme_uses_one_navigation_language_across_modules() -> None:
         button.text for row in subscriber_invites_home_menu().inline_keyboard for button in row
     ]
 
-    assert "↻ Обновить данные" in main_labels
-    assert "🎯 Чаты и списки" in main_labels
-    assert "⌂ На главную" in direct_labels
-    assert "⌂ На главную" in invite_labels
-    assert cancel_menu().inline_keyboard[0][0].text == "✕ Отменить ввод"
-    assert direct_blacklist_menu().inline_keyboard[-1][0].text == "← К личным сообщениям"
+    assert "↻ Обновить" in main_labels
+    assert "Чаты и списки" in main_labels
+    assert "⌂ Главная" in direct_labels
+    assert "⌂ Главная" in invite_labels
+    assert cancel_menu().inline_keyboard[0][0].text == "× Отменить"
+    assert direct_blacklist_menu().inline_keyboard[-1][0].text == "‹ К личным сообщениям"
     invite_blacklist = direct_blacklist_menu(
         add_callback="inv:blacklist:add",
         back_callback="inv:home",
     )
     assert invite_blacklist.inline_keyboard[0][0].callback_data == "inv:blacklist:add"
+
+
+def test_keyboard_theme_compacts_operator_provided_long_button_labels() -> None:
+    """Long chat and campaign titles stay readable without changing their routes."""
+
+    source = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="  🎯 " + "очень длинное название чата " * 8,
+                    callback_data="target:open:123",
+                )
+            ]
+        ]
+    )
+
+    rendered = polish_markup(source)
+    button = rendered.inline_keyboard[0][0]
+
+    assert len(button.text) <= MAX_INLINE_BUTTON_TEXT_LENGTH
+    assert button.text.endswith("…")
+    assert "  " not in button.text
+    assert button.callback_data == "target:open:123"

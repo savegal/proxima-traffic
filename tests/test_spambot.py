@@ -273,11 +273,11 @@ class SpamBotGateway:
 async def test_check_service_persists_temporary_ban_and_uses_cached_result(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'spambot.db'}")
     await database.create_schema()
-    expiry = REFERENCE_TIME + timedelta(days=5)
+    expiry = utc_now() + timedelta(days=5)
     gateway = SpamBotGateway(
         SpamBotResult(
             SpamBotStatus.TEMPORARY_RESTRICTION,
-            "limited until 2026-08-06",
+            f"limited until {expiry.isoformat()}",
             restricted_until=expiry,
         )
     )

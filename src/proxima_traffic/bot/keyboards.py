@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import uuid4
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -40,39 +42,45 @@ def main_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🚀 Создать рассылку",
+                    text="＋ Новая рассылка в чаты",
                     callback_data="order:new",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📊 Запуски и результаты",
+                    text="Запуски в чатах",
                     callback_data="menu:runs:0",
                 ),
-                InlineKeyboardButton(text="🗂 Мои рассылки", callback_data="menu:campaigns:0"),
+                InlineKeyboardButton(text="Рассылки в чатах", callback_data="menu:campaigns:0"),
             ],
             [
-                InlineKeyboardButton(text="🎯 Чаты и списки", callback_data="audiences:home"),
-                InlineKeyboardButton(text="👥 Аккаунты", callback_data="menu:accounts:0"),
+                InlineKeyboardButton(text="Автокомментарии", callback_data="comments:home:0"),
+                InlineKeyboardButton(text="Реакции участникам", callback_data="pr:home:0"),
             ],
             [
-                InlineKeyboardButton(text="💬 Автокомментарии", callback_data="comments:home:0"),
+                InlineKeyboardButton(text="ЛС-рассылки", callback_data="dm:home"),
+                InlineKeyboardButton(text="Приглашения", callback_data="inv:home"),
             ],
             [
-                InlineKeyboardButton(text="👍 Авто-реакции в чатах", callback_data="pr:home:0"),
+                InlineKeyboardButton(text="📖 Теггинг в историях", callback_data="story:home"),
+                InlineKeyboardButton(text="👀 Просмотр и реакции", callback_data="story_view:home"),
             ],
             [
-                InlineKeyboardButton(text="✉️ Базы подписчиков и ЛС", callback_data="dm:home"),
+                InlineKeyboardButton(text="Чаты и списки", callback_data="audiences:home"),
+                InlineKeyboardButton(text="База подписчиков", callback_data="dm:lists:0"),
             ],
             [
-                InlineKeyboardButton(text="📝 Шаблоны", callback_data="menu:templates:0"),
-                InlineKeyboardButton(text="🌐 Прокси", callback_data="menu:proxies:0"),
+                InlineKeyboardButton(text="Аккаунты", callback_data="menu:accounts:0"),
+                InlineKeyboardButton(text="Прокси", callback_data="menu:proxies:0"),
             ],
             [
-                InlineKeyboardButton(text="❓ Как начать", callback_data="menu:guide"),
-                InlineKeyboardButton(text="⚙️ Настройки и сервис", callback_data="menu:settings"),
+                InlineKeyboardButton(text="Шаблоны", callback_data="menu:templates:0"),
+                InlineKeyboardButton(text="Сервис и настройки", callback_data="menu:settings"),
             ],
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu:home")],
+            [
+                InlineKeyboardButton(text="Как начать", callback_data="menu:guide"),
+                InlineKeyboardButton(text="↻ Обновить", callback_data="menu:home"),
+            ],
         ]
     )
 
@@ -91,7 +99,7 @@ def guide_menu() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton(text="4 · Посмотреть результаты", callback_data="menu:runs:0")],
-            [InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home")],
+            [InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home")],
         ]
     )
 
@@ -101,23 +109,23 @@ def order_type_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📢 Активная рассылка · по умолчанию",
+                    text="Активная рассылка · по умолчанию",
                     callback_data="order:draft:broadcast",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="💬 Диалог от нескольких аккаунтов",
+                    text="↳ Диалог от нескольких аккаунтов",
                     callback_data="order:draft:dialogue",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📣 Открыть рассылки",
+                    text="Открыть рассылки",
                     callback_data="menu:campaigns:0",
                 )
             ],
-            [InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home")],
+            [InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home")],
         ]
     )
 
@@ -147,11 +155,11 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text="✏️ Название",
+                text="✎ Название",
                 callback_data="order:edit:name",
             ),
             InlineKeyboardButton(
-                text=("✅ Чаты" if has_audience else "⚠️ Чаты"),
+                text=("✓ Чаты" if has_audience else "! Чаты"),
                 callback_data="order:edit:audience",
             ),
         ]
@@ -161,16 +169,16 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{'✅' if sender_count else '⚠️'} Отправители · {sender_count}",
+                    text=f"{'✓' if sender_count else '!'} Отправители · {sender_count}",
                     callback_data="order:edit:senders",
                 ),
                 InlineKeyboardButton(
                     text=(
-                        f"✅ Пост · {_draft_media_label(data)}"
+                        f"✓ Пост · {_draft_media_label(data)}"
                         if content_ready and _draft_media_label(data)
-                        else "✅ Пост"
+                        else "✓ Пост"
                         if content_ready
-                        else "⚠️ Пост"
+                        else "! Пост"
                     ),
                     callback_data="order:edit:text",
                 ),
@@ -180,10 +188,10 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         reactions_enabled = bool(data.get("reactions_enabled", False)) and reaction_count > 0
         mentions_enabled = bool(data.get("hidden_mentions_enabled", False))
         engagement_label = (
-            f"✨ Реакции {data.get('reaction_emoji', '👍')} × {reaction_count} · "
-            f"отметки {'ВКЛ' if mentions_enabled else 'ВЫКЛ'}"
+            f"◇ Реакции {data.get('reaction_emoji', '👍')} × {reaction_count} · "
+            f"отметки {'вкл.' if mentions_enabled else 'выкл.'}"
             if reactions_enabled
-            else f"✨ Реакции ВЫКЛ · отметки {'ВКЛ' if mentions_enabled else 'ВЫКЛ'}"
+            else f"◇ Реакции выкл. · отметки {'вкл.' if mentions_enabled else 'выкл.'}"
         )
         rows.append(
             [
@@ -198,9 +206,9 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=(
-                        f"🚀 Независимо · {sender_count} потоков/чат"
+                        f"↗ Независимо · {sender_count} потоков/чат"
                         if independent
-                        else "🤖 Умный выбор · 1 поток/чат"
+                        else "≈ Умный выбор · 1 поток/чат"
                     ),
                     callback_data="order:sendermode:choose",
                 )
@@ -211,7 +219,7 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{'✅' if content_ready else '⚠️'} Диалог · {step_count} сообщ.",
+                    text=f"{'✓' if content_ready else '!'} Диалог · {step_count} сообщ.",
                     callback_data="order:edit:chain",
                 )
             ]
@@ -221,13 +229,13 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text=(
-                    "♻️ Активная · до остановки"
+                    "↻ Активная · до остановки"
                     if smart and bool(data.get("repeat_forever", False)) and mode == "broadcast"
-                    else f"♻️ Активная · до {int(data.get('smart_duration_hours', 24))} ч"
+                    else f"↻ Активная · до {int(data.get('smart_duration_hours', 24))} ч"
                     if smart and mode == "broadcast"
-                    else f"♻️ Повторять диалоги · до {int(data.get('smart_duration_hours', 24))} ч"
+                    else f"↻ Повторять диалоги · до {int(data.get('smart_duration_hours', 24))} ч"
                     if smart
-                    else "1️⃣ Один проход"
+                    else "Один проход"
                 ),
                 callback_data="order:schedule:choose",
             )
@@ -246,14 +254,14 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"👁 После {visibility_depth} новых сообщ.",
+                    text=f"После {visibility_depth} новых сообщ.",
                     callback_data="order:edit:visibility",
                 ),
                 InlineKeyboardButton(
                     text=(
-                        "♾ До остановки"
+                        "∞ До остановки"
                         if bool(data.get("repeat_forever", False))
-                        else f"🗓 Работать · {duration_hours} ч"
+                        else f"◷ Работать · {duration_hours} ч"
                     ),
                     callback_data="order:edit:duration",
                 ),
@@ -263,15 +271,15 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{'✅ ' if selected_profile == 'active' else ''}⚡ Активная",
+                    text=f"{'✓ ' if selected_profile == 'active' else ''}↗ Активная",
                     callback_data="order:profile:active",
                 ),
                 InlineKeyboardButton(
-                    text=f"{'✅ ' if selected_profile == 'balanced' else ''}⚖️ Средняя",
+                    text=f"{'✓ ' if selected_profile == 'balanced' else ''}≈ Средняя",
                     callback_data="order:profile:balanced",
                 ),
                 InlineKeyboardButton(
-                    text=f"{'✅ ' if selected_profile == 'gentle' else ''}🌙 Бережная",
+                    text=f"{'✓ ' if selected_profile == 'gentle' else ''}○ Бережная",
                     callback_data="order:profile:gentle",
                 ),
             ]
@@ -279,7 +287,7 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="⚙️ Дополнительные условия",
+                    text="Дополнительные условия",
                     callback_data="order:advanced",
                 )
             ]
@@ -288,7 +296,7 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"🕒 Разложить за · {int(data.get('spread_hours', 0))} ч",
+                    text=f"◷ Разложить за · {int(data.get('spread_hours', 0))} ч",
                     callback_data="order:edit:spread",
                 )
             ]
@@ -297,7 +305,7 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="👁 Предпросмотр для меня",
+                    text="Предпросмотр для меня",
                     callback_data="order:preview",
                 )
             ]
@@ -306,7 +314,7 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🔎 Проверить и запустить",
+                    text="⌕ Проверить и запустить",
                     callback_data="order:launch",
                 )
             ]
@@ -314,7 +322,7 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="💾 Сохранить на потом",
+                    text="✓ Сохранить на потом",
                     callback_data="order:save",
                 )
             ]
@@ -323,12 +331,12 @@ def order_draft_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="⚠️ Показать, что осталось",
+                    text="! Показать, что осталось",
                     callback_data="order:check",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="✖️ Отменить создание", callback_data="order:cancel")])
+    rows.append([InlineKeyboardButton(text="× Отменить создание", callback_data="order:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -374,14 +382,14 @@ def order_advanced_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
-                text=f"👁 До повтора · {visibility_depth} сообщ.",
+                text=f"До повтора · {visibility_depth} сообщ.",
                 callback_data="order:edit:visibility",
             ),
             InlineKeyboardButton(
                 text=(
-                    "⌛ Только после порога"
+                    "◷ Только после порога"
                     if visibility_max_wait_minutes == 0
-                    else f"⌛ Ожидание · {visibility_max_wait_minutes} мин"
+                    else f"◷ Ожидание · {visibility_max_wait_minutes} мин"
                 ),
                 callback_data="order:edit:maxwait",
             ),
@@ -389,14 +397,14 @@ def order_advanced_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text=(
-                    "🧠 Подстраиваться · ВКЛ"
+                    "≈ Подстраиваться · вкл."
                     if bool(data.get("activity_aware", True))
-                    else "🧠 Подстраиваться · ВЫКЛ"
+                    else "≈ Подстраиваться · выкл."
                 ),
                 callback_data="order:activity:toggle",
             ),
             InlineKeyboardButton(
-                text=f"🔎 Проверять · {check_label}",
+                text=f"⌕ Проверять · {check_label}",
                 callback_data="order:edit:check",
             ),
         ],
@@ -406,7 +414,7 @@ def order_advanced_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
                 callback_data="order:edit:interval",
             ),
             InlineKeyboardButton(
-                text=f"🗓 Срок · {int(data.get('smart_duration_hours', 24))} ч",
+                text=f"◷ Срок · {int(data.get('smart_duration_hours', 24))} ч",
                 callback_data="order:edit:duration",
             ),
         ],
@@ -419,15 +427,15 @@ def order_advanced_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=(
-                        "🛟 Автозамена аккаунта · ВКЛ"
+                        "? Автозамена аккаунта · вкл."
                         if bool(data.get("auto_sender_failover", True))
-                        else "🛟 Автозамена аккаунта · ВЫКЛ"
+                        else "? Автозамена аккаунта · выкл."
                     ),
                     callback_data="order:failover:toggle",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="⬅️ К черновику", callback_data="order:back")])
+    rows.append([InlineKeyboardButton(text="‹ К черновику", callback_data="order:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -439,27 +447,27 @@ def order_schedule_mode_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
     duration_hours = max(1, int(data.get("smart_duration_hours", 24)))
     repeat_forever = bool(data.get("repeat_forever", False))
     active_label = (
-        "♻️ Активная · до остановки"
+        "↻ Активная · до остановки"
         if repeat_forever and mode == "broadcast"
-        else f"♻️ Активная · до {duration_hours} ч"
+        else f"↻ Активная · до {duration_hours} ч"
         if mode == "broadcast"
-        else f"♻️ Повторять диалоги · до {duration_hours} ч"
+        else f"↻ Повторять диалоги · до {duration_hours} ч"
     )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"{'✅ ' if not smart else ''}1️⃣ Один проход",
+                    text=f"{'✓ ' if not smart else ''}Один проход",
                     callback_data="order:schedule:set:once",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=f"{'✅ ' if smart else ''}{active_label}",
+                    text=f"{'✓ ' if smart else ''}{active_label}",
                     callback_data="order:schedule:set:active",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К черновику", callback_data="order:back")],
+            [InlineKeyboardButton(text="‹ К черновику", callback_data="order:back")],
         ]
     )
 
@@ -469,11 +477,11 @@ def order_launch_confirmation() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔎 Проверить готовность",
+                    text="⌕ Проверить готовность",
                     callback_data="order:launch:confirm",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ Вернуться к настройке", callback_data="order:back")],
+            [InlineKeyboardButton(text="‹ Вернуться к настройке", callback_data="order:back")],
         ]
     )
 
@@ -481,7 +489,7 @@ def order_launch_confirmation() -> InlineKeyboardMarkup:
 def order_interval_presets() -> InlineKeyboardMarkup:
     return _order_number_presets(
         "interval",
-        [(3, "3 мин"), (5, "5 мин ✓"), (10, "10 мин"), (20, "20 мин"), (60, "1 час")],
+        [(3, "3 мин"), (5, "5 мин "), (10, "10 мин"), (20, "20 мин"), (60, "1 час")],
     )
 
 
@@ -489,10 +497,10 @@ def order_duration_presets() -> InlineKeyboardMarkup:
     return _order_number_presets(
         "duration",
         [
-            (0, "♾ До остановки"),
+            (0, "∞ До остановки"),
             (6, "6 ч"),
             (12, "12 ч"),
-            (24, "24 ч ✓"),
+            (24, "24 ч "),
             (48, "2 суток"),
             (72, "3 суток"),
             (168, "7 суток"),
@@ -515,7 +523,7 @@ def _order_number_presets(
     for value, label in values:
         builder.button(text=label, callback_data=f"order:preset:{kind}:{value}")
     builder.adjust(3)
-    builder.row(InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back"))
+    builder.row(InlineKeyboardButton(text="‹ К рассылке", callback_data="order:back"))
     return builder.as_markup()
 
 
@@ -524,14 +532,14 @@ def order_visibility_presets() -> InlineKeyboardMarkup:
     for value in (5, 10, 12, 20, 50):
         builder.button(text=f"{value} сообщений", callback_data=f"order:preset:visibility:{value}")
     builder.adjust(2)
-    builder.row(InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back"))
+    builder.row(InlineKeyboardButton(text="‹ К рассылке", callback_data="order:back"))
     return builder.as_markup()
 
 
 def order_activity_check_presets() -> InlineKeyboardMarkup:
     return _order_number_presets(
         "check",
-        [(30, "30 сек"), (60, "60 сек ✓"), (120, "2 мин"), (300, "5 мин")],
+        [(30, "30 сек"), (60, "60 сек "), (120, "2 мин"), (300, "5 мин")],
     )
 
 
@@ -542,7 +550,7 @@ def order_visibility_wait_presets() -> InlineKeyboardMarkup:
             (0, "Только после порога"),
             (5, "5 мин"),
             (10, "10 мин"),
-            (15, "15 мин ✓"),
+            (15, "15 мин "),
             (30, "30 мин"),
             (60, "1 час"),
         ],
@@ -563,7 +571,7 @@ def order_sender_picker(
     for account in accounts[start : start + page_size]:
         selected = account.id in selected_ids
         builder.button(
-            text=f"{'✅' if selected else '▫️'} {account.label}",
+            text=f"{'✓' if selected else '○'} {account.label}",
             callback_data=f"order:sender:toggle:{account.id}",
         )
     builder.adjust(1)
@@ -593,7 +601,7 @@ def order_sender_picker(
         jumps: list[InlineKeyboardButton] = []
         if normalized_page > 1:
             jumps.append(
-                InlineKeyboardButton(text="⏮ В начало", callback_data="order:sender:page:0")
+                InlineKeyboardButton(text="‹‹ В начало", callback_data="order:sender:page:0")
             )
         if normalized_page > 10:
             jumps.append(
@@ -612,7 +620,7 @@ def order_sender_picker(
         if normalized_page < pages - 2:
             jumps.append(
                 InlineKeyboardButton(
-                    text="В конец ⏭",
+                    text="В конец ››",
                     callback_data=f"order:sender:page:{pages - 1}",
                 )
             )
@@ -622,14 +630,14 @@ def order_sender_picker(
         InlineKeyboardButton(text="Выбрать все", callback_data="order:sender:all"),
         InlineKeyboardButton(text="Очистить", callback_data="order:sender:clear"),
     )
-    builder.row(InlineKeyboardButton(text="✅ Готово", callback_data="order:sender:done"))
-    builder.row(InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back"))
+    builder.row(InlineKeyboardButton(text="✓ Готово", callback_data="order:sender:done"))
+    builder.row(InlineKeyboardButton(text="‹ К рассылке", callback_data="order:back"))
     return builder.as_markup()
 
 
 def order_back_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back")]]
+        inline_keyboard=[[InlineKeyboardButton(text="‹ К рассылке", callback_data="order:back")]]
     )
 
 
@@ -643,7 +651,7 @@ def order_audience_source_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"📚 Списки чатов · {list_count}",
+                    text=f"Списки чатов · {list_count}",
                     callback_data="order:audience:lists:0",
                 )
             ]
@@ -652,7 +660,7 @@ def order_audience_source_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"☑️ Выбрать чаты галочками · {standalone_count}",
+                    text=f"✓ Выбрать чаты галочками · {standalone_count}",
                     callback_data="order:audience:chats:0",
                 )
             ]
@@ -660,12 +668,12 @@ def order_audience_source_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text="📥 Создать новый список",
+                text="↓ Создать новый список",
                 callback_data="order:audience:create-list",
             )
         ]
     )
-    rows.append([InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back")])
+    rows.append([InlineKeyboardButton(text="‹ К рассылке", callback_data="order:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -678,14 +686,14 @@ def order_target_picker(
     for target in page.items:
         selected = target.id in selected_ids
         builder.button(
-            text=f"{'✅' if selected else '▫️'} {_compact_button_label(target.title, 52)}",
+            text=f"{'✓' if selected else '○'} {_compact_button_label(target.title, 52)}",
             callback_data=f"order:audience:toggle:{target.id}",
         )
     builder.adjust(1)
     _order_audience_pagination(builder, "chats", page.page, page.pages)
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Найти чат",
+            text="⌕ Найти чат",
             callback_data="order:audience:search:chats",
         )
     )
@@ -695,12 +703,12 @@ def order_target_picker(
     )
     builder.row(
         InlineKeyboardButton(
-            text=f"✅ Готово · выбрано {len(selected_ids)}",
+            text=f"✓ Готово · выбрано {len(selected_ids)}",
             callback_data="order:audience:done",
         )
     )
     builder.row(
-        InlineKeyboardButton(text="⬅️ К выбору аудитории", callback_data="order:edit:audience")
+        InlineKeyboardButton(text="‹ К выбору аудитории", callback_data="order:edit:audience")
     )
     return builder.as_markup()
 
@@ -711,7 +719,7 @@ def order_target_list_picker(page: Page[TargetListView]) -> InlineKeyboardMarkup
         status = f"{item.approved_count} чатов" if item.approved_count else "нужно включить"
         builder.button(
             text=(
-                f"{'📚' if item.approved_count else '⚪'} "
+                f"{'≡' if item.approved_count else '○'} "
                 f"{_compact_button_label(item.name, 36)} · {status}"
             ),
             callback_data=f"order:audience:list:{item.id}",
@@ -720,12 +728,12 @@ def order_target_list_picker(page: Page[TargetListView]) -> InlineKeyboardMarkup
     _order_audience_pagination(builder, "lists", page.page, page.pages)
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Найти список",
+            text="⌕ Найти список",
             callback_data="order:audience:search:lists",
         )
     )
     builder.row(
-        InlineKeyboardButton(text="⬅️ К выбору аудитории", callback_data="order:edit:audience")
+        InlineKeyboardButton(text="‹ К выбору аудитории", callback_data="order:edit:audience")
     )
     return builder.as_markup()
 
@@ -735,17 +743,17 @@ def order_target_list_activation_menu(target_list_id: int) -> InlineKeyboardMark
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="▶️ Включить доступные чаты и выбрать",
+                    text="› Включить доступные чаты и выбрать",
                     callback_data=f"order:audience:list:activate:{target_list_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К выбору аудитории",
+                    text="‹ К выбору аудитории",
                     callback_data="order:edit:audience",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К рассылке", callback_data="order:back")],
+            [InlineKeyboardButton(text="‹ К рассылке", callback_data="order:back")],
         ]
     )
 
@@ -761,13 +769,13 @@ def order_audience_search_menu(
     if results is not None:
         builder.row(
             InlineKeyboardButton(
-                text="🔎 Искать ещё",
+                text="⌕ Искать ещё",
                 callback_data=f"order:audience:search:{kind}",
             )
         )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ Вернуться к списку",
+            text="‹ Вернуться к списку",
             callback_data=f"order:audience:{kind}:0",
         )
     )
@@ -785,7 +793,7 @@ def order_engagement_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
-                text=("🟢 Реакции включены" if reactions_enabled else "⚪ Реакции выключены"),
+                text=("● Реакции включены" if reactions_enabled else "○ Реакции выключены"),
                 callback_data="order:engagement:reactions:toggle",
             )
         ],
@@ -809,20 +817,20 @@ def order_engagement_menu(data: dict[str, object]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text=(
-                    "🟢 Отметки участников включены"
+                    "● Отметки участников включены"
                     if mentions_enabled
-                    else "⚪ Отметки участников выключены"
+                    else "○ Отметки участников выключены"
                 ),
                 callback_data="order:engagement:mentions:toggle",
             )
         ],
         [
             InlineKeyboardButton(
-                text=f"🔄 Не повторять участника · {cooldown_days} дн.",
+                text=f"↻ Не повторять участника · {cooldown_days} дн.",
                 callback_data="order:engagement:mentions:cooldown",
             )
         ],
-        [InlineKeyboardButton(text="⬅️ К черновику", callback_data="order:back")],
+        [InlineKeyboardButton(text="‹ К черновику", callback_data="order:back")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -841,11 +849,11 @@ def order_mention_cooldown_menu(current_days: int) -> InlineKeyboardMarkup:
         )
     builder.row(
         InlineKeyboardButton(
-            text="✍️ Другое значение",
+            text="✎ Другое значение",
             callback_data="order:engagement:mentions:custom",
         )
     )
-    builder.row(InlineKeyboardButton(text="⬅️ К действиям", callback_data="order:engagement"))
+    builder.row(InlineKeyboardButton(text="‹ К действиям", callback_data="order:engagement"))
     return builder.as_markup()
 
 
@@ -854,19 +862,19 @@ def order_sender_mode_menu(selected_mode: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=("✅ " if selected_mode == "distributed" else "")
-                    + "🤖 Умный выбор · 1 поток на чат",
+                    text=("✓ " if selected_mode == "distributed" else "")
+                    + "≈ Умный выбор · 1 поток на чат",
                     callback_data="order:sendermode:set:distributed",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅ " if selected_mode == "independent" else "")
-                    + "🚀 Независимо · поток каждого аккаунта",
+                    text=("✓ " if selected_mode == "independent" else "")
+                    + "↗ Независимо · поток каждого аккаунта",
                     callback_data="order:sendermode:set:independent",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К черновику", callback_data="order:back")],
+            [InlineKeyboardButton(text="‹ К черновику", callback_data="order:back")],
         ]
     )
 
@@ -880,21 +888,21 @@ def campaign_sender_mode_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=("✅ " if selected_mode == "distributed" else "")
-                    + "🤖 Умный выбор · 1 поток на чат",
+                    text=("✓ " if selected_mode == "distributed" else "")
+                    + "≈ Умный выбор · 1 поток на чат",
                     callback_data=f"campaign:sendermode:set:distributed:{campaign_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅ " if selected_mode == "independent" else "")
-                    + "🚀 Независимо · поток каждого аккаунта",
+                    text=("✓ " if selected_mode == "independent" else "")
+                    + "↗ Независимо · поток каждого аккаунта",
                     callback_data=f"campaign:sendermode:set:independent:{campaign_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К рассылке",
+                    text="‹ К рассылке",
                     callback_data=f"campaign:details:{campaign_id}:{page}",
                 )
             ],
@@ -930,7 +938,7 @@ def _order_audience_pagination(
     jumps: list[InlineKeyboardButton] = []
     if page > 1:
         jumps.append(
-            InlineKeyboardButton(text="⏮ В начало", callback_data=f"order:audience:{kind}:0")
+            InlineKeyboardButton(text="‹‹ В начало", callback_data=f"order:audience:{kind}:0")
         )
     if page > 10:
         jumps.append(
@@ -949,7 +957,7 @@ def _order_audience_pagination(
     if page < pages - 2:
         jumps.append(
             InlineKeyboardButton(
-                text="В конец ⏭",
+                text="В конец ››",
                 callback_data=f"order:audience:{kind}:{pages - 1}",
             )
         )
@@ -962,34 +970,34 @@ def audiences_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📚 Списки чатов",
+                    text="Списки чатов",
                     callback_data="menu:targetlists:0",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📌 Отдельные чаты",
+                    text="· Отдельные чаты",
                     callback_data="menu:targets:0",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🚫 Исключённые чаты",
+                    text="× Исключённые чаты",
                     callback_data="target:bad:0",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📥 Создать / импортировать список",
+                    text="↓ Создать / импортировать список",
                     callback_data="target:import",
                 ),
                 InlineKeyboardButton(
-                    text="➕ Добавить чат",
+                    text="＋ Добавить чат",
                     callback_data="target:add",
                 ),
             ],
-            [InlineKeyboardButton(text="🔄 Обновить состояние", callback_data="audiences:home")],
-            [InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home")],
+            [InlineKeyboardButton(text="↻ Обновить состояние", callback_data="audiences:home")],
+            [InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home")],
         ]
     )
 
@@ -998,9 +1006,9 @@ def proxies_menu(page: ProxyPage) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     filter_labels = [
         ("all", "Все"),
-        ("healthy", "🟢 Рабочие"),
-        ("problem", "🔴 Ошибки"),
-        ("unknown", "⚪️ Новые"),
+        ("healthy", "● Рабочие"),
+        ("problem", "× Ошибки"),
+        ("unknown", "Новые"),
         ("free", "Без аккаунтов"),
     ]
     builder.row(
@@ -1022,11 +1030,11 @@ def proxies_menu(page: ProxyPage) -> InlineKeyboardMarkup:
         ]
     )
     icons = {
-        "unknown": "⚪️",
-        "healthy": "🟢",
-        "unhealthy": "🔴",
-        "quarantined": "🟠",
-        "disabled": "⏸",
+        "unknown": "◇",
+        "healthy": "●",
+        "unhealthy": "×",
+        "quarantined": "◷",
+        "disabled": "Ⅱ",
     }
     for item in page.items:
         proxy = item.proxy
@@ -1037,15 +1045,16 @@ def proxies_menu(page: ProxyPage) -> InlineKeyboardMarkup:
         )
     builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="➕ Добавить прокси", callback_data="proxy:add"),
-        InlineKeyboardButton(text="🩺 Проверить все", callback_data=f"proxy:checkall:{page.page}"),
+        InlineKeyboardButton(text="＋ Добавить прокси", callback_data="proxy:add"),
+        InlineKeyboardButton(text="⌕ Проверить все", callback_data=f"proxy:checkall:{page.page}"),
     )
     builder.row(
-        InlineKeyboardButton(text="📄 Импорт TXT", callback_data="proxy:import"),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"menu:proxies:{page.page}"),
+        InlineKeyboardButton(text="Импорт TXT", callback_data="proxy:import"),
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"menu:proxies:{page.page}"),
     )
+    builder.row(InlineKeyboardButton(text="＋ MTProto-ссылки", callback_data="proxy:mtproto"))
     _proxy_pagination(builder, page)
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -1054,10 +1063,10 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
-                text="🩺 Проверить", callback_data=f"proxy:check:{proxy.id}:{page}"
+                text="⌕ Проверить", callback_data=f"proxy:check:{proxy.id}:{page}"
             ),
             InlineKeyboardButton(
-                text="⏸ Выключить" if proxy.enabled else "▶️ Включить",
+                text="Ⅱ Выключить" if proxy.enabled else "› Включить",
                 callback_data=f"proxy:toggle:{proxy.id}:{page}",
             ),
         ]
@@ -1066,14 +1075,12 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text=(
-                    "🔑 Адрес и secret"
-                    if proxy.protocol.value == "mtproto"
-                    else "🔑 Адрес и пароль"
+                    "◇ Адрес и secret" if proxy.protocol.value == "mtproto" else "◇ Адрес и пароль"
                 ),
                 callback_data=f"proxy:edit:{proxy.id}:{page}",
             ),
             InlineKeyboardButton(
-                text="🏷 Название",
+                text="Название",
                 callback_data=f"proxy:meta:{proxy.id}:{page}",
             ),
         ]
@@ -1082,11 +1089,11 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=("🔁 Сменить IP у всех" if item.assignment_count > 1 else "🔁 Сменить IP"),
+                    text=("↻ Сменить IP у всех" if item.assignment_count > 1 else "↻ Сменить IP"),
                     callback_data=f"proxy:rotate:{proxy.id}:{page}",
                 ),
                 InlineKeyboardButton(
-                    text="🔗 Ссылка ротации",
+                    text="↗ Ссылка ротации",
                     callback_data=f"proxy:rotation:{proxy.id}:{page}",
                 ),
             ]
@@ -1095,7 +1102,7 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🔓 Снять со всех аккаунтов",
+                    text="Снять со всех аккаунтов",
                     callback_data=f"proxy:release:{proxy.id}:{page}",
                 )
             ]
@@ -1104,12 +1111,12 @@ def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить", callback_data=f"proxy:delete:ask:{proxy.id}:{page}"
+                    text="× Удалить", callback_data=f"proxy:delete:ask:{proxy.id}:{page}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К прокси",
+                    text="‹ К прокси",
                     callback_data=f"menu:proxies:{page}",
                 )
             ],
@@ -1126,7 +1133,7 @@ def campaign_variants_menu(
     rows: list[list[InlineKeyboardButton]] = []
     for index, variant in enumerate(variants, start=1):
         content_label = (
-            " · 📇 контакт"
+            " · ≡ контакт"
             if variant.contact is not None
             else f" · {len(variant.media)} медиа"
             if variant.media
@@ -1136,8 +1143,7 @@ def campaign_variants_menu(
             [
                 InlineKeyboardButton(
                     text=(
-                        f"{'🟢' if variant.enabled else '⚪️'} {index}. "
-                        f"{variant.name}{content_label}"
+                        f"{'●' if variant.enabled else '◇'} {index}. {variant.name}{content_label}"
                     ),
                     callback_data=(
                         f"campaign:variant:view:{campaign.id}:{variant.variant_id}:{page}"
@@ -1149,11 +1155,11 @@ def campaign_variants_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="➕ Текст / медиа",
+                    text="＋ Текст / медиа",
                     callback_data=f"campaign:variant:add:{campaign.id}:{page}",
                 ),
                 InlineKeyboardButton(
-                    text="📇 Контакт",
+                    text="Контакт",
                     callback_data=f"campaign:variant:contact:add:{campaign.id}:{page}",
                 ),
             ]
@@ -1161,7 +1167,7 @@ def campaign_variants_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ К рассылке",
+                text="‹ К рассылке",
                 callback_data=f"campaign:details:{campaign.id}:{page}",
             )
         ]
@@ -1179,7 +1185,7 @@ def campaign_variant_menu(
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text="👁 Отправить предпросмотр",
+                text="Отправить предпросмотр",
                 callback_data=(f"campaign:preview:{variant.variant_id}:{campaign.id}:{page}"),
             )
         ],
@@ -1188,13 +1194,13 @@ def campaign_variant_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="✏️ Изменить контакт",
+                    text="✎ Изменить контакт",
                     callback_data=(
                         f"campaign:variant:contact:edit:{campaign.id}:{variant.variant_id}:{page}"
                     ),
                 ),
                 InlineKeyboardButton(
-                    text="🏷 Название",
+                    text="Название",
                     callback_data=(
                         f"campaign:variant:rename:{campaign.id}:{variant.variant_id}:{page}"
                     ),
@@ -1205,13 +1211,13 @@ def campaign_variant_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="✏️ Изменить текст",
+                    text="✎ Изменить текст",
                     callback_data=(
                         f"campaign:variant:edit:{campaign.id}:{variant.variant_id}:{page}"
                     ),
                 ),
                 InlineKeyboardButton(
-                    text="🏷 Название",
+                    text="Название",
                     callback_data=(
                         f"campaign:variant:rename:{campaign.id}:{variant.variant_id}:{page}"
                     ),
@@ -1221,7 +1227,7 @@ def campaign_variant_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text=("⏸ Выключить вариант" if variant.enabled else "▶️ Включить вариант"),
+                text=("Ⅱ Выключить вариант" if variant.enabled else "› Включить вариант"),
                 callback_data=(
                     f"campaign:variant:toggle:{campaign.id}:{variant.variant_id}:{page}"
                 ),
@@ -1232,7 +1238,7 @@ def campaign_variant_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="➕ Добавить медиа в альбом",
+                    text="＋ Добавить медиа в альбом",
                     callback_data=(
                         f"campaign:variant:media:add:{campaign.id}:{variant.variant_id}:{page}"
                     ),
@@ -1243,7 +1249,7 @@ def campaign_variant_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"✖️ Убрать {index + 1}. {item.name[:32]}",
+                    text=f"× Убрать {index + 1}. {item.name[:32]}",
                     callback_data=(
                         "campaign:variant:media:remove:"
                         f"{campaign.id}:{variant.variant_id}:{index}:{page}"
@@ -1255,7 +1261,7 @@ def campaign_variant_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить вариант",
+                    text="× Удалить вариант",
                     callback_data=(
                         f"campaign:variant:delete:ask:{campaign.id}:{variant.variant_id}:{page}"
                     ),
@@ -1265,7 +1271,7 @@ def campaign_variant_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ Ко всем вариантам",
+                text="‹ Ко всем вариантам",
                 callback_data=f"campaign:variants:{campaign.id}:{page}",
             )
         ]
@@ -1282,7 +1288,7 @@ def campaign_variant_delete_confirmation(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить вариант",
+                    text="× Да, удалить вариант",
                     callback_data=(
                         f"campaign:variant:delete:confirm:{campaign_id}:{variant_id}:{page}"
                     ),
@@ -1290,7 +1296,7 @@ def campaign_variant_delete_confirmation(
             ],
             [
                 InlineKeyboardButton(
-                    text="✖️ Отмена",
+                    text="× Отмена",
                     callback_data=f"campaign:variant:view:{campaign_id}:{variant_id}:{page}",
                 )
             ],
@@ -1303,7 +1309,7 @@ def campaign_variant_input_cancel(campaign_id: int, page: int) -> InlineKeyboard
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✖️ Отмена",
+                    text="× Отмена",
                     callback_data=f"campaign:variants:{campaign_id}:{page}",
                 )
             ]
@@ -1316,13 +1322,13 @@ def proxy_delete_confirmation(proxy_id: int, page: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить",
+                    text="× Да, удалить",
                     callback_data=f"proxy:delete:confirm:{proxy_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить", callback_data=f"proxy:details:{proxy_id}:{page}"
+                    text="‹ Нет, оставить", callback_data=f"proxy:details:{proxy_id}:{page}"
                 )
             ],
         ]
@@ -1334,13 +1340,13 @@ def proxy_groups_menu(groups: list[ProxyGroup]) -> InlineKeyboardMarkup:
     for group in groups:
         builder.row(
             InlineKeyboardButton(
-                text=f"🗂 {group.name}",
+                text=f"{group.name}",
                 callback_data=f"proxy:groupfilter:{group.id}:0",
             ),
-            InlineKeyboardButton(text="🗑", callback_data=f"proxy:group:delete:ask:{group.id}"),
+            InlineKeyboardButton(text="×", callback_data=f"proxy:group:delete:ask:{group.id}"),
         )
-    builder.row(InlineKeyboardButton(text="➕ Создать группу", callback_data="proxy:group:add"))
-    builder.row(InlineKeyboardButton(text="⬅️ К прокси", callback_data="menu:proxies:0"))
+    builder.row(InlineKeyboardButton(text="＋ Создать группу", callback_data="proxy:group:add"))
+    builder.row(InlineKeyboardButton(text="‹ К прокси", callback_data="menu:proxies:0"))
     return builder.as_markup()
 
 
@@ -1349,7 +1355,7 @@ _ACCOUNT_FILTER_BUTTONS: tuple[tuple[AccountListFilter, str], ...] = (
     (AccountListFilter.READY, "Сессия проверена"),
     (AccountListFilter.NEEDS_ATTENTION, "Нужно внимание"),
     (AccountListFilter.PROFILE_INCOMPLETE, "Профиль не оформлен"),
-    (AccountListFilter.PREMIUM, "⭐ Premium"),
+    (AccountListFilter.PREMIUM, "☆ Premium"),
     (AccountListFilter.ORDINARY, "Обычные"),
     (AccountListFilter.UNKNOWN, "Premium не проверен"),
     (AccountListFilter.PAUSED, "На паузе"),
@@ -1453,18 +1459,15 @@ def accounts_menu(
         )
     builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="── Навигация ──", callback_data="noop"),
-    )
-    builder.row(
         InlineKeyboardButton(
-            text=f"🎛 {account_filter_label(normalized_filter)}",
+            text=f"{account_filter_label(normalized_filter)}",
             callback_data=(
                 f"account:filters:{account_filter_callback_code(normalized_filter)}:"
                 f"{scope}:{page.page}"
             ),
         ),
         InlineKeyboardButton(
-            text="🗂 Группы",
+            text="Группы",
             callback_data=(
                 f"account:groups:{account_filter_callback_code(normalized_filter)}:"
                 f"{scope}:{page.page}"
@@ -1472,46 +1475,43 @@ def accounts_menu(
         ),
     )
     builder.row(
-        InlineKeyboardButton(text="── Проверка ──", callback_data="noop"),
-    )
-    builder.row(
         InlineKeyboardButton(
-            text="🔍 Проверить сессии",
+            text="⌕ Проверить сессии",
             callback_data=f"account:check:all:{page.page}",
         ),
         InlineKeyboardButton(
-            text="🛡 Проверить @SpamBot",
+            text="Проверить @SpamBot",
             callback_data=f"account:spambot:all:{page.page}",
         ),
     )
     builder.row(
-        InlineKeyboardButton(text="── Оформление профиля ──", callback_data="noop"),
-    )
-    builder.row(
         InlineKeyboardButton(
-            text="🎲 Имена",
+            text="⇄ Имена",
             callback_data="account:names:menu",
         ),
         InlineKeyboardButton(
-            text="📝 Описания",
+            text="Описания",
             callback_data="account:about:bulk",
         ),
     )
     builder.row(
         InlineKeyboardButton(
-            text="🖼 Аватары",
+            text="Аватары",
             callback_data="account:avatars:bulk",
         )
     )
     builder.row(
-        InlineKeyboardButton(text="── Добавление ──", callback_data="noop"),
+        InlineKeyboardButton(
+            text="↓ Импорт",
+            callback_data=f"account:import:menu:{page.page}",
+        ),
+        InlineKeyboardButton(text="＋ Без сессии", callback_data="account:add"),
     )
     builder.row(
         InlineKeyboardButton(
-            text="📥 Импорт",
-            callback_data=f"account:import:menu:{page.page}",
-        ),
-        InlineKeyboardButton(text="➕ Без сессии", callback_data="account:add"),
+            text="× Удалить невалидные сессии",
+            callback_data=f"account:check:purge:ask:{page.page}",
+        )
     )
     _account_pagination(
         builder,
@@ -1521,11 +1521,11 @@ def accounts_menu(
     )
     builder.row(
         InlineKeyboardButton(
-            text="🔄 Обновить список",
+            text="↻ Обновить список",
             callback_data=account_browse_data(normalized_filter, group_id, page.page),
         )
     )
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -1546,7 +1546,7 @@ def account_filters_menu(
     builder.adjust(2, 1, 2, 1, 2, 1)
     builder.row(
         InlineKeyboardButton(
-            text="← К списку",
+            text="‹ К списку",
             callback_data=account_browse_data(normalized, group_id, page),
         )
     )
@@ -1565,20 +1565,20 @@ def account_groups_menu(
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text=("✓ Все группы" if group_id is None else "Все группы"),
+            text=("Все группы" if group_id is None else "Все группы"),
             callback_data=account_browse_data(normalized, None, 0),
         ),
         InlineKeyboardButton(
-            text=("✓ Без группы" if group_id == 0 else "Без группы"),
+            text=("Без группы" if group_id == 0 else "Без группы"),
             callback_data=account_browse_data(normalized, 0, 0),
         ),
     )
     for item in groups:
         marker = "✓ " if group_id == item.id else ""
-        icon = "⭐" if item.is_system else "🗂"
+        icon = "☆" if item.is_system else "≡"
         settings_button = (
             InlineKeyboardButton(
-                text="ℹ️" if item.is_system else "⚙️",
+                text="ℹ️" if item.is_system else "≡",
                 callback_data=(
                     f"account:group:view:{item.id}:{account_filter_callback_code(normalized)}:"
                     f"{scope}:{page}"
@@ -1596,7 +1596,7 @@ def account_groups_menu(
         )
     builder.row(
         InlineKeyboardButton(
-            text="➕ Создать группу",
+            text="＋ Создать группу",
             callback_data=(
                 f"account:group:add:list:{account_filter_callback_code(normalized)}:{scope}:{page}"
             ),
@@ -1604,7 +1604,7 @@ def account_groups_menu(
     )
     builder.row(
         InlineKeyboardButton(
-            text="← К аккаунтам",
+            text="‹ К аккаунтам",
             callback_data=account_browse_data(normalized, group_id, page),
         )
     )
@@ -1627,7 +1627,7 @@ def account_group_details_menu(
             [
                 [
                     InlineKeyboardButton(
-                        text="👥 Настроить состав",
+                        text="○ Настроить состав",
                         callback_data=(
                             f"account:group:members:{group_id}:"
                             f"{account_filter_callback_code(normalized)}:0"
@@ -1636,7 +1636,7 @@ def account_group_details_menu(
                 ],
                 [
                     InlineKeyboardButton(
-                        text="✏️ Название и описание",
+                        text="✎ Название и описание",
                         callback_data=(
                             f"account:group:edit:{group_id}:{account_filter_callback_code(normalized)}:"
                             f"{scope}:{page}"
@@ -1645,7 +1645,7 @@ def account_group_details_menu(
                 ],
                 [
                     InlineKeyboardButton(
-                        text="🗑 Удалить только группу",
+                        text="× Удалить только группу",
                         callback_data=(
                             f"account:group:delete:ask:{group_id}:"
                             f"{account_filter_callback_code(normalized)}:{scope}:{page}"
@@ -1657,7 +1657,7 @@ def account_group_details_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text="← К группам",
+                text="‹ К группам",
                 callback_data=(
                     f"account:groups:{account_filter_callback_code(normalized)}:{scope}:{page}"
                 ),
@@ -1679,7 +1679,7 @@ def account_group_members_menu(
     for account in page.items:
         selected = account.id in selected_account_ids
         builder.button(
-            text=f"{'☑️' if selected else '◻️'} {_compact_button_label(account.label, 37)}",
+            text=f"{'✓' if selected else '◻️'} {_compact_button_label(account.label, 37)}",
             callback_data=(
                 f"account:group:member:toggle:{group_id}:{account.id}:"
                 f"{account_filter_callback_code(normalized)}:{page.page}"
@@ -1688,7 +1688,7 @@ def account_group_members_menu(
     builder.adjust(1)
     builder.row(
         InlineKeyboardButton(
-            text="✓ Выбрать страницу",
+            text="Выбрать страницу",
             callback_data=(
                 f"account:group:member:page:on:{group_id}:"
                 f"{account_filter_callback_code(normalized)}:{page.page}"
@@ -1730,7 +1730,7 @@ def account_group_members_menu(
         builder.row(*navigation)
     builder.row(
         InlineKeyboardButton(
-            text="🎛 Фильтр аккаунтов",
+            text="Фильтр аккаунтов",
             callback_data=(
                 f"account:group:member:filters:{group_id}:"
                 f"{account_filter_callback_code(normalized)}:{page.page}"
@@ -1739,7 +1739,7 @@ def account_group_members_menu(
     )
     builder.row(
         InlineKeyboardButton(
-            text="← К группе",
+            text="‹ К группе",
             callback_data=(
                 f"account:group:view:{group_id}:{account_filter_callback_code(normalized)}:all:0"
             ),
@@ -1767,7 +1767,7 @@ def account_group_member_filters_menu(
     builder.adjust(2, 1, 2, 1, 2, 1)
     builder.row(
         InlineKeyboardButton(
-            text="← К составу",
+            text="‹ К составу",
             callback_data=(
                 f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:{page}"
             ),
@@ -1794,7 +1794,7 @@ def account_membership_menu(
         selected = group.id in selected_group_ids
         builder.row(
             InlineKeyboardButton(
-                text=("☑️ " if selected else "◻️ ") + _compact_button_label(group.name, 42),
+                text=("✓ " if selected else "◻️ ") + _compact_button_label(group.name, 42),
                 callback_data=(
                     f"am:t:{account_id}:{group.id}:{account_filter_callback_code(normalized)}:"
                     f"{scope}:{page}"
@@ -1804,7 +1804,7 @@ def account_membership_menu(
     if not groups:
         builder.row(
             InlineKeyboardButton(
-                text="➕ Создать первую группу",
+                text="＋ Создать первую группу",
                 callback_data=(
                     f"account:group:add:member:{account_id}:"
                     f"{account_filter_callback_code(normalized)}:{scope}:{page}"
@@ -1814,7 +1814,7 @@ def account_membership_menu(
     else:
         builder.row(
             InlineKeyboardButton(
-                text="➕ Создать группу",
+                text="＋ Создать группу",
                 callback_data=(
                     f"account:group:add:member:{account_id}:"
                     f"{account_filter_callback_code(normalized)}:{scope}:{page}"
@@ -1823,7 +1823,7 @@ def account_membership_menu(
         )
     builder.row(
         InlineKeyboardButton(
-            text="← К карточке аккаунта",
+            text="‹ К карточке аккаунта",
             callback_data=(
                 f"account:view:{account_id}:{account_filter_callback_code(normalized)}:"
                 f"{scope}:{page}"
@@ -1846,7 +1846,7 @@ def account_group_delete_confirmation(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить группу",
+                    text="× Да, удалить группу",
                     callback_data=(
                         f"account:group:delete:confirm:{group_id}:"
                         f"{account_filter_callback_code(normalized)}:"
@@ -1856,7 +1856,7 @@ def account_group_delete_confirmation(
             ],
             [
                 InlineKeyboardButton(
-                    text="← Оставить группу",
+                    text="‹ Оставить группу",
                     callback_data=(
                         f"account:group:view:{group_id}:{account_filter_callback_code(normalized)}:"
                         f"{scope}:{page}"
@@ -1877,28 +1877,28 @@ def account_bulk_check_menu(
     if revoked_accounts:
         builder.row(
             InlineKeyboardButton(
-                text=f"🧹 Удалить все точно невалидные ({len(revoked_accounts)})",
+                text=f"× Удалить все точно невалидные ({len(revoked_accounts)})",
                 callback_data=f"account:check:purge:ask:{page}",
             )
         )
     for account_id, label in revoked_accounts[:12]:
         builder.row(
             InlineKeyboardButton(
-                text=f"🗑 Удалить · {_compact_button_label(label, 34)}",
+                text=f"× Удалить · {_compact_button_label(label, 34)}",
                 callback_data=f"account:delete:ask:{account_id}:{page}",
             )
         )
     builder.row(
         InlineKeyboardButton(
-            text="🔁 Повторить быструю проверку",
+            text="↻ Повторить быструю проверку",
             callback_data=f"account:check:all:{page}",
         ),
         InlineKeyboardButton(
-            text="🛡 Проверить @SpamBot",
+            text="Проверить @SpamBot",
             callback_data=f"account:spambot:all:{page}",
         ),
     )
-    builder.row(InlineKeyboardButton(text="← К аккаунтам", callback_data=f"menu:accounts:{page}"))
+    builder.row(InlineKeyboardButton(text="‹ К аккаунтам", callback_data=f"menu:accounts:{page}"))
     return builder.as_markup()
 
 
@@ -1907,38 +1907,35 @@ def account_bulk_spambot_menu(page: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔁 Проверить @SpamBot снова",
+                    text="↻ Проверить @SpamBot снова",
                     callback_data=f"account:spambot:all:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔍 Проверить сессии",
+                    text="⌕ Проверить сессии",
                     callback_data=f"account:check:all:{page}",
                 )
             ],
-            [InlineKeyboardButton(text="← К аккаунтам", callback_data=f"menu:accounts:{page}")],
+            [InlineKeyboardButton(text="‹ К аккаунтам", callback_data=f"menu:accounts:{page}")],
         ]
     )
 
 
-def account_bulk_cleanup_confirmation(page: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🧹 Да, перепроверить и очистить",
-                    callback_data=f"account:check:purge:confirm:{page}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="← Вернуться к результатам",
-                    callback_data=f"account:check:all:{page}",
-                )
-            ],
-        ]
-    )
+def account_bulk_cleanup_confirmation(
+    page: int, *, token: str | None = None, count: int | None = None
+) -> InlineKeyboardMarkup:
+    rows = []
+    if count != 0:
+        rows.append([InlineKeyboardButton(
+            text=f"× Перепроверить и удалить ({count})" if count is not None
+            else "× Да, перепроверить и очистить",
+            callback_data=f"account:check:purge:confirm:{page}" + (f":{token}" if token else ""),
+        )])
+    rows.append([InlineKeyboardButton(
+        text="‹ К аккаунтам", callback_data=f"menu:accounts:{page}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def account_bulk_cleanup_result_menu(page: int) -> InlineKeyboardMarkup:
@@ -1946,11 +1943,11 @@ def account_bulk_cleanup_result_menu(page: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔁 Проверить сессии снова",
+                    text="↻ Проверить сессии снова",
                     callback_data=f"account:check:all:{page}",
                 )
             ],
-            [InlineKeyboardButton(text="← К аккаунтам", callback_data=f"menu:accounts:{page}")],
+            [InlineKeyboardButton(text="‹ К аккаунтам", callback_data=f"menu:accounts:{page}")],
         ]
     )
 
@@ -1963,35 +1960,35 @@ def account_import_sources_menu(page: int = 0) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📥 TData из Telegram Desktop (.zip)",
+                    text="↓ TData из Telegram Desktop (.zip)",
                     callback_data=f"account:import:tdata:{source_page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🗂 Файл .session (Telethon / Pyrogram)",
+                    text="Файл .session (Telethon / Pyrogram)",
                     callback_data=f"account:import:session:{source_page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📦 ZIP с несколькими аккаунтами",
+                    text="ZIP с несколькими аккаунтами",
                     callback_data=f"account:import:archive:{source_page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📄 JSON сессии",
+                    text="JSON сессии",
                     callback_data=f"account:import:json:{source_page}",
                 ),
                 InlineKeyboardButton(
-                    text="🔑 Строка сессии",
+                    text="Строка сессии",
                     callback_data=f"account:import:string:{source_page}",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К аккаунтам",
+                    text="‹ К аккаунтам",
                     callback_data=f"menu:accounts:{source_page}",
                 )
             ],
@@ -2005,13 +2002,13 @@ def account_import_result_menu(page: int = 0) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📦 Импортировать ещё архив",
+                    text="Импортировать ещё архив",
                     callback_data=f"account:import:archive:{source_page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К аккаунтам",
+                    text="‹ К аккаунтам",
                     callback_data=f"menu:accounts:{source_page}",
                 )
             ],
@@ -2054,47 +2051,47 @@ def account_details_menu(
     )
     builder.row(
         InlineKeyboardButton(
-            text="🏷 Название в боте",
+            text="Название в панели",
             callback_data=f"account:label:edit:{account.id}:{page}",
         )
     )
     if groups_callback is not None:
         builder.row(
             InlineKeyboardButton(
-                text="🗂 Группы аккаунта",
+                text="Группы аккаунта",
                 callback_data=groups_callback,
             )
         )
     if has_session:
         builder.row(
             InlineKeyboardButton(
-                text="🩺 Проверить сессию + @SpamBot",
+                text="Проверить сессию и SpamBot",
                 callback_data=f"account:check:{account.id}:{page}",
             )
         )
         builder.row(
             InlineKeyboardButton(
-                text="✏️ Имя Telegram",
+                text="✎ Имя Telegram",
                 callback_data=f"account:name:edit:{account.id}:{page}",
             ),
             InlineKeyboardButton(
-                text="🎲 Имя Telegram из каталога",
+                text="Имя из базы",
                 callback_data=f"account:name:catalog:{account.id}:{page}",
             ),
         )
         builder.row(
             InlineKeyboardButton(
-                text="🖼 Аватар Telegram",
+                text="Аватар Telegram",
                 callback_data=f"account:avatar:menu:{account.id}:{page}",
             ),
             InlineKeyboardButton(
-                text="📝 Описание",
+                text="Описание",
                 callback_data=f"account:about:edit:{account.id}:{page}",
             ),
         )
     if has_session:
         proxy_button = InlineKeyboardButton(
-            text="🔓 Убрать прокси" if has_proxy else "🌐 Назначить прокси",
+            text="Убрать прокси" if has_proxy else "⇄ Назначить прокси",
             callback_data=(
                 f"account:proxy:release:{account.id}:{page}"
                 if has_proxy
@@ -2108,7 +2105,7 @@ def account_details_menu(
         else:
             builder.row(
                 InlineKeyboardButton(
-                    text="⏸ Пауза" if account.status.value == "active" else "▶️ Включить",
+                    text="Ⅱ Пауза" if account.status.value == "active" else "› Включить",
                     callback_data=f"account:toggle:{account.id}:{page}",
                 ),
                 proxy_button,
@@ -2117,9 +2114,9 @@ def account_details_menu(
         builder.row(
             InlineKeyboardButton(
                 text=(
-                    f"🔁 Сменить IP у всех ({shared_proxy_accounts})"
+                    f"↻ Сменить IP у всех ({shared_proxy_accounts})"
                     if shared_proxy_accounts > 1
-                    else "🔁 Сменить IP"
+                    else "↻ Сменить IP"
                 ),
                 callback_data=f"account:proxy:rotate:{account.id}:{page}",
             )
@@ -2127,18 +2124,18 @@ def account_details_menu(
     if has_session:
         builder.row(
             InlineKeyboardButton(
-                text="🔐 Стереть сессию и доступ",
+                text="Стереть сессию и доступ",
                 callback_data=f"account:session:ask:{account.id}:{page}",
             )
         )
     builder.row(
         InlineKeyboardButton(
-            text="🗑 Удалить запись", callback_data=f"account:delete:ask:{account.id}:{page}"
+            text="× Удалить запись", callback_data=f"account:delete:ask:{account.id}:{page}"
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К аккаунтам",
+            text="‹ К аккаунтам",
             callback_data=back_callback or f"menu:accounts:{page}",
         )
     )
@@ -2150,13 +2147,13 @@ def account_delete_confirmation(account_id: int, page: int) -> InlineKeyboardMar
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить и стереть сессию",
+                    text="× Да, удалить и стереть сессию",
                     callback_data=f"account:delete:confirm:{account_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=f"account:details:{account_id}:{page}",
                 )
             ],
@@ -2167,10 +2164,10 @@ def account_delete_confirmation(account_id: int, page: int) -> InlineKeyboardMar
 def account_delete_blocked_menu(account_id: int, page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 К запускам", callback_data="menu:runs:0")],
+            [InlineKeyboardButton(text="К запускам", callback_data="menu:runs:0")],
             [
                 InlineKeyboardButton(
-                    text="← К аккаунту",
+                    text="‹ К аккаунту",
                     callback_data=f"account:details:{account_id}:{page}",
                 )
             ],
@@ -2183,13 +2180,13 @@ def account_session_clear_confirmation(account_id: int, page: int) -> InlineKeyb
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔐 Да, стереть доступ",
+                    text="Да, стереть доступ",
                     callback_data=f"account:session:confirm:{account_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=f"account:details:{account_id}:{page}",
                 )
             ],
@@ -2202,11 +2199,11 @@ def account_name_confirmation(account_id: int, page: int) -> InlineKeyboardMarku
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Изменить имя Telegram",
+                    text="✓ Изменить имя Telegram",
                     callback_data=f"account:name:confirm:{account_id}:{page}",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -2216,11 +2213,11 @@ def account_about_confirmation(account_id: int, page: int) -> InlineKeyboardMark
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Сохранить описание",
+                    text="✓ Сохранить описание",
                     callback_data=f"account:about:confirm:{account_id}:{page}",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -2235,15 +2232,15 @@ def account_about_bulk_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"✍️ Установить{target}", callback_data="account:about:bulk:set"
+                    text=f"✎ Установить{target}", callback_data="account:about:bulk:set"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=f"🧹 Очистить{target}", callback_data="account:about:bulk:clear:ask"
+                    text=f"× Очистить{target}", callback_data="account:about:bulk:clear:ask"
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ Выбрать область", callback_data=back_callback)],
+            [InlineKeyboardButton(text="‹ Выбрать область", callback_data=back_callback)],
         ]
     )
 
@@ -2259,11 +2256,11 @@ def account_about_bulk_result_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📝 Изменить описания ещё раз",
+                    text="Изменить описания ещё раз",
                     callback_data="account:about:bulk",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="menu:accounts:0")],
+            [InlineKeyboardButton(text="‹ К аккаунтам", callback_data="menu:accounts:0")],
         ]
     )
 
@@ -2274,7 +2271,7 @@ def account_about_bulk_confirmation(
     scope_label: str | None = None,
 ) -> InlineKeyboardMarkup:
     target = f" · {_compact_button_label(scope_label, 22)}" if scope_label else " у всех"
-    label = ("🧹 Да, очистить" if clear else "✅ Установить") + target
+    label = ("× Да, очистить" if clear else "✓ Установить") + target
     action = "clear" if clear else "apply"
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2283,7 +2280,7 @@ def account_about_bulk_confirmation(
                     text=label, callback_data=f"account:about:bulk:{action}:confirm"
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="account:about:bulk")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="account:about:bulk")],
         ]
     )
 
@@ -2319,14 +2316,14 @@ def account_profile_scope_menu(
     normalized_ready_count = max(0, int(ready_count))
     builder.row(
         InlineKeyboardButton(
-            text=f"👥 Все готовые · {normalized_ready_count}",
+            text=f"○ Все готовые · {normalized_ready_count}",
             callback_data=_profile_scope_callback(operation, "all"),
         )
     )
     for group in groups:
         if group.ready_count <= 0:
             continue
-        icon = "⭐" if group.is_system else "🗂"
+        icon = "☆" if group.is_system else "≡"
         builder.row(
             InlineKeyboardButton(
                 text=(
@@ -2335,7 +2332,7 @@ def account_profile_scope_menu(
                 callback_data=_profile_scope_callback(operation, f"group:{group.id}"),
             )
         )
-    builder.row(InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data=back_callback))
+    builder.row(InlineKeyboardButton(text="‹ К аккаунтам", callback_data=back_callback))
     return builder.as_markup()
 
 
@@ -2350,12 +2347,12 @@ def account_name_catalog_menu(
     back = back_callback or (
         f"account:details:{account_id}:{page}" if account_id else f"menu:accounts:{page}"
     )
-    back_label = f"⬅️ {_compact_button_label(scope_label, 34)}" if scope_label else "⬅️ Назад"
+    back_label = f"‹ {_compact_button_label(scope_label, 34)}" if scope_label else "‹ Назад"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🎲 Смешанные · рекомендуется",
+                    text="⇄ Смешанные · рекомендуется",
                     callback_data=f"account:names:preview:mixed{suffix}",
                 )
             ],
@@ -2365,7 +2362,7 @@ def account_name_catalog_menu(
                     callback_data=f"account:names:preview:ru{suffix}",
                 ),
                 InlineKeyboardButton(
-                    text="🌍 Латиницей",
+                    text="◎ Латиницей",
                     callback_data=f"account:names:preview:en{suffix}",
                 ),
             ],
@@ -2385,18 +2382,18 @@ def account_generated_names_confirmation(
 ) -> InlineKeyboardMarkup:
     retry = retry_callback or f"account:names:preview:{locale}:{account_id}:{page}"
     back = back_callback or "fsm:cancel"
-    back_label = f"⬅️ {_compact_button_label(scope_label, 34)}" if scope_label else "✖️ Отмена"
+    back_label = f"‹ {_compact_button_label(scope_label, 34)}" if scope_label else "× Отмена"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Применить в Telegram",
+                    text="✓ Применить в Telegram",
                     callback_data="account:names:apply",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🎲 Другие варианты",
+                    text="⇄ Другие варианты",
                     callback_data=retry,
                 )
             ],
@@ -2414,7 +2411,7 @@ def account_avatar_menu(
     rows = [
         [
             InlineKeyboardButton(
-                text="📤 Загрузить новый аватар",
+                text="↑ Загрузить новый аватар",
                 callback_data=f"account:avatar:upload:{account_id}:{page}",
             )
         ]
@@ -2422,7 +2419,7 @@ def account_avatar_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text=("🗑 Удалить все аватары" if has_avatar else "🧹 Очистить аватары в Telegram"),
+                text=("× Удалить все аватары" if has_avatar else "× Очистить аватары в Telegram"),
                 callback_data=f"account:avatar:delete:ask:{account_id}:{page}",
             )
         ]
@@ -2430,7 +2427,7 @@ def account_avatar_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ К аккаунту",
+                text="‹ К аккаунту",
                 callback_data=f"account:details:{account_id}:{page}",
             )
         ]
@@ -2443,13 +2440,13 @@ def account_avatar_delete_confirmation(account_id: int, page: int) -> InlineKeyb
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить все аватары",
+                    text="× Да, удалить все аватары",
                     callback_data=f"account:avatar:delete:confirm:{account_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=f"account:avatar:menu:{account_id}:{page}",
                 )
             ],
@@ -2464,7 +2461,7 @@ def account_bulk_avatar_upload_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✖️ Отмена",
+                    text="× Отмена",
                     callback_data="account:avatars:bulk:cancel",
                 )
             ]
@@ -2479,13 +2476,13 @@ def account_bulk_avatar_confirmation(*, count: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"✅ Установить на {max(0, int(count))} аккаунтов",
+                    text=f"✓ Установить на {max(0, int(count))} аккаунтов",
                     callback_data="account:avatars:bulk:apply",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✖️ Отмена",
+                    text="× Отмена",
                     callback_data="account:avatars:bulk:cancel",
                 )
             ],
@@ -2498,11 +2495,11 @@ def account_bulk_avatar_result_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🖼 Ещё аватары",
+                    text="Ещё аватары",
                     callback_data="account:avatars:bulk",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="menu:accounts:0")],
+            [InlineKeyboardButton(text="‹ К аккаунтам", callback_data="menu:accounts:0")],
         ]
     )
 
@@ -2513,18 +2510,18 @@ def _account_icon(account: Account) -> str:
     # transient object as the normal active default instead of crashing the UI.
     status = getattr(account.status, "value", "active")
     if status != "active":
-        return "⏸"
+        return "Ⅱ"
     if _account_source_value(account) == "none":
-        return "📄"
+        return "▤"
     if not getattr(account, "authorized", False):
-        return "🟡"
+        return "◷"
     if (
         not (getattr(account, "first_name", None) or "").strip()
         or not getattr(account, "has_profile_photo", False)
         or not (getattr(account, "about", None) or "").strip()
     ):
-        return "🧩"
-    return "🟢"
+        return "≡"
+    return "●"
 
 
 def proxy_group_delete_confirmation(group_id: int) -> InlineKeyboardMarkup:
@@ -2532,11 +2529,11 @@ def proxy_group_delete_confirmation(group_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить только группу",
+                    text="× Удалить только группу",
                     callback_data=f"proxy:group:delete:confirm:{group_id}",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="proxy:groups")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="proxy:groups")],
         ]
     )
 
@@ -2545,13 +2542,13 @@ def targets_menu(page: Page[Target]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for target in page.items:
         icon = (
-            "🚫"
+            "×"
             if target.quality_status == "bad"
-            else "🔴"
+            else "×"
             if target.last_error_code
-            else "🟢"
+            else "●"
             if target.approved_by_operator
-            else "⚪️"
+            else "◇"
         )
         builder.button(
             text=f"{icon} {_compact_button_label(target.title, 54)}",
@@ -2559,25 +2556,25 @@ def targets_menu(page: Page[Target]) -> InlineKeyboardMarkup:
         )
     builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="➕ Добавить чат", callback_data="target:add"),
-        InlineKeyboardButton(text="🔎 Найти", callback_data="search:start:targets"),
+        InlineKeyboardButton(text="＋ Добавить чат", callback_data="target:add"),
+        InlineKeyboardButton(text="⌕ Найти", callback_data="search:start:targets"),
     )
     if page.total:
         builder.row(
             InlineKeyboardButton(
-                text="▶️ Включить все доступные",
+                text="› Включить все доступные",
                 callback_data=f"targets:bulk:approve:{page.page}",
             ),
             InlineKeyboardButton(
-                text="⏸ Выключить все",
+                text="Ⅱ Выключить все",
                 callback_data=f"targets:bulk:revoke:{page.page}",
             ),
         )
     _pagination(builder, "targets", page.page, page.pages)
     builder.row(
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"menu:targets:{page.page}")
+        InlineKeyboardButton(text="↻ Обновить список", callback_data=f"menu:targets:{page.page}")
     )
-    builder.row(InlineKeyboardButton(text="⬅️ К чатам и спискам", callback_data="audiences:home"))
+    builder.row(InlineKeyboardButton(text="‹ К чатам и спискам", callback_data="audiences:home"))
     return builder.as_markup()
 
 
@@ -2586,7 +2583,7 @@ def target_details_menu(target: Target, page: int) -> InlineKeyboardMarkup:
     state_row = (
         [
             InlineKeyboardButton(
-                text="♻️ Вернуть чат в работу",
+                text="↻ Вернуть чат в работу",
                 callback_data=f"target:quality:restore:{target.id}:{page}:targets",
             )
         ]
@@ -2594,7 +2591,7 @@ def target_details_menu(target: Target, page: int) -> InlineKeyboardMarkup:
         else [
             InlineKeyboardButton(
                 text=(
-                    "⏸ Не использовать чат" if target.approved_by_operator else "▶️ Использовать чат"
+                    "Ⅱ Не использовать чат" if target.approved_by_operator else "› Использовать чат"
                 ),
                 callback_data=f"target:{action}:{target.id}:{page}",
             )
@@ -2604,26 +2601,26 @@ def target_details_menu(target: Target, page: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🕒 Интервал сообщений",
+                    text="◷ Интервал сообщений",
                     callback_data=f"target:cooldown:{target.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="♻️ Сбросить память банов",
+                    text="↻ Сбросить память банов",
                     callback_data=f"target:unblock:{target.id}:{page}",
                 )
             ],
             state_row,
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить чат",
+                    text="× Удалить чат",
                     callback_data=f"target:delete:ask:{target.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К отдельным чатам", callback_data=f"menu:targets:{page}"
+                    text="‹ К отдельным чатам", callback_data=f"menu:targets:{page}"
                 )
             ],
         ]
@@ -2634,12 +2631,12 @@ def bad_targets_menu(page: Page[Target]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for target in page.items:
         builder.button(
-            text=f"🚫 {target.title} · {target.quality_score}/100",
+            text=f"× {target.title} · {target.quality_score}/100",
             callback_data=f"target:bad:details:{target.id}:{page.page}",
         )
     builder.adjust(1)
     _pagination(builder, "badtargets", page.page, page.pages)
-    builder.row(InlineKeyboardButton(text="⬅️ К чатам и спискам", callback_data="audiences:home"))
+    builder.row(InlineKeyboardButton(text="‹ К чатам и спискам", callback_data="audiences:home"))
     return builder.as_markup()
 
 
@@ -2648,13 +2645,13 @@ def bad_target_details_menu(target: Target, page: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="♻️ Вернуть чат в работу",
+                    text="↻ Вернуть чат в работу",
                     callback_data=f"target:quality:restore:{target.id}:{page}:bad",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К исключённым чатам",
+                    text="‹ К исключённым чатам",
                     callback_data=f"target:bad:{page}",
                 )
             ],
@@ -2677,7 +2674,7 @@ def target_cooldown_picker() -> InlineKeyboardMarkup:
             callback_data=f"tcooldown:set:{minutes}",
         )
     builder.adjust(1, 2, 3)
-    builder.row(InlineKeyboardButton(text="✖️ Отменить изменения", callback_data="tcooldown:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отменить изменения", callback_data="tcooldown:cancel"))
     return builder.as_markup()
 
 
@@ -2686,13 +2683,13 @@ def target_delete_confirmation(target_id: int, page: int) -> InlineKeyboardMarku
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить чат",
+                    text="× Да, удалить чат",
                     callback_data=f"target:delete:confirm:{target_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить", callback_data=f"target:details:{target_id}:{page}"
+                    text="‹ Нет, оставить", callback_data=f"target:details:{target_id}:{page}"
                 )
             ],
         ]
@@ -2702,31 +2699,31 @@ def target_delete_confirmation(target_id: int, page: int) -> InlineKeyboardMarku
 def campaigns_menu(page: Page[Campaign]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for campaign in page.items:
-        icon = "📢" if getattr(campaign.mode, "value", "dialogue") == "broadcast" else "💬"
-        status = "" if campaign.enabled else " · ⏸"
+        icon = "≡" if getattr(campaign.mode, "value", "dialogue") == "broadcast" else "↳"
+        status = "" if campaign.enabled else " · Ⅱ"
         builder.button(
             text=f"{icon} {campaign.name}{status}",
             callback_data=f"campaign:details:{campaign.id}:{page.page}",
         )
     builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="🚀 Новая рассылка", callback_data="order:draft:broadcast"),
-        InlineKeyboardButton(text="💬 Новый диалог", callback_data="order:draft:dialogue"),
+        InlineKeyboardButton(text="↗ Новая рассылка", callback_data="order:draft:broadcast"),
+        InlineKeyboardButton(text="↳ Новый диалог", callback_data="order:draft:dialogue"),
     )
     builder.row(
-        InlineKeyboardButton(text="🔎 Найти рассылку", callback_data="search:start:campaigns")
+        InlineKeyboardButton(text="⌕ Найти рассылку", callback_data="search:start:campaigns")
     )
     builder.row(
-        InlineKeyboardButton(text="📊 Запуски и результаты", callback_data="menu:runs:0"),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"menu:campaigns:{page.page}"),
+        InlineKeyboardButton(text="Запуски и результаты", callback_data="menu:runs:0"),
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"menu:campaigns:{page.page}"),
     )
     builder.row(
         InlineKeyboardButton(
-            text="🛑 Остановить текущие отправки", callback_data="campaign:stopall:ask"
+            text="Ⅱ Остановить текущие отправки", callback_data="campaign:stopall:ask"
         )
     )
     _pagination(builder, "campaigns", page.page, page.pages)
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -2736,7 +2733,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🚀 Проверить и перейти к запуску",
+                    text="↗ Проверить и перейти к запуску",
                     callback_data=f"campaign:run:ask:{campaign.id}:{page}",
                 )
             ]
@@ -2744,7 +2741,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
     rows.append(
         [
             InlineKeyboardButton(
-                text="🩺 Проверить доступ без запуска",
+                text="⌕ Проверить доступ без запуска",
                 callback_data=f"campaign:preflight:{campaign.id}:{page}",
             )
         ]
@@ -2768,9 +2765,9 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
             [
                 InlineKeyboardButton(
                     text=(
-                        "🚀 Независимые потоки аккаунтов"
+                        "↗ Независимые потоки аккаунтов"
                         if independent
-                        else "🤖 Умный выбор · 1 поток на чат"
+                        else "≈ Умный выбор · 1 поток на чат"
                     ),
                     callback_data=f"campaign:sendermode:choose:{campaign.id}:{page}",
                 )
@@ -2779,7 +2776,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="👥 Изменить отправителей",
+                    text="○ Изменить отправителей",
                     callback_data=f"campaign:edit:senders:{campaign.id}:{page}",
                 )
             ]
@@ -2787,11 +2784,11 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🎨 Варианты постов и медиа",
+                    text="Варианты постов и медиа",
                     callback_data=f"campaign:variants:{campaign.id}:{page}",
                 ),
                 InlineKeyboardButton(
-                    text="👁 Посмотреть пост",
+                    text="Посмотреть пост",
                     callback_data=f"campaign:preview:primary:{campaign.id}:{page}",
                 ),
             ]
@@ -2800,14 +2797,14 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
             [
                 InlineKeyboardButton(
                     text=(
-                        "🔔 Отметки участников · ВКЛ"
+                        "◇ Отметки участников · вкл."
                         if campaign.hidden_mentions_enabled
-                        else "🔔 Отметки участников · ВЫКЛ"
+                        else "◇ Отметки участников · выкл."
                     ),
                     callback_data=f"campaign:mentions:toggle:{campaign.id}:{page}",
                 ),
                 InlineKeyboardButton(
-                    text=f"🔄 {campaign.mention_cooldown_days} дн.",
+                    text=f"↻ {campaign.mention_cooldown_days} дн.",
                     callback_data=f"campaign:mentions:cooldown:{campaign.id}:{page}",
                 ),
             ]
@@ -2815,7 +2812,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
     rows.append(
         [
             InlineKeyboardButton(
-                text=("✏️ Основное сообщение" if is_broadcast else "🧩 Изменить цепочку"),
+                text=("✎ Основное сообщение" if is_broadcast else "≡ Изменить цепочку"),
                 callback_data=f"campaign:edit:content:{campaign.id}:{page}",
             )
         ]
@@ -2823,7 +2820,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
     rows.append(
         [
             InlineKeyboardButton(
-                text="🎯 Изменить чаты",
+                text="◎ Изменить чаты",
                 callback_data=f"campaign:edit:target:{campaign.id}:{page}",
             )
         ]
@@ -2832,15 +2829,15 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{'✓ ' if selected_profile_key == 'active' else ''}⚡ Активная",
+                    text=f"{'✓ ' if selected_profile_key == 'active' else ''}↗ Активная",
                     callback_data=f"campaign:profile:active:{campaign.id}:{page}",
                 ),
                 InlineKeyboardButton(
-                    text=f"{'✓ ' if selected_profile_key == 'balanced' else ''}⚖️ Средняя",
+                    text=f"{'✓ ' if selected_profile_key == 'balanced' else ''}≈ Средняя",
                     callback_data=f"campaign:profile:balanced:{campaign.id}:{page}",
                 ),
                 InlineKeyboardButton(
-                    text=f"{'✓ ' if selected_profile_key == 'gentle' else ''}🌙 Бережная",
+                    text=f"{'✓ ' if selected_profile_key == 'gentle' else ''}○ Бережная",
                     callback_data=f"campaign:profile:gentle:{campaign.id}:{page}",
                 ),
             ]
@@ -2849,9 +2846,9 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         [
             InlineKeyboardButton(
                 text=(
-                    "👍 Реакции на публикации · ВКЛ"
+                    "Реакции на публикации · вкл."
                     if campaign.reactions_enabled
-                    else "👍 Реакции на публикации · ВЫКЛ"
+                    else "Реакции на публикации · выкл."
                 ),
                 callback_data=f"campaign:reactions:{campaign.id}:{page}",
             )
@@ -2860,7 +2857,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
     rows.append(
         [
             InlineKeyboardButton(
-                text="🔁 Изменить режим отправки",
+                text="↻ Изменить режим отправки",
                 callback_data=f"campaign:edit:schedule:{campaign.id}:{page}",
             )
         ]
@@ -2869,7 +2866,7 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="⚙️ Точные настройки",
+                    text="Точные настройки",
                     callback_data=f"campaign:advanced:{campaign.id}:{page}",
                 )
             ]
@@ -2878,9 +2875,9 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
         [
             InlineKeyboardButton(
                 text=(
-                    "⏸ Приостановить новые запуски"
+                    "Ⅱ Приостановить новые запуски"
                     if campaign.enabled
-                    else "▶️ Разрешить новые запуски"
+                    else "› Разрешить новые запуски"
                 ),
                 callback_data=(
                     f"campaign:pause:ask:{campaign.id}:{page}"
@@ -2889,13 +2886,13 @@ def campaign_details_menu(campaign: Campaign, page: int) -> InlineKeyboardMarkup
                 ),
             ),
             InlineKeyboardButton(
-                text="🗑 Удалить",
+                text="× Удалить",
                 callback_data=f"campaign:delete:ask:{campaign.id}:{page}",
             ),
         ]
     )
     rows.append(
-        [InlineKeyboardButton(text="⬅️ К рассылкам", callback_data=f"menu:campaigns:{page}")]
+        [InlineKeyboardButton(text="‹ К рассылкам", callback_data=f"menu:campaigns:{page}")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2905,13 +2902,13 @@ def campaign_pause_confirmation(campaign_id: int, page: int) -> InlineKeyboardMa
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⏸ Да, приостановить сценарий",
+                    text="Ⅱ Да, приостановить сценарий",
                     callback_data=f"campaign:pause:confirm:{campaign_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Не приостанавливать",
+                    text="‹ Не приостанавливать",
                     callback_data=f"campaign:details:{campaign_id}:{page}",
                 )
             ],
@@ -2938,13 +2935,13 @@ def campaign_mention_cooldown_menu(
         )
     builder.row(
         InlineKeyboardButton(
-            text="✍️ Другое значение",
+            text="✎ Другое значение",
             callback_data=f"campaign:mentions:custom:{campaign_id}:{page}",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К рассылке",
+            text="‹ К рассылке",
             callback_data=f"campaign:details:{campaign_id}:{page}",
         )
     )
@@ -2973,44 +2970,44 @@ def campaign_advanced_menu(campaign: Campaign, page: int) -> InlineKeyboardMarku
             ),
             InlineKeyboardButton(
                 text=(
-                    "♾ До остановки"
+                    "∞ До остановки"
                     if campaign.repeat_forever
-                    else f"🗓 Срок · {duration_seconds // 3600} ч"
+                    else f"◷ Срок · {duration_seconds // 3600} ч"
                 ),
                 callback_data=f"campaign:advanced:edit:duration:{campaign.id}:{page}",
             ),
         ],
         [
             InlineKeyboardButton(
-                text=f"👁 Глубина · {depth}",
+                text=f"Глубина · {depth}",
                 callback_data=f"campaign:advanced:edit:depth:{campaign.id}:{page}",
             ),
             InlineKeyboardButton(
                 text=(
-                    "⌛ Только после порога"
+                    "◷ Только после порога"
                     if max_wait_seconds <= 0
-                    else f"⌛ Лимит · {max_wait_seconds // 60} мин"
+                    else f"◷ Лимит · {max_wait_seconds // 60} мин"
                 ),
                 callback_data=f"campaign:advanced:edit:maxwait:{campaign.id}:{page}",
             ),
         ],
         [
             InlineKeyboardButton(
-                text=f"🔎 Проверка · {check_label}",
+                text=f"⌕ Проверка · {check_label}",
                 callback_data=f"campaign:advanced:edit:check:{campaign.id}:{page}",
             )
         ],
         [
             InlineKeyboardButton(
                 text=(
-                    "🧠 Адаптивность · ВКЛ" if campaign.activity_aware else "🧠 Адаптивность · ВЫКЛ"
+                    "≈ Адаптивность · вкл." if campaign.activity_aware else "≈ Адаптивность · выкл."
                 ),
                 callback_data=f"campaign:advanced:toggle:activity:{campaign.id}:{page}",
             ),
         ],
         [
             InlineKeyboardButton(
-                text="⬅️ К рассылке",
+                text="‹ К рассылке",
                 callback_data=f"campaign:details:{campaign.id}:{page}",
             )
         ],
@@ -3019,11 +3016,11 @@ def campaign_advanced_menu(campaign: Campaign, page: int) -> InlineKeyboardMarku
         rows[3].append(
             InlineKeyboardButton(
                 text=(
-                    "🚀 Потоки независимы"
+                    "↗ Потоки независимы"
                     if getattr(campaign.sender_mode, "value", campaign.sender_mode) == "independent"
-                    else "🛟 Автозамена · ВКЛ"
+                    else "? Автозамена · вкл."
                     if campaign.auto_sender_failover
-                    else "🛟 Автозамена · ВЫКЛ"
+                    else "? Автозамена · выкл."
                 ),
                 callback_data=(
                     "noop"
@@ -3036,7 +3033,7 @@ def campaign_advanced_menu(campaign: Campaign, page: int) -> InlineKeyboardMarku
 
 
 def campaign_reactions_menu(campaign: Campaign, page: int, step_count: int) -> InlineKeyboardMarkup:
-    enabled_label = "🟢 Реакции включены" if campaign.reactions_enabled else "⚪ Реакции выключены"
+    enabled_label = "● Реакции включены" if campaign.reactions_enabled else "○ Реакции выключены"
     rows = [
         [
             InlineKeyboardButton(
@@ -3079,7 +3076,7 @@ def campaign_reactions_menu(campaign: Campaign, page: int, step_count: int) -> I
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ К рассылке", callback_data=f"campaign:details:{campaign.id}:{page}"
+                text="‹ К рассылке", callback_data=f"campaign:details:{campaign.id}:{page}"
             )
         ]
     )
@@ -3098,7 +3095,7 @@ def campaign_edit_target_source_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"📚 Списки чатов · {list_count}",
+                    text=f"Списки чатов · {list_count}",
                     callback_data=(f"campaign:edit:browse:lists:{campaign_id}:{campaign_page}:0"),
                 )
             ]
@@ -3107,7 +3104,7 @@ def campaign_edit_target_source_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"☑️ Изменить подборку чатов · {standalone_count}",
+                    text=f"✓ Изменить подборку чатов · {standalone_count}",
                     callback_data=(f"campaign:edit:checked:{campaign_id}:{campaign_page}:0"),
                 )
             ]
@@ -3115,7 +3112,7 @@ def campaign_edit_target_source_menu(
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ Не менять",
+                text="‹ Не менять",
                 callback_data=f"campaign:details:{campaign_id}:{campaign_page}",
             )
         ]
@@ -3136,7 +3133,7 @@ def campaign_checked_target_picker(
     for target in page.items:
         selected = target.id in selected_ids
         builder.button(
-            text=f"{'✅' if selected else '▫️'} {_compact_button_label(target.title, 52)}",
+            text=f"{'✓' if selected else '○'} {_compact_button_label(target.title, 52)}",
             callback_data=f"campaign:edit:checktoggle:{target.id}",
         )
     builder.adjust(1)
@@ -3152,7 +3149,7 @@ def campaign_checked_target_picker(
     if pagination:
         builder.row(*pagination)
     builder.row(
-        InlineKeyboardButton(text="🔎 Найти чат", callback_data="campaign:edit:checksearch")
+        InlineKeyboardButton(text="⌕ Найти чат", callback_data="campaign:edit:checksearch")
     )
     builder.row(
         InlineKeyboardButton(text="Выбрать все", callback_data="campaign:edit:checkall"),
@@ -3160,13 +3157,13 @@ def campaign_checked_target_picker(
     )
     builder.row(
         InlineKeyboardButton(
-            text=f"✅ Сохранить подборку · {len(selected_ids)}",
+            text=f"✓ Сохранить подборку · {len(selected_ids)}",
             callback_data="campaign:edit:checkdone",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К выбору аудитории",
+            text="‹ К выбору аудитории",
             callback_data=f"campaign:edit:target:{campaign_id}:{campaign_page}",
         )
     )
@@ -3184,19 +3181,19 @@ def campaign_edit_target_picker(
     if kind == "lists":
         for item in page.items:
             builder.button(
-                text=f"📚 {item.name} ({item.approved_count})",  # type: ignore[union-attr]
+                text=f"{item.name} ({item.approved_count})",  # type: ignore[union-attr]
                 callback_data=f"cedit:list:{item.id}",
             )
     else:
         for item in page.items:
             builder.button(
-                text=f"📌 {item.title}",  # type: ignore[union-attr]
+                text=f"· {item.title}",  # type: ignore[union-attr]
                 callback_data=f"cedit:target:{item.id}",
             )
     builder.adjust(1)
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Найти список" if kind == "lists" else "🔎 Найти чат",
+            text="⌕ Найти список" if kind == "lists" else "⌕ Найти чат",
             callback_data=(f"campaign:edit:search:{kind}:{campaign_id}:{campaign_page}"),
         )
     )
@@ -3204,7 +3201,7 @@ def campaign_edit_target_picker(
         prefix = f"campaign:edit:browse:{kind}:{campaign_id}:{campaign_page}:"
         pagination: list[InlineKeyboardButton] = []
         if page.page > 1:
-            pagination.append(InlineKeyboardButton(text="⏮", callback_data=f"{prefix}0"))
+            pagination.append(InlineKeyboardButton(text="‹‹", callback_data=f"{prefix}0"))
         if page.page > 10:
             pagination.append(
                 InlineKeyboardButton(text="−10", callback_data=f"{prefix}{page.page - 10}")
@@ -3226,12 +3223,12 @@ def campaign_edit_target_picker(
             )
         if page.page < page.pages - 2:
             pagination.append(
-                InlineKeyboardButton(text="⏭", callback_data=f"{prefix}{page.pages - 1}")
+                InlineKeyboardButton(text="››", callback_data=f"{prefix}{page.pages - 1}")
             )
         builder.row(*pagination)
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К выбору аудитории",
+            text="‹ К выбору аудитории",
             callback_data=f"campaign:edit:target:{campaign_id}:{campaign_page}",
         )
     )
@@ -3243,7 +3240,7 @@ def campaign_content_edit_cancel(campaign_id: int, page: int) -> InlineKeyboardM
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Не менять",
+                    text="‹ Не менять",
                     callback_data=f"campaign:content:cancel:{campaign_id}:{page}",
                 )
             ]
@@ -3256,13 +3253,13 @@ def campaign_delete_confirmation(campaign_id: int, page: int) -> InlineKeyboardM
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить черновик",
+                    text="× Да, удалить черновик",
                     callback_data=f"campaign:delete:confirm:{campaign_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=f"campaign:details:{campaign_id}:{page}",
                 )
             ],
@@ -3275,7 +3272,7 @@ def target_lists_menu(page: Page[TargetListView]) -> InlineKeyboardMarkup:
     for item in page.items:
         builder.button(
             text=(
-                f"📚 {_compact_button_label(item.name, 38)} "
+                f"≡ {_compact_button_label(item.name, 38)} "
                 f"({item.approved_count}/{item.item_count})"
             ),
             callback_data=f"targetlist:details:{item.id}:{page.page}",
@@ -3283,16 +3280,16 @@ def target_lists_menu(page: Page[TargetListView]) -> InlineKeyboardMarkup:
     builder.adjust(1)
     _pagination(builder, "targetlists", page.page, page.pages)
     builder.row(
-        InlineKeyboardButton(text="📥 Создать / импортировать", callback_data="target:import"),
-        InlineKeyboardButton(text="🔎 Найти", callback_data="search:start:targetlists"),
+        InlineKeyboardButton(text="↓ Создать / импортировать", callback_data="target:import"),
+        InlineKeyboardButton(text="⌕ Найти", callback_data="search:start:targetlists"),
     )
     builder.row(
         InlineKeyboardButton(
-            text="🔄 Обновить список",
+            text="↻ Обновить список",
             callback_data=f"menu:targetlists:{page.page}",
         )
     )
-    builder.row(InlineKeyboardButton(text="⬅️ К чатам и спискам", callback_data="audiences:home"))
+    builder.row(InlineKeyboardButton(text="‹ К чатам и спискам", callback_data="audiences:home"))
     return builder.as_markup()
 
 
@@ -3304,37 +3301,37 @@ def target_list_details_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="👁 Чаты этого списка",
+                    text="Чаты этого списка",
                     callback_data=f"tlv:{target_list.id}:{page}:0",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✏️ Переименовать список",
+                    text="✎ Переименовать список",
                     callback_data=f"targetlist:rename:{target_list.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="▶️ Использовать все чаты",
+                    text="› Использовать все чаты",
                     callback_data=f"targetlist:approve:{target_list.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⏸ Не использовать все чаты",
+                    text="Ⅱ Не использовать все чаты",
                     callback_data=f"targetlist:revoke:{target_list.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить список",
+                    text="× Удалить список",
                     callback_data=f"targetlist:delete:ask:{target_list.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К спискам чатов", callback_data=f"menu:targetlists:{page}"
+                    text="‹ К спискам чатов", callback_data=f"menu:targetlists:{page}"
                 )
             ],
         ]
@@ -3368,19 +3365,19 @@ def target_list_targets_menu(
 
     builder.row(
         filter_button("all", "Все"),
-        filter_button("enabled", "🟢 Вкл."),
-        filter_button("disabled", "⚪️ Выкл."),
+        filter_button("enabled", "● Вкл."),
+        filter_button("disabled", "Выкл."),
     )
     builder.row(
-        filter_button("bad", "🚫 Исключённые"),
-        filter_button("problem", "🔴 Ошибки"),
+        filter_button("bad", "× Исключённые"),
+        filter_button("problem", "× Ошибки"),
     )
     if target_list is not None:
         all_chats_buttons: list[InlineKeyboardButton] = []
         if target_list.disabled_count:
             all_chats_buttons.append(
                 InlineKeyboardButton(
-                    text="▶️ Включить все доступные",
+                    text="› Включить все доступные",
                     callback_data=(
                         f"tlall:approve:{target_list_id}:{list_page}:{filter_name}:{page.page}"
                     ),
@@ -3389,7 +3386,7 @@ def target_list_targets_menu(
         if target_list.approved_count:
             all_chats_buttons.append(
                 InlineKeyboardButton(
-                    text="⏸ Выключить все",
+                    text="Ⅱ Выключить все",
                     callback_data=(
                         f"tlall:revoke:{target_list_id}:{list_page}:{filter_name}:{page.page}"
                     ),
@@ -3399,13 +3396,13 @@ def target_list_targets_menu(
             builder.row(*all_chats_buttons)
     for target in page.items:
         icon = (
-            "🚫"
+            "×"
             if target.quality_status == "bad"
-            else "🔴"
+            else "×"
             if target.last_error_code
-            else "🟢"
+            else "●"
             if target.approved_by_operator
-            else "⚪️"
+            else "◇"
         )
         builder.row(
             InlineKeyboardButton(
@@ -3420,7 +3417,7 @@ def target_list_targets_menu(
         if filter_name != "enabled":
             bulk_buttons.append(
                 InlineKeyboardButton(
-                    text="▶️ Включить страницу",
+                    text="› Включить страницу",
                     callback_data=(
                         f"tlbulk:approve:{target_list_id}:{list_page}:{filter_name}:{page.page}"
                     ),
@@ -3429,7 +3426,7 @@ def target_list_targets_menu(
         if filter_name not in {"disabled", "bad"}:
             bulk_buttons.append(
                 InlineKeyboardButton(
-                    text="⏸ Выключить страницу",
+                    text="Ⅱ Выключить страницу",
                     callback_data=(
                         f"tlbulk:revoke:{target_list_id}:{list_page}:{filter_name}:{page.page}"
                     ),
@@ -3439,7 +3436,7 @@ def target_list_targets_menu(
             builder.row(*bulk_buttons)
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Найти чат в базе",
+            text="⌕ Найти чат в базе",
             callback_data=f"tls:{target_list_id}:{list_page}",
         )
     )
@@ -3448,7 +3445,7 @@ def target_list_targets_menu(
         if page.page > 1:
             pagination.append(
                 InlineKeyboardButton(
-                    text="⏮",
+                    text="‹‹",
                     callback_data=f"tlf:{target_list_id}:{list_page}:{filter_name}:0",
                 )
             )
@@ -3479,7 +3476,7 @@ def target_list_targets_menu(
         if page.page < page.pages - 2:
             pagination.append(
                 InlineKeyboardButton(
-                    text="⏭",
+                    text="››",
                     callback_data=(
                         f"tlf:{target_list_id}:{list_page}:{filter_name}:{page.pages - 1}"
                     ),
@@ -3510,7 +3507,7 @@ def target_list_targets_menu(
             builder.row(*jumps)
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ Карточка списка",
+            text="‹ Карточка списка",
             callback_data=f"targetlist:details:{target_list_id}:{list_page}",
         )
     )
@@ -3528,7 +3525,7 @@ def target_list_target_details_menu(
     state_row = (
         [
             InlineKeyboardButton(
-                text="🚫 Автоматически исключён",
+                text="× Автоматически исключён",
                 callback_data="noop",
             )
         ]
@@ -3536,7 +3533,7 @@ def target_list_target_details_menu(
         else [
             InlineKeyboardButton(
                 text=(
-                    "⏸ Не использовать чат" if target.approved_by_operator else "▶️ Использовать чат"
+                    "Ⅱ Не использовать чат" if target.approved_by_operator else "› Использовать чат"
                 ),
                 callback_data=(
                     f"tlt:{action}:{target.id}:{target_list_id}:{list_page}:{chat_page}"
@@ -3549,7 +3546,7 @@ def target_list_target_details_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🕒 Интервал сообщений",
+                    text="◷ Интервал сообщений",
                     callback_data=(
                         f"tlcd:{target.id}:{target_list_id}:{list_page}:{chat_page}:{filter_name}"
                     ),
@@ -3558,7 +3555,7 @@ def target_list_target_details_menu(
             state_row,
             [
                 InlineKeyboardButton(
-                    text="➖ Убрать из этого списка",
+                    text="− Убрать из этого списка",
                     callback_data=(
                         f"tlra:{target.id}:{target_list_id}:{list_page}:{chat_page}:{filter_name}"
                     ),
@@ -3566,7 +3563,7 @@ def target_list_target_details_menu(
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ К чатам списка",
+                    text="‹ К чатам списка",
                     callback_data=(f"tlf:{target_list_id}:{list_page}:{filter_name}:{chat_page}"),
                 )
             ],
@@ -3585,7 +3582,7 @@ def target_list_target_remove_confirmation(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➖ Да, убрать из списка",
+                    text="− Да, убрать из списка",
                     callback_data=(
                         f"tlrc:{target_id}:{target_list_id}:{list_page}:{chat_page}:{filter_name}"
                     ),
@@ -3593,7 +3590,7 @@ def target_list_target_remove_confirmation(
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=(
                         f"tld:{target_id}:{target_list_id}:{list_page}:{chat_page}:{filter_name}"
                     ),
@@ -3608,13 +3605,13 @@ def target_list_delete_confirmation(target_list_id: int, page: int) -> InlineKey
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить список",
+                    text="× Да, удалить список",
                     callback_data=f"targetlist:delete:confirm:{target_list_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=f"targetlist:details:{target_list_id}:{page}",
                 )
             ],
@@ -3627,20 +3624,20 @@ def templates_menu(page: Page[MessageTemplate]) -> InlineKeyboardMarkup:
     for template in page.items:
         builder.row(
             InlineKeyboardButton(
-                text=f"📝 {template.name}",
+                text=f"{template.name}",
                 callback_data=f"template:details:{template.id}:{page.page}",
             ),
             InlineKeyboardButton(
-                text="⏸ Пауза" if template.enabled else "▶️ Включить",
+                text="Ⅱ Пауза" if template.enabled else "› Включить",
                 callback_data=f"template:toggle:{template.id}:{page.page}",
             ),
         )
-    builder.row(InlineKeyboardButton(text="➕ Создать шаблон", callback_data="template:add"))
+    builder.row(InlineKeyboardButton(text="＋ Создать шаблон", callback_data="template:add"))
     _pagination(builder, "templates", page.page, page.pages)
     builder.row(
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"menu:templates:{page.page}")
+        InlineKeyboardButton(text="↻ Обновить список", callback_data=f"menu:templates:{page.page}")
     )
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -3652,23 +3649,23 @@ def template_details_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✏️ Изменить тексты",
+                    text="✎ Изменить тексты",
                     callback_data=f"template:edit:{template.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⏸ Пауза" if template.enabled else "▶️ Включить",
+                    text="Ⅱ Пауза" if template.enabled else "› Включить",
                     callback_data=f"template:toggle:{template.id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить шаблон",
+                    text="× Удалить шаблон",
                     callback_data=f"template:delete:ask:{template.id}:{page}",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К шаблонам", callback_data=f"menu:templates:{page}")],
+            [InlineKeyboardButton(text="‹ К шаблонам", callback_data=f"menu:templates:{page}")],
         ]
     )
 
@@ -3678,13 +3675,13 @@ def template_delete_confirmation(template_id: int, page: int) -> InlineKeyboardM
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить шаблон",
+                    text="× Да, удалить шаблон",
                     callback_data=f"template:delete:confirm:{template_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, оставить",
+                    text="‹ Нет, оставить",
                     callback_data=f"template:details:{template_id}:{page}",
                 )
             ],
@@ -3701,7 +3698,7 @@ def launches_menu(
     for launch in page.items:
         icon = _launch_icon(launch)
         result = (
-            f"отправлено {launch.sent_publications}"
+            f"успешных шагов {launch.sent_publications}"
             if launch.smart_timer_mode
             else f"{launch.finished}/{launch.total}"
         )
@@ -3715,21 +3712,21 @@ def launches_menu(
     _pagination(builder, section, page.page, page.pages)
     builder.row(
         InlineKeyboardButton(
-            text="🔄 Обновить",
+            text="↻ Обновить",
             callback_data=f"menu:{section}:{page.page}",
         ),
         InlineKeyboardButton(
-            text="🔎 Найти рассылку",
+            text="⌕ Найти рассылку",
             callback_data=f"search:start:{section}",
         ),
     )
     builder.row(
         InlineKeyboardButton(
-            text="📊 Работа и результаты" if archived else "🗄 Архив результатов",
+            text="Работа и результаты" if archived else "≡ Архив результатов",
             callback_data="menu:runs:0" if archived else "menu:archive:0",
         )
     )
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -3742,7 +3739,7 @@ def search_prompt_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Вернуться к списку",
+                    text="‹ Вернуться к списку",
                     callback_data=back_callback or f"menu:{section}:0",
                 )
             ]
@@ -3763,13 +3760,13 @@ def search_results_menu(
         builder.row(InlineKeyboardButton(text=compact, callback_data=callback_data))
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Новый поиск",
+            text="⌕ Новый поиск",
             callback_data=new_search_callback or f"search:start:{section}",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ Вернуться к списку",
+            text="‹ Вернуться к списку",
             callback_data=back_callback or f"menu:{section}:0",
         )
     )
@@ -3780,11 +3777,11 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text="🔄 Обновить отчёт",
+                text="↻ Обновить отчёт",
                 callback_data=f"launch:details:{launch.anchor_run_id}:{page}",
             ),
             InlineKeyboardButton(
-                text="📣 Настройки рассылки",
+                text="Настройки рассылки",
                 callback_data=f"campaign:details:{launch.campaign_id}:0",
             ),
         ]
@@ -3793,7 +3790,7 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="♻️ Вернуть в результаты",
+                    text="↻ Вернуть в результаты",
                     callback_data=f"launch:restore:{launch.anchor_run_id}:{page}",
                 )
             ]
@@ -3803,9 +3800,9 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=(
-                        f"🛑 Остановить отправку ({launch.pending_work})"
+                        f"Ⅱ Остановить отправку ({launch.pending_work})"
                         if launch.active
-                        else f"🛑 Остановить реакции ({launch.reaction_active})"
+                        else f"Ⅱ Остановить реакции ({launch.reaction_active})"
                     ),
                     callback_data=f"launch:cancel:ask:{launch.anchor_run_id}:{page}",
                 )
@@ -3815,7 +3812,7 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text="✏️ Изменить будущие посты",
+                        text="✎ Изменить будущие посты",
                         callback_data=f"launch:edit:text:{launch.anchor_run_id}:{page}",
                     )
                 ]
@@ -3824,11 +3821,11 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text="👁 Порог новых сообщений",
+                        text="Порог новых сообщений",
                         callback_data=(f"launch:edit:depth:{launch.anchor_run_id}:{page}"),
                     ),
                     InlineKeyboardButton(
-                        text="🗓 Работать ещё",
+                        text="◷ Работать ещё",
                         callback_data=(f"launch:edit:duration:{launch.anchor_run_id}:{page}"),
                     ),
                 ]
@@ -3840,16 +3837,16 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
                         callback_data=(f"launch:edit:interval:{launch.anchor_run_id}:{page}"),
                     ),
                     InlineKeyboardButton(
-                        text="⌛ Тайм-аут повтора",
+                        text="◷ Тайм-аут повтора",
                         callback_data=(f"launch:edit:maxwait:{launch.anchor_run_id}:{page}"),
                     ),
                 ]
             )
-    if launch.failed and not launch.archived:
+    if launch.retryable_failed and not launch.archived:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"🔁 Повторить неотправленные ({launch.failed})",
+                    text=f"↻ Повторить неотправленные ({launch.retryable_failed})",
                     callback_data=f"launch:retry:ask:{launch.anchor_run_id}:{page}",
                 )
             ]
@@ -3858,7 +3855,7 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🗄 Убрать из результатов",
+                    text="Убрать из результатов",
                     callback_data=f"launch:archive:{launch.anchor_run_id}:{page}",
                 )
             ]
@@ -3866,7 +3863,7 @@ def launch_details_menu(launch: LaunchView, page: int) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ К работе и результатам",
+                text="‹ К работе и результатам",
                 callback_data=(f"menu:archive:{page}" if launch.archived else f"menu:runs:{page}"),
             )
         ]
@@ -3879,7 +3876,7 @@ def launch_edit_cancel(anchor_run_id: int, page: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Не менять",
+                    text="‹ Не менять",
                     callback_data=f"launch:edit:cancel:{anchor_run_id}:{page}",
                 )
             ]
@@ -3892,13 +3889,13 @@ def launch_cancel_confirmation(anchor_run_id: int, page: int) -> InlineKeyboardM
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🛑 Да, остановить отправку",
+                    text="Ⅱ Да, остановить отправку",
                     callback_data=f"launch:cancel:confirm:{anchor_run_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, продолжить",
+                    text="‹ Нет, продолжить",
                     callback_data=f"launch:details:{anchor_run_id}:{page}",
                 )
             ],
@@ -3911,13 +3908,13 @@ def launch_retry_confirmation(anchor_run_id: int, page: int) -> InlineKeyboardMa
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔁 Да, повторить ошибки",
+                    text="↻ Да, повторить ошибки",
                     callback_data=f"launch:retry:confirm:{anchor_run_id}:{page}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, вернуться",
+                    text="‹ Нет, вернуться",
                     callback_data=f"launch:details:{anchor_run_id}:{page}",
                 )
             ],
@@ -3930,10 +3927,10 @@ def template_edit_confirmation() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Сохранить изменения", callback_data="template:edit:save"
+                    text="✓ Сохранить изменения", callback_data="template:edit:save"
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отменить изменения", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отменить изменения", callback_data="fsm:cancel")],
         ]
     )
 
@@ -3950,22 +3947,22 @@ def runs_menu(page: Page[CampaignRun]) -> InlineKeyboardMarkup:
         if run.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
             row.append(
                 InlineKeyboardButton(
-                    text="🛑 Стоп", callback_data=f"run:cancel:{run.id}:{page.page}"
+                    text="Ⅱ Стоп", callback_data=f"run:cancel:{run.id}:{page.page}"
                 )
             )
         builder.row(*row)
     _pagination(builder, "runs", page.page, page.pages)
     builder.row(
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"menu:runs:{page.page}")
+        InlineKeyboardButton(text="↻ Обновить список", callback_data=f"menu:runs:{page.page}")
     )
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
 def audit_menu(page: Page[object]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     _pagination(builder, "audit", page.page, page.pages)
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -3974,19 +3971,19 @@ def settings_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💾 Резервная копия",
+                    text="Резервная копия",
                     callback_data="maintenance:backup",
                 ),
-                InlineKeyboardButton(text="🩺 Диагностика", callback_data="maintenance:doctor"),
+                InlineKeyboardButton(text="⌕ Диагностика", callback_data="maintenance:doctor"),
             ],
             [
                 InlineKeyboardButton(
-                    text="🛑 Остановить все отправки", callback_data="queue:stopall:ask"
+                    text="Ⅱ Остановить все отправки", callback_data="queue:stopall:ask"
                 )
             ],
-            [InlineKeyboardButton(text="📜 Журнал действий", callback_data="menu:audit:0")],
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu:settings")],
-            [InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home")],
+            [InlineKeyboardButton(text="Журнал действий", callback_data="menu:audit:0")],
+            [InlineKeyboardButton(text="↻ Обновить", callback_data="menu:settings")],
+            [InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home")],
         ]
     )
 
@@ -3996,10 +3993,10 @@ def stop_all_confirmation() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🛑 Да, остановить всё", callback_data="queue:stopall:confirm"
+                    text="Ⅱ Да, остановить всё", callback_data="queue:stopall:confirm"
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ Нет, вернуться", callback_data="menu:settings")],
+            [InlineKeyboardButton(text="‹ Нет, вернуться", callback_data="menu:settings")],
         ]
     )
 
@@ -4009,12 +4006,12 @@ def campaign_stop_all_confirmation() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🛑 Да, остановить публикации", callback_data="campaign:stopall:confirm"
+                    text="Ⅱ Да, остановить публикации", callback_data="campaign:stopall:confirm"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Нет, вернуться к рассылкам", callback_data="menu:campaigns:0"
+                    text="‹ Нет, вернуться к рассылкам", callback_data="menu:campaigns:0"
                 )
             ],
         ]
@@ -4023,7 +4020,7 @@ def campaign_stop_all_confirmation() -> InlineKeyboardMarkup:
 
 def cancel_menu(cancel_callback: str = "fsm:cancel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel_callback)]]
+        inline_keyboard=[[InlineKeyboardButton(text="× Отмена", callback_data=cancel_callback)]]
     )
 
 
@@ -4032,10 +4029,10 @@ def ownership_confirmation() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Да, принадлежит мне", callback_data="account:confirm:yes"
+                    text="✓ Да, принадлежит мне", callback_data="account:confirm:yes"
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -4053,7 +4050,7 @@ def account_picker(
             callback_data=f"campaign:pick:{role}:{account.id}",
         )
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=cancel_callback))
+    builder.row(InlineKeyboardButton(text="‹ Назад", callback_data=cancel_callback))
     return builder.as_markup()
 
 
@@ -4085,7 +4082,7 @@ def target_folder_account_picker(
         if active_page > 0:
             navigation.append(
                 InlineKeyboardButton(
-                    text="⬅️",
+                    text="‹",
                     callback_data=f"target:folder:accounts:page:{active_page - 1}",
                 )
             )
@@ -4098,12 +4095,12 @@ def target_folder_account_picker(
         if active_page + 1 < pages:
             navigation.append(
                 InlineKeyboardButton(
-                    text="➡️",
+                    text="›",
                     callback_data=f"target:folder:accounts:page:{active_page + 1}",
                 )
             )
         builder.row(*navigation)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel"))
     return builder.as_markup()
 
 
@@ -4115,32 +4112,32 @@ def campaign_sender_picker(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for account in accounts:
-        marker = "✅" if account.id in selected_ids else "☐"
+        marker = "✓" if account.id in selected_ids else "○"
         builder.button(
             text=f"{marker} {account.label}",
             callback_data=f"campaign:sender:toggle:{account.id}",
         )
     builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="☑️ Выбрать все", callback_data="campaign:sender:all"),
-        InlineKeyboardButton(text="✖️ Снять все", callback_data="campaign:sender:clear"),
+        InlineKeyboardButton(text="✓ Выбрать все", callback_data="campaign:sender:all"),
+        InlineKeyboardButton(text="× Снять все", callback_data="campaign:sender:clear"),
     )
     builder.row(
         InlineKeyboardButton(
-            text=f"✅ Продолжить ({len(selected_ids)})",
+            text=f"✓ Продолжить ({len(selected_ids)})",
             callback_data="campaign:sender:done",
         )
     )
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel_callback))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data=cancel_callback))
     return builder.as_markup()
 
 
 def target_picker(targets: list[Target]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for target in targets:
-        builder.button(text=f"🎯 {target.title}", callback_data=f"campaign:pick:target:{target.id}")
+        builder.button(text=f"◎ {target.title}", callback_data=f"campaign:pick:target:{target.id}")
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel"))
     return builder.as_markup()
 
 
@@ -4158,18 +4155,18 @@ def campaign_target_picker(
     builder = InlineKeyboardBuilder()
     for target_list in target_lists:
         builder.button(
-            text=f"📚 {target_list.name} ({target_list.approved_count})",
+            text=f"{target_list.name} ({target_list.approved_count})",
             callback_data=f"campaign:pick:targetlist:{target_list.id}",
         )
     for target in targets_page.items:
-        builder.button(text=f"🎯 {target.title}", callback_data=f"campaign:pick:target:{target.id}")
+        builder.button(text=f"◎ {target.title}", callback_data=f"campaign:pick:target:{target.id}")
     builder.adjust(1)
     if targets_page.pages > 1:
         pagination: list[InlineKeyboardButton] = []
         if targets_page.page > 0:
             pagination.append(
                 InlineKeyboardButton(
-                    text="←",
+                    text="‹",
                     callback_data=f"campaign:pick:page:{targets_page.page - 1}",
                 )
             )
@@ -4182,12 +4179,12 @@ def campaign_target_picker(
         if targets_page.page + 1 < targets_page.pages:
             pagination.append(
                 InlineKeyboardButton(
-                    text="→",
+                    text="›",
                     callback_data=f"campaign:pick:page:{targets_page.page + 1}",
                 )
             )
         builder.row(*pagination)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel"))
     return builder.as_markup()
 
 
@@ -4201,7 +4198,7 @@ def campaign_audience_source_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"📚 Выбрать список · {list_count}",
+                    text=f"Выбрать список · {list_count}",
                     callback_data="campaign:targetsource:lists:0",
                 )
             ]
@@ -4210,12 +4207,12 @@ def campaign_audience_source_menu(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"📌 Выбрать отдельный чат · {standalone_count}",
+                    text=f"· Выбрать отдельный чат · {standalone_count}",
                     callback_data="campaign:targetsource:chats:0",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")])
+    rows.append([InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -4223,20 +4220,20 @@ def campaign_standalone_target_picker(page: Page[Target]) -> InlineKeyboardMarku
     builder = InlineKeyboardBuilder()
     for target in page.items:
         builder.button(
-            text=f"📌 {_compact_button_label(target.title, 54)}",
+            text=f"· {_compact_button_label(target.title, 54)}",
             callback_data=f"campaign:pick:target:{target.id}",
         )
     builder.adjust(1)
     _campaign_audience_pagination(builder, "chats", page.page, page.pages)
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Найти чат",
+            text="⌕ Найти чат",
             callback_data="campaign:targetsearch:chats",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К выбору аудитории",
+            text="‹ К выбору аудитории",
             callback_data="campaign:targetsource:home:0",
         )
     )
@@ -4248,7 +4245,7 @@ def campaign_target_list_picker(page: Page[TargetListView]) -> InlineKeyboardMar
     for target_list in page.items:
         builder.button(
             text=(
-                f"📚 {_compact_button_label(target_list.name, 38)} · "
+                f"≡ {_compact_button_label(target_list.name, 38)} · "
                 f"{target_list.approved_count} чатов"
             ),
             callback_data=f"campaign:pick:targetlist:{target_list.id}",
@@ -4257,13 +4254,13 @@ def campaign_target_list_picker(page: Page[TargetListView]) -> InlineKeyboardMar
     _campaign_audience_pagination(builder, "lists", page.page, page.pages)
     builder.row(
         InlineKeyboardButton(
-            text="🔎 Найти список",
+            text="⌕ Найти список",
             callback_data="campaign:targetsearch:lists",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К выбору аудитории",
+            text="‹ К выбору аудитории",
             callback_data="campaign:targetsource:home:0",
         )
     )
@@ -4282,7 +4279,7 @@ def _campaign_audience_pagination(
     if page > 1:
         row.append(
             InlineKeyboardButton(
-                text="⏮",
+                text="‹‹",
                 callback_data=f"campaign:targetsource:{kind}:0",
             )
         )
@@ -4304,7 +4301,7 @@ def _campaign_audience_pagination(
     if page < pages - 2:
         row.append(
             InlineKeyboardButton(
-                text="⏭",
+                text="››",
                 callback_data=f"campaign:targetsource:{kind}:{pages - 1}",
             )
         )
@@ -4321,18 +4318,18 @@ def template_picker(templates: list[MessageTemplate]) -> InlineKeyboardMarkup:
     builder.adjust(1)
     builder.row(
         InlineKeyboardButton(
-            text="✍️ Ввести тексты вручную", callback_data="campaign:pick:template:manual"
+            text="✎ Ввести тексты вручную", callback_data="campaign:pick:template:manual"
         )
     )
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel"))
     return builder.as_markup()
 
 
 def template_confirmation() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Сохранить текст", callback_data="template:confirm")],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="✓ Сохранить текст", callback_data="template:confirm")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -4342,17 +4339,17 @@ def campaign_mode_picker() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📢 Рассылка",
+                    text="Рассылка",
                     callback_data="campaign:pick:mode:broadcast",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="💬 Диалог",
+                    text="↳ Диалог",
                     callback_data="campaign:pick:mode:dialogue",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -4362,17 +4359,17 @@ def campaign_repeat_mode_picker() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="1️⃣ Одноразовая · один пост в чат",
+                    text="Одноразовая · один пост в чат",
                     callback_data="campaign:repeat:once",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="♻️ Умная непрерывная",
+                    text="↻ Умная непрерывная",
                     callback_data="campaign:repeat:smart",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -4380,7 +4377,7 @@ def campaign_repeat_mode_picker() -> InlineKeyboardMarkup:
 def campaign_one_off_window_presets() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for hours, label in [
-        (0, "⚡ Сразу"),
+        (0, "↗ Сразу"),
         (1, "1 ч"),
         (6, "6 ч"),
         (12, "12 ч"),
@@ -4393,7 +4390,7 @@ def campaign_one_off_window_presets() -> InlineKeyboardMarkup:
             callback_data=f"campaign:once:window:{hours}",
         )
     builder.adjust(1, 3, 3)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel"))
     return builder.as_markup()
 
 
@@ -4403,7 +4400,7 @@ def campaign_smart_duration_presets(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for hours, label in [
-        (0, "♾ До остановки"),
+        (0, "∞ До остановки"),
         (1, "1 ч"),
         (6, "6 ч"),
         (12, "12 ч"),
@@ -4417,7 +4414,7 @@ def campaign_smart_duration_presets(
             callback_data=f"campaign:smart:duration:{hours}",
         )
     builder.adjust(1, 3, 3)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel_callback))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data=cancel_callback))
     return builder.as_markup()
 
 
@@ -4428,7 +4425,7 @@ def campaign_smart_interval_presets(
     builder = InlineKeyboardBuilder()
     for minutes, label in [
         (3, "3 мин"),
-        (5, "⭐ 5 мин · активная"),
+        (5, "☆ 5 мин · активная"),
         (10, "10 мин"),
         (15, "15 мин"),
         (30, "30 мин"),
@@ -4442,7 +4439,7 @@ def campaign_smart_interval_presets(
             callback_data=f"campaign:smart:interval:{minutes}",
         )
     builder.adjust(2, 1, 3, 2)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel_callback))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data=cancel_callback))
     return builder.as_markup()
 
 
@@ -4463,7 +4460,7 @@ def campaign_repeat_interval_presets(prefix: str) -> InlineKeyboardMarkup:
         )
     builder.adjust(1, 3, 3)
     cancel = "cschedule:cancel" if prefix == "cschedule" else "fsm:cancel"
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data=cancel))
     return builder.as_markup()
 
 
@@ -4476,7 +4473,7 @@ def campaign_repeat_count_presets(prefix: str) -> InlineKeyboardMarkup:
         )
     builder.adjust(5)
     cancel = "cschedule:cancel" if prefix == "cschedule" else "fsm:cancel"
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data=cancel))
     return builder.as_markup()
 
 
@@ -4488,7 +4485,7 @@ def campaign_schedule_mode_picker(
     rows = [
         [
             InlineKeyboardButton(
-                text="1️⃣ Сделать одноразовой",
+                text="1 Сделать одноразовой",
                 callback_data="cschedule:once",
             )
         ]
@@ -4497,7 +4494,7 @@ def campaign_schedule_mode_picker(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🔁 Настроить конечные повторы",
+                    text="↻ Настроить конечные повторы",
                     callback_data="cschedule:smart",
                 )
             ]
@@ -4507,14 +4504,14 @@ def campaign_schedule_mode_picker(
             [
                 InlineKeyboardButton(
                     text=(
-                        "♻️ Изменить умную рассылку"
+                        "↻ Изменить умную рассылку"
                         if smart_timer_mode
-                        else "♻️ Сделать умной непрерывной"
+                        else "↻ Сделать умной непрерывной"
                     ),
                     callback_data="cschedule:continuous",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="cschedule:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="cschedule:cancel")],
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -4528,7 +4525,7 @@ def dialogue_chain_menu(
     rows = [
         [
             InlineKeyboardButton(
-                text="➕ Добавить сообщение",
+                text="＋ Добавить сообщение",
                 callback_data="campaign:chain:add",
             )
         ]
@@ -4546,11 +4543,11 @@ def dialogue_chain_menu(
         [
             [
                 InlineKeyboardButton(
-                    text=f"✅ Цепочка готова · {step_count} сообщений",
+                    text=f"✓ Цепочка готова · {step_count} сообщений",
                     callback_data="campaign:chain:done",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data=cancel_callback)],
+            [InlineKeyboardButton(text="× Отмена", callback_data=cancel_callback)],
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -4561,11 +4558,11 @@ def campaign_confirmation() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Сохранить и открыть список",
+                    text="✓ Сохранить и открыть список",
                     callback_data="campaign:confirm",
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
@@ -4576,19 +4573,21 @@ def campaign_run_confirmation(
     *,
     ready_targets: int | None = None,
     schedule_after_cooldown: bool = False,
+    launch_token: str | None = None,
 ) -> InlineKeyboardMarkup:
+    token = launch_token or uuid4().hex[:12]
     queue_label = (
-        f"🚀 Подтвердить запуск готовых направлений ({ready_targets})"
+        f"↗ Подтвердить запуск готовых направлений ({ready_targets})"
         if ready_targets is not None
-        else "🚀 Подтвердить запуск"
+        else "↗ Подтвердить запуск"
     )
     rows: list[list[InlineKeyboardButton]] = []
     if schedule_after_cooldown:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🕓 Запланировать после безопасной паузы",
-                    callback_data=f"campaign:run:deferred:{campaign_id}:{page}",
+                    text="◷ Запланировать после безопасной паузы",
+                    callback_data=f"campaign:run:deferred:{campaign_id}:{page}:{token}",
                 )
             ]
         )
@@ -4597,14 +4596,14 @@ def campaign_run_confirmation(
             [
                 InlineKeyboardButton(
                     text=queue_label,
-                    callback_data=f"campaign:run:confirm:{campaign_id}:{page}",
+                    callback_data=f"campaign:run:confirm:{campaign_id}:{page}:{token}",
                 )
             ]
         )
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ К настройкам рассылки",
+                text="‹ К настройкам рассылки",
                 callback_data=f"campaign:details:{campaign_id}:{page}",
             )
         ]
@@ -4618,12 +4617,12 @@ def run_details_menu(run: CampaignRun, page: int) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🛑 Остановить", callback_data=f"run:cancel:{run.id}:{page}"
+                    text="Ⅱ Остановить", callback_data=f"run:cancel:{run.id}:{page}"
                 )
             ]
         )
     rows.append(
-        [InlineKeyboardButton(text="⬅️ К работе и результатам", callback_data=f"menu:runs:{page}")]
+        [InlineKeyboardButton(text="‹ К работе и результатам", callback_data=f"menu:runs:{page}")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -4644,7 +4643,7 @@ def _pagination(builder: InlineKeyboardBuilder, section: str, page: int, pages: 
     builder.row(*navigation)
     jumps: list[InlineKeyboardButton] = []
     if page > 1:
-        jumps.append(InlineKeyboardButton(text="⏮ В начало", callback_data=f"menu:{section}:0"))
+        jumps.append(InlineKeyboardButton(text="‹‹ В начало", callback_data=f"menu:{section}:0"))
     if page > 10:
         jumps.append(
             InlineKeyboardButton(
@@ -4662,7 +4661,7 @@ def _pagination(builder: InlineKeyboardBuilder, section: str, page: int, pages: 
     if page < pages - 2:
         jumps.append(
             InlineKeyboardButton(
-                text="В конец ⏭",
+                text="В конец ››",
                 callback_data=f"menu:{section}:{pages - 1}",
             )
         )
@@ -4692,7 +4691,7 @@ def _proxy_pagination(builder: InlineKeyboardBuilder, page: ProxyPage) -> None:
     builder.row(*navigation)
     jumps: list[InlineKeyboardButton] = []
     if page.page > 1:
-        jumps.append(InlineKeyboardButton(text="⏮ В начало", callback_data=callback_for(0)))
+        jumps.append(InlineKeyboardButton(text="‹‹ В начало", callback_data=callback_for(0)))
     if page.page > 10:
         jumps.append(
             InlineKeyboardButton(
@@ -4709,7 +4708,7 @@ def _proxy_pagination(builder: InlineKeyboardBuilder, page: ProxyPage) -> None:
         )
     if page.page < page.pages - 2:
         jumps.append(
-            InlineKeyboardButton(text="В конец ⏭", callback_data=callback_for(page.pages - 1))
+            InlineKeyboardButton(text="В конец ››", callback_data=callback_for(page.pages - 1))
         )
     if jumps:
         builder.row(*jumps)
@@ -4727,16 +4726,16 @@ def _run_status_label(value: str) -> str:
 
 def _launch_icon(launch: LaunchView) -> str:
     if launch.running:
-        return "🔵"
+        return "↻"
     if launch.queued:
-        return "🕒"
+        return "◷"
     if launch.failed:
-        return "❌"
+        return "×"
     if launch.succeeded == launch.total:
-        return "✅"
+        return "✓"
     if launch.cancelled == launch.total:
-        return "🚫"
-    return "🟠"
+        return "×"
+    return "◷"
 
 
 # All keyboard factories share the same navigation vocabulary. Applying this at

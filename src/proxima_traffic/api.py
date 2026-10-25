@@ -1,12 +1,13 @@
 from collections.abc import AsyncIterator
 from secrets import compare_digest
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from proxima_traffic.account_state import ACCOUNT_PROTECTED_PAUSE_REASONS, locked_account
 from proxima_traffic.bot.repository import AdminRepository
 from proxima_traffic.content import (
     BroadcastContentVariant,
@@ -22,6 +23,7 @@ from proxima_traffic.dialogues import (
 )
 from proxima_traffic.models import (
     Account,
+    AccountStatus,
     ActionLog,
     AuditEvent,
     BroadcastSenderMode,
@@ -36,6 +38,7 @@ from proxima_traffic.models import (
     Target,
     TargetList,
     TargetListItem,
+    ensure_utc,
     utc_now,
 )
 from proxima_traffic.proxies import (
@@ -114,9 +117,6 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
-RunStatusFilter = Annotated[RunStatus | None, Query(alias="status")]
-PageLimit = Annotated[int, Query(ge=1, le=500)]
-PageNumber = Annotated[int, Query(ge=0, le=1_000_000)]
 router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin_key)])
 
 
@@ -288,11 +288,11 @@ async def import_proxies(payload: ProxyBatchCreate, request: Request) -> ProxyIm
 @router.get("/proxies", response_model=PageRead[ProxyRead])
 async def list_proxies(
     request: Request,
-    proxy_status: Annotated[ProxyStatus | None, Query(alias="status")] = None,
-    proxy_filter: Annotated[ProxyFilter, Query(alias="filter")] = ProxyFilter.ALL,
+    proxy_status: ProxyStatus | None = Query(default=None, alias="status"),
+    proxy_filter: ProxyFilter = Query(default=ProxyFilter.ALL, alias="filter"),
     group_id: int | None = None,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[ProxyRead]:
     service: ProxyService = request.app.state.proxy_service
     results = await service.list_proxies(
@@ -489,8 +489,8 @@ async def create_account(payload: AccountCreate, session: SessionDep) -> Account
 @router.get("/accounts", response_model=PageRead[AccountRead])
 async def list_accounts(
     session: SessionDep,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[AccountRead]:
     total = int(await session.scalar(select(func.count(Account.id))) or 0)
     items = list(
@@ -507,10 +507,24 @@ async def update_account(
     payload: AccountUpdate,
     session: SessionDep,
 ) -> Account:
-    account = await session.get(Account, account_id)
+    account = await locked_account(session, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="account not found")
     changes = payload.model_dump(exclude_unset=True)
+    if changes.get("status") == AccountStatus.ACTIVE:
+        cooldown = ensure_utc(account.cooldown_until)
+        if account.cooldown_reason in ACCOUNT_PROTECTED_PAUSE_REASONS or (
+            cooldown and cooldown > utc_now()
+        ):
+            raise HTTPException(
+                status_code=409, detail="Telegram protective pause requires a fresh account check"
+            )
+        if account.status == AccountStatus.DISABLED and not account.authorized:
+            raise HTTPException(
+                status_code=409, detail="Telegram session must be checked or reimported first"
+            )
+    if "status" in changes:
+        account.operator_paused = changes["status"] != AccountStatus.ACTIVE
     for field, value in changes.items():
         setattr(account, field, value)
     add_audit_event(
@@ -578,8 +592,8 @@ async def list_targets(
     session: SessionDep,
     include_list_members: bool = Query(default=False),
     target_list_id: int | None = Query(default=None),
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[TargetRead]:
     if target_list_id is not None:
         list_exists = await session.get(TargetList, target_list_id)
@@ -662,8 +676,8 @@ async def create_target_list(payload: TargetListCreate, request: Request) -> Tar
 @router.get("/target-lists", response_model=PageRead[TargetListRead])
 async def list_target_lists(
     request: Request,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[TargetListRead]:
     repository = AdminRepository(request.app.state.database.session_factory)
     result = await repository.list_target_lists(page, page_size)
@@ -748,8 +762,8 @@ async def create_template(
 @router.get("/templates", response_model=PageRead[MessageTemplateRead])
 async def list_templates(
     session: SessionDep,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[MessageTemplateRead]:
     total = int(await session.scalar(select(func.count(MessageTemplate.id))) or 0)
     items = list(
@@ -840,8 +854,8 @@ async def create_campaign(payload: CampaignCreate, session: SessionDep) -> Campa
 @router.get("/campaigns", response_model=PageRead[CampaignRead])
 async def list_campaigns(
     session: SessionDep,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[CampaignRead]:
     total = int(await session.scalar(select(func.count(Campaign.id))) or 0)
     campaigns = list(
@@ -1018,9 +1032,9 @@ async def enqueue_campaign(
 @router.get("/runs", response_model=PageRead[RunRead])
 async def list_runs(
     session: SessionDep,
-    run_status: RunStatusFilter = None,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    run_status: RunStatus | None = Query(default=None, alias="status"),
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[RunRead]:
     statement = select(CampaignRun).order_by(CampaignRun.id.desc())
     count_statement = select(func.count(CampaignRun.id))
@@ -1121,8 +1135,8 @@ async def get_run(run_id: int, session: SessionDep) -> RunDetails:
 @router.get("/audit", response_model=PageRead[AuditEventRead])
 async def list_audit_events(
     session: SessionDep,
-    page: PageNumber = 0,
-    page_size: PageLimit = 100,
+    page: int = Query(default=0, ge=0, le=1_000_000),
+    page_size: int = Query(default=100, ge=1, le=500),
 ) -> PageRead[AuditEventRead]:
     return PageRead(
         items=list(
@@ -1507,6 +1521,11 @@ async def _campaign_read(
             campaign.dialogue_steps_json,
             primary_account_id=campaign.primary_account_id,
             primary_text=campaign.primary_text,
+            primary_html=campaign.primary_html,
+            primary_media_path=campaign.primary_media_path,
+            primary_media_kind=campaign.primary_media_kind,
+            primary_media_name=campaign.primary_media_name,
+            primary_media_size=campaign.primary_media_size,
             reply_account_id=campaign.reply_account_id,
             reply_text=campaign.reply_text,
             reply_delay_seconds=campaign.reply_delay_seconds,

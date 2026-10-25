@@ -22,6 +22,7 @@ from proxima_traffic.gateways import (
 from proxima_traffic.models import (
     Account,
     ChannelCommentMentionState,
+    ChannelCommentMessage,
     ChannelCommentMode,
     ChannelCommentReactionAccountState,
     ChannelCommentRule,
@@ -30,6 +31,7 @@ from proxima_traffic.models import (
     MentionBlacklistEntry,
     ReactionTask,
     ReactionTaskStatus,
+    ensure_utc,
     utc_now,
 )
 from proxima_traffic.reactions import ReactionWorker
@@ -603,9 +605,28 @@ async def test_channel_comments_ignore_old_posts_and_do_not_duplicate(app: FastA
 
 
 @pytest.mark.asyncio
-async def test_channel_comment_timeout_releases_the_run_for_retry(app: FastAPI) -> None:
-    app.state.settings.worker_step_timeout_seconds = 0.05
+async def test_channel_comment_timeout_after_dispatch_is_not_retried(
+    app: FastAPI, monkeypatch
+) -> None:
+    app.state.settings.worker_step_timeout_seconds = 30
     gateway = BlockingChannelGateway()
+    real_timeout = asyncio.timeout
+    scopes = []
+
+    def capture_timeout(seconds):
+        scope = real_timeout(seconds)
+        if seconds == 30:
+            scopes.append(scope)
+        return scope
+
+    original_send = gateway.send_channel_comment
+
+    async def expire_after_dispatch(**kwargs):
+        scopes[-1].reschedule(asyncio.get_running_loop().time())
+        return await original_send(**kwargs)
+
+    gateway.send_channel_comment = expire_after_dispatch
+    monkeypatch.setattr(asyncio, "timeout", capture_timeout)
     service = _service(app, gateway)
     account = await _account(app, "timeout-comment-sender")
     rule = await service.create_rule(
@@ -624,9 +645,10 @@ async def test_channel_comment_timeout_releases_the_run_for_retry(app: FastAPI) 
     async with app.state.database.session_factory() as session:
         run = await session.scalar(select(ChannelCommentRun))
     assert run is not None
-    assert run.status == ChannelCommentRunStatus.QUEUED
-    assert run.error_code == "comment_timeout"
+    assert run.status == ChannelCommentRunStatus.FAILED
+    assert run.error_code == "delivery_unconfirmed"
     assert run.lease_token is None
+    assert await service.process_next() is False
 
 
 @pytest.mark.asyncio
@@ -658,6 +680,29 @@ async def test_busy_account_defers_comment_without_using_delivery_attempt(app: F
     assert run.status == ChannelCommentRunStatus.QUEUED
     assert run.error_code == "account_operation_busy"
     assert run.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_refused_comment_is_terminal_without_a_guessed_account_pause(app: FastAPI) -> None:
+    gateway = RecordingChannelGateway()
+    gateway.delivery_error = PermanentGatewayError("PeerFloodError", code="account_restricted")
+    service = _service(app, gateway)
+    account = await _account(app, "refused-comment-sender")
+    rule = await service.create_rule(
+        name="Refused comment", channel_ref="@refused_comment_channel",
+        mode=ChannelCommentMode.SINGLE, primary_account_id=account.id,
+        primary_text="Comment", initial_delay_seconds=0,
+    )
+    gateway.posts = (ChannelPost(message_id=14, published_at=utc_now()),)
+    await service.scan_rule(rule.id)
+    assert await service.process_next() is True
+    assert await service.process_next() is False
+    async with app.state.database.session_factory() as session:
+        run = await session.scalar(select(ChannelCommentRun))
+        account = await session.get(Account, account.id)
+        assert run.status == ChannelCommentRunStatus.FAILED
+        assert run.error_code == "account_restricted"
+        assert account.cooldown_until is None
 
 
 @pytest.mark.asyncio
@@ -793,6 +838,16 @@ async def test_channel_comment_dialogue_replies_to_previous_comment(app: FastAPI
     assert [call["account"].id for call in gateway.calls] == [first.id, second.id]
     assert gateway.calls[0]["reply_to_message_id"] is None
     assert gateway.calls[1]["reply_to_message_id"] == 40_001
+    async with app.state.database.session_factory() as session:
+        messages = list(await session.scalars(
+            select(ChannelCommentMessage).order_by(ChannelCommentMessage.step_index)
+        ))
+    assert [message.message_id for message in messages] == [40_001, 40_002]
+    assert [message.account_id for message in messages] == [first.id, second.id]
+    assert all(message.next_check_at is not None for message in messages)
+    view = await service.get_rule_view(rule.id)
+    assert view.delivery.confirmed == view.delivery.pending == 2
+    assert view.legacy_runs_with_incomplete_delivery == 0
 
 
 @pytest.mark.asyncio
@@ -948,7 +1003,6 @@ async def test_saved_comment_mentions_are_reconciled_with_owned_accounts(
     assert view.mentions_skipped_posts == 1
     assert view.mention_count == 0
 
-
 @pytest.mark.asyncio
 async def test_failed_channel_comment_does_not_report_mentions_as_delivered(
     app: FastAPI,
@@ -976,6 +1030,8 @@ async def test_failed_channel_comment_does_not_report_mentions_as_delivered(
     assert run.sent_steps == 0
     assert view.mentions_resolved_posts == 0
     assert view.mention_count == 0
+    async with app.state.database.session_factory() as session:
+        assert await session.scalar(select(func.count(ChannelCommentMessage.id))) == 0
 
 
 @pytest.mark.asyncio
@@ -1033,6 +1089,16 @@ async def test_message_edit_replaces_the_original_comment_after_its_due_time(
         assert run.sent_steps == 1
         assert run.last_comment_message_id == 40_001
         assert stored_account is not None and stored_account.sent_today == 1
+        message = await session.scalar(select(ChannelCommentMessage))
+        assert message is not None and message.message_id == 40_001
+        original_delivered_at = message.delivered_at
+        message.status = "present"
+        message.check_stage = 1
+        message.first_check_status = "present"
+        message.first_checked_at = utc_now()
+        message.lease_owner = "an-old-observer"
+        message.lease_token = "an-old-read"
+        message.lease_until = utc_now() + timedelta(minutes=2)
         run.scheduled_for = utc_now() - timedelta(seconds=1)
         await session.commit()
 
@@ -1062,6 +1128,16 @@ async def test_message_edit_replaces_the_original_comment_after_its_due_time(
         'Финальный комментарий <tg-emoji emoji-id="543210987654321">⭐</tg-emoji>'
     )
     assert edit["idempotency_key"] == f"channel-comment:{run.id}:step:1"
+    async with app.state.database.session_factory() as session:
+        messages = list(await session.scalars(select(ChannelCommentMessage)))
+    assert len(messages) == 1
+    message = messages[0]
+    assert message.delivered_at == original_delivered_at and message.edited_at is not None
+    assert message.status == "pending" and message.check_stage == 0
+    assert message.first_check_status is None and message.lease_token is None
+    assert message.next_check_at == message.edited_at + timedelta(minutes=10)
+    view = await service.get_rule_view(rule.id)
+    assert view.delivery.confirmed == 1
 
 
 @pytest.mark.asyncio
@@ -1270,6 +1346,90 @@ async def test_auto_replacement_requeues_comment_with_verified_fallback_account(
     assert await service.process_next() is True
     assert int(gateway.calls[-1]["account"].id) == fallback.id
     assert (await service.recent_runs(rule.id))[0].status == ChannelCommentRunStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("save_failure", [False, True])
+async def test_comment_result_is_saved_before_account_reservation_is_released(
+    app, monkeypatch, save_failure
+):
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    account = await _account(app, "comment-result-reservation")
+    rule = await service.create_rule(
+        name="Result reservation",
+        channel_ref="@result_reservation",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=account.id,
+        primary_text="Comment",
+        initial_delay_seconds=0,
+    )
+    gateway.posts = (ChannelPost(message_id=66, published_at=utc_now()),)
+    await service.scan_rule(rule.id)
+    record_delivery = service._record_delivery
+    checked = False
+
+    async def guarded_record(*args, **kwargs):
+        nonlocal checked
+        async with app.state.database.session_factory() as session:
+            stored_account = await session.get(Account, account.id)
+            assert stored_account.send_reservation_token is not None
+            assert stored_account.sent_today == 1
+        checked = True
+        if save_failure:
+            raise OSError("local result persistence failed")
+        await record_delivery(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_record_delivery", guarded_record)
+    assert await service.process_next() is True
+    assert checked
+    result = (await service.recent_runs(rule.id))[0]
+    if save_failure:
+        assert result.status == ChannelCommentRunStatus.FAILED
+        assert result.error_code == "delivery_unconfirmed"
+        assert result.sent_steps == 0
+        assert await service.process_next() is False
+    else:
+        assert result.status == ChannelCommentRunStatus.SUCCEEDED
+        assert result.sent_steps == 1
+    assert len(gateway.calls) == 1
+    async with app.state.database.session_factory() as session:
+        stored_account = await session.get(Account, account.id)
+        assert stored_account.send_reservation_token is None
+
+
+async def test_unconfirmed_comment_with_readback_flood_never_replaces_sender(app):
+    gateway = RecordingChannelGateway()
+    service = _service(app, gateway)
+    primary = await _account(app, "readback-primary")
+    await _account(app, "readback-backup")
+    rule = await service.create_rule(
+        name="Unconfirmed readback",
+        channel_ref="@readback_channel",
+        mode=ChannelCommentMode.SINGLE,
+        primary_account_id=primary.id,
+        primary_text="Comment",
+        initial_delay_seconds=0,
+    )
+    await service.set_auto_replace_primary_account(rule.id, True)
+    gateway.posts = (ChannelPost(message_id=777, published_at=utc_now()),)
+    await service.scan_rule(rule.id)
+    error = PermanentGatewayError(
+        "accepted comment cannot be read",
+        code="delivery_unconfirmed",
+        external_message_id=44001,
+    )
+    error.__cause__ = TemporaryGatewayError("readback flood", code="flood_wait", retry_after=900)
+    gateway.delivery_error = error
+    assert await service.process_next() is True
+    run = (await service.recent_runs(rule.id))[0]
+    assert run.status == ChannelCommentRunStatus.FAILED
+    assert run.error_code == "delivery_unconfirmed"
+    assert (await service.get_rule_view(rule.id)).rule.primary_account_id == primary.id
+    async with app.state.database.session_factory() as session:
+        account = await session.get(Account, primary.id)
+        assert account.sent_today == 1
+        assert account.flood_hits == 1
+        assert ensure_utc(account.cooldown_until) >= utc_now() + timedelta(seconds=899)
 
 
 @pytest.mark.asyncio

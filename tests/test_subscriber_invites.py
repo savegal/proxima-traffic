@@ -2,17 +2,25 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select, update
 
+from proxima_traffic.account_state import apply_flood_pause
 from proxima_traffic.bot.subscriber_invite_ui import invite_launch_text
 from proxima_traffic.config import Settings
 from proxima_traffic.db import Database
 from proxima_traffic.direct_messages import DirectMessageService
-from proxima_traffic.gateways import DryRunGateway, PermanentGatewayError, TemporaryGatewayError
+from proxima_traffic.gateways import (
+    DryRunGateway,
+    PermanentGatewayError,
+    SubscriberInviteDelivery,
+    TemporaryGatewayError,
+)
 from proxima_traffic.models import (
     Account,
+    AccountStatus,
     DirectLaunchStatus,
     DirectMessageTaskStatus,
     Subscriber,
@@ -20,6 +28,7 @@ from proxima_traffic.models import (
     SubscriberInviteLaunchAccountState,
     SubscriberInviteTask,
     SubscriberSegment,
+    ensure_utc,
     utc_now,
 )
 from proxima_traffic.services import CampaignRunner, ConflictError
@@ -45,7 +54,7 @@ def _settings(tmp_path: Path, name: str) -> Settings:
     )
 
 
-class PrivacyRouteGateway(DryRunGateway):
+class UnresolvableRouteGateway(DryRunGateway):
     def __init__(self, blocked_account_id: int) -> None:
         super().__init__()
         self.blocked_account_id = blocked_account_id
@@ -55,7 +64,9 @@ class PrivacyRouteGateway(DryRunGateway):
         account = kwargs["account"]
         self.sender_ids.append(int(account.id))
         if int(account.id) == self.blocked_account_id:
-            raise PermanentGatewayError("recipient privacy", code="invite_recipient_privacy")
+            raise PermanentGatewayError(
+                "recipient inaccessible", code="invite_recipient_unresolvable"
+            )
         return await super().invite_subscriber(**kwargs)
 
 
@@ -63,6 +74,175 @@ class UncertainInviteGateway(DryRunGateway):
     async def invite_subscriber(self, **kwargs):
         del kwargs
         raise TemporaryGatewayError("network reply lost", code="network_error")
+
+
+@pytest.mark.parametrize("healthy_backup", [False, True])
+async def test_refused_invite_sender_is_not_used_for_remaining_people(tmp_path, healthy_backup):
+    class RefusedSenderGateway(DryRunGateway):
+        def __init__(self):
+            super().__init__()
+            self.sender_ids = []
+
+        async def invite_subscriber(self, **kwargs):
+            self.sender_ids.append(kwargs["account"].id)
+            if kwargs["account"].id == primary_id:
+                raise PermanentGatewayError("refused", code="account_restricted")
+            return await super().invite_subscriber(**kwargs)
+
+    gateway = RefusedSenderGateway()
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-refused-remaining.db", gateway, records=3
+    )
+    try:
+        async with database.session_factory() as session:
+            primary = Account(label="primary", ownership_confirmed=True)
+            backup = Account(label="backup", ownership_confirmed=True)
+            session.add_all([primary, backup])
+            await session.commit()
+            primary_id, backup_id = primary.id, backup.id
+        campaign = await service.create_campaign(
+            name="Refusal handling",
+            subscriber_list_id=list_id,
+            destination_ref="@owned_channel",
+            segment=SubscriberSegment.ALL,
+            recipient_limit=3,
+            contact_cooldown_days=0,
+            account_ids=[primary_id, backup_id] if healthy_backup else [primary_id],
+        )
+        launch = await service.launch_campaign(campaign.id, consent_confirmed=True)
+        for _ in range(6):
+            if await service.process_next() is None:
+                break
+        assert gateway.sender_ids == (
+            [primary_id, backup_id, backup_id] if healthy_backup else [primary_id]
+        )
+        view = await service.get_launch_view(launch.id)
+        assert view.queued == 0
+        assert view.invited == (2 if healthy_backup else 0)
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.parametrize("readback_flood", [False, True])
+async def test_invite_result_and_account_pause_are_saved_before_releasing_sender(
+    tmp_path, monkeypatch, readback_flood
+):
+    class ReceiptGateway(DryRunGateway):
+        async def invite_subscriber(self, **kwargs):
+            if readback_flood:
+                raise PermanentGatewayError(
+                    "readback failed", code="invite_delivery_unconfirmed"
+                ) from TemporaryGatewayError(
+                    "verification flood", retry_after=900, code="flood_wait"
+                )
+            return await super().invite_subscriber(**kwargs)
+
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-result-reservation.db", ReceiptGateway(), records=1
+    )
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="admin", ownership_confirmed=True)
+            session.add(account)
+            await session.commit()
+            account_id = account.id
+        campaign = await service.create_campaign(
+            name="Result handling",
+            subscriber_list_id=list_id,
+            destination_ref="@owned_channel",
+            segment=SubscriberSegment.ALL,
+            recipient_limit=1,
+            contact_cooldown_days=0,
+            account_ids=[account_id],
+        )
+        await service.launch_campaign(campaign.id, consent_confirmed=True)
+        method_name = "_finish_task" if readback_flood else "_record_success"
+        original = getattr(service, method_name)
+        checked = False
+
+        async def check_reservation(*args, **kwargs):
+            nonlocal checked
+            async with database.session_factory() as session:
+                stored = await session.get(Account, account_id)
+                assert stored.send_reservation_token is not None
+                assert stored.sent_today == 1
+                if readback_flood:
+                    assert stored.flood_hits == 1
+                    assert ensure_utc(stored.cooldown_until) >= utc_now() + timedelta(seconds=899)
+            checked = True
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(service, method_name, check_reservation)
+        task = await service.process_next()
+        assert checked
+        assert task.status == (
+            DirectMessageTaskStatus.FAILED if readback_flood else DirectMessageTaskStatus.SUCCEEDED
+        )
+        if readback_flood:
+            assert task.error_code == "invite_delivery_unconfirmed"
+        assert await service.process_next() is None
+    finally:
+        await database.dispose()
+
+
+async def test_paused_invite_sender_is_rechecked_after_waiting_for_account_slot(
+    tmp_path, monkeypatch
+):
+    class CountingGateway(DryRunGateway):
+        calls = 0
+
+        async def invite_subscriber(self, **kwargs):
+            self.calls += 1
+            return await super().invite_subscriber(**kwargs)
+
+    gateway = CountingGateway()
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-paused-boundary.db", gateway, records=1
+    )
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="admin", ownership_confirmed=True)
+            session.add(account)
+            await session.commit()
+            account_id = account.id
+        campaign = await service.create_campaign(
+            name="Pause boundary",
+            subscriber_list_id=list_id,
+            destination_ref="@owned_channel",
+            segment=SubscriberSegment.ALL,
+            recipient_limit=1,
+            contact_cooldown_days=0,
+            account_ids=[account_id],
+        )
+        await service.launch_campaign(campaign.id, consent_confirmed=True)
+        original = service._runner.run_account_send_operation
+
+        async def pause_before_slot(sender_id, operation):
+            async with database.session_factory() as session:
+                stored = await session.get(Account, sender_id)
+                stored.status = AccountStatus.PAUSED
+                await session.commit()
+            return await original(sender_id, operation)
+
+        monkeypatch.setattr(service._runner, "run_account_send_operation", pause_before_slot)
+        task = await service.process_next()
+        assert gateway.calls == 0
+        assert task.delivery_attempted_at is None
+        assert task.status != DirectMessageTaskStatus.SUCCEEDED
+    finally:
+        await database.dispose()
+
+
+class AlreadyParticipantGateway(DryRunGateway):
+    async def invite_subscriber(self, **kwargs):
+        recipient = kwargs["recipient"]
+        return SubscriberInviteDelivery(
+            telegram_user_id=recipient.telegram_user_id,
+            username=recipient.username,
+            is_premium=None,
+            access_hash=recipient.access_hash,
+            already_participant=True,
+        )
 
 
 class PreRpcInviteGateway(DryRunGateway):
@@ -73,6 +253,36 @@ class PreRpcInviteGateway(DryRunGateway):
     async def invite_subscriber(self, **kwargs):
         del kwargs
         raise TemporaryGatewayError("invite could not start", code=self.code, retry_after=1)
+
+
+@pytest.mark.asyncio
+async def test_restricted_invite_is_terminal_without_a_guessed_account_pause(tmp_path):
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-no-guessed-pause.db", PreRpcInviteGateway("account_restricted"),
+        records=1,
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+    campaign = await service.create_campaign(
+        name="Refused invite", subscriber_list_id=list_id, destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL, recipient_limit=1, contact_cooldown_days=0,
+        account_ids=[account.id],
+    )
+    await service.launch_campaign(campaign.id, consent_confirmed=True)
+    task = await service.process_next()
+    assert task.status == DirectMessageTaskStatus.FAILED
+    assert task.error_code == "account_restricted"
+    assert await service.process_next() is None
+    async with database.session_factory() as session:
+        account = await session.get(Account, account.id)
+        subscriber = await session.get(Subscriber, task.subscriber_id)
+        assert account.cooldown_until is None
+        assert account.sent_today == 0
+        assert subscriber.reserved_invite_launch_id is None
+        assert subscriber.last_invited_at is None
+    await database.dispose()
 
 
 class FatalAccountInviteGateway(DryRunGateway):
@@ -156,6 +366,90 @@ async def _service_with_import(
 
 
 @pytest.mark.asyncio
+async def test_profile_flood_defers_existing_invite_queue_until_deadline(tmp_path, monkeypatch):
+    database, service, list_id = await _service_with_import(
+        tmp_path,
+        "profile-flood-invites.db",
+        DryRunGateway(),
+        records=2,
+    )
+    try:
+        async with database.session_factory() as session:
+            account = Account(label="Invite sender", ownership_confirmed=True)
+            session.add(account)
+            await session.commit()
+            aid = account.id
+        campaign = await service.create_campaign(
+            name="Timed pause",
+            subscriber_list_id=list_id,
+            destination_ref="@owned_channel",
+            segment=SubscriberSegment.ALL,
+            recipient_limit=2,
+            contact_cooldown_days=0,
+            account_ids=[aid],
+        )
+        launch = await service.launch_campaign(campaign.id, consent_confirmed=True)
+        rpc = AsyncMock(wraps=service._gateway.invite_subscriber)
+        monkeypatch.setattr(service._gateway, "invite_subscriber", rpc)
+        async with database.session_factory() as session:
+            account = await session.get(Account, aid)
+            apply_flood_pause(account, 900)
+            deadline = ensure_utc(account.cooldown_until)
+            await session.commit()
+        task = await service.process_next()
+        assert task.status == DirectMessageTaskStatus.QUEUED
+        assert task.delivery_attempted_at is None
+        assert task.attempt_count == 0
+        assert ensure_utc(task.scheduled_for) >= deadline
+        rpc.assert_not_awaited()
+        view = await service.get_launch_view(launch.id)
+        assert view.queued == 2
+        assert view.failed == 0
+        assert view.launch.status != DirectLaunchStatus.FAILED
+        async with database.session_factory() as session:
+            account = await session.get(Account, aid)
+            account.cooldown_until = utc_now() - timedelta(seconds=1)
+            stored = await session.get(SubscriberInviteTask, task.id)
+            stored.scheduled_for = utc_now()
+            await session.commit()
+        resumed = await service.process_next()
+        assert resumed.status == DirectMessageTaskStatus.SUCCEEDED
+        rpc.assert_awaited_once()
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subscriber_invite_admin_setup_grants_selected_accounts(tmp_path: Path) -> None:
+    database, service, _ = await _service_with_import(
+        tmp_path, "invite-admin-setup.db", DryRunGateway()
+    )
+    async with database.session_factory() as session:
+        manager = Account(label="main admin", ownership_confirmed=True)
+        worker = Account(label="worker", ownership_confirmed=True)
+        session.add_all([manager, worker])
+        await session.commit()
+        await session.refresh(manager)
+        await session.refresh(worker)
+    progress: list[tuple[int, int, int, int]] = []
+
+    async def report(checked: int, total: int, granted: int, failed: int) -> None:
+        progress.append((checked, total, granted, failed))
+
+    result = await service.prepare_invite_admins(
+        manager_id=int(manager.id),
+        account_ids=[int(worker.id)],
+        destination_ref="@owned_channel",
+        on_progress=report,
+    )
+
+    assert result.manager_label == "main admin"
+    assert result.granted_labels == ("worker",)
+    assert result.failed == ()
+    assert progress == [(0, 1, 0, 0), (1, 1, 1, 0)]
+
+
+@pytest.mark.asyncio
 async def test_subscriber_invite_launch_records_success_and_prevents_repeat(tmp_path: Path) -> None:
     database, service, list_id = await _service_with_import(
         tmp_path, "invite-success.db", DryRunGateway()
@@ -174,7 +468,16 @@ async def test_subscriber_invite_launch_records_success_and_prevents_repeat(tmp_
         contact_cooldown_days=90,
         account_ids=[int(account.id)],
     )
-    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    progress: list[tuple[int, int, int, int]] = []
+
+    async def report(checked: int, total: int, ready: int, unavailable: int) -> None:
+        progress.append((checked, total, ready, unavailable))
+
+    launch = await service.launch_campaign(
+        int(campaign.id), consent_confirmed=True, on_preflight_progress=report
+    )
+    assert progress[0] == (0, 1, 0, 0)
+    assert progress[-1] == (1, 1, 1, 0)
 
     while await service.process_next() is not None:
         pass
@@ -182,6 +485,7 @@ async def test_subscriber_invite_launch_records_success_and_prevents_repeat(tmp_
     view = await service.get_launch_view(int(launch.id))
     assert view.launch.status == DirectLaunchStatus.SUCCEEDED
     assert view.invited == 2
+    assert view.simulated is True
     async with database.session_factory() as session:
         recipients = list(await session.scalars(select(Subscriber).order_by(Subscriber.id)))
         assert all(item.reserved_invite_launch_id is None for item in recipients)
@@ -194,10 +498,10 @@ async def test_subscriber_invite_launch_records_success_and_prevents_repeat(tmp_
 
 
 @pytest.mark.asyncio
-async def test_subscriber_invite_uses_another_admin_after_privacy_route_failure(
+async def test_subscriber_invite_uses_another_admin_after_identity_resolution_failure(
     tmp_path: Path,
 ) -> None:
-    gateway = PrivacyRouteGateway(blocked_account_id=1)
+    gateway = UnresolvableRouteGateway(blocked_account_id=1)
     database, service, list_id = await _service_with_import(
         tmp_path, "invite-reroute.db", gateway, records=1
     )
@@ -264,15 +568,125 @@ async def test_subscriber_invite_never_retries_an_uncertain_telegram_outcome(
         contact_cooldown_days=0,
         account_ids=[int(account.id)],
     )
-    await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
     result = await service.process_next()
 
     assert result is not None
     assert result.status == DirectMessageTaskStatus.FAILED
     assert result.error_code == "invite_delivery_unconfirmed"
+    view = await service.get_launch_view(int(launch.id))
+    assert view.invited == 0
+    assert view.uncertain == 1
+    async with database.session_factory() as session:
+        sender = await session.get(Account, int(account.id))
+        assert sender.sent_today == 1
     assert await service.process_next() is None
     with pytest.raises(ConflictError, match="нет доступных"):
         await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_existing_participant_is_not_counted_as_new_invite_or_sender_send(
+    tmp_path: Path,
+) -> None:
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-existing-member.db", AlreadyParticipantGateway(), records=1
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Existing participant",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[int(account.id)],
+    )
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    result = await service.process_next()
+
+    assert result.status == DirectMessageTaskStatus.SUCCEEDED
+    assert result.already_participant is True
+    view = await service.get_launch_view(int(launch.id))
+    assert view.invited == 0
+    assert view.already_participant == 1
+    assert view.last_error_code is None
+    async with database.session_factory() as session:
+        subscriber = await session.scalar(select(Subscriber))
+        sender = await session.get(Account, int(account.id))
+        assert subscriber.invite_count == 0
+        assert subscriber.last_invited_at is None
+        assert sender.sent_today == 0
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_invite_before_rpc_is_retried_without_unknown_result(
+    tmp_path: Path,
+) -> None:
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-pre-rpc-interruption.db", DryRunGateway(), records=1
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Invite pre-RPC interruption",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[int(account.id)],
+    )
+    await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    task = await service._claim_next()
+    assert task is not None
+    recovered = await service._handle_interrupted_task(task.id, task.lease_token, "step_timeout")
+    assert recovered.status == DirectMessageTaskStatus.QUEUED
+    assert recovered.error_code == "step_timeout"
+    async with database.session_factory() as session:
+        sender = await session.get(Account, int(account.id))
+        assert sender.sent_today == 0
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invite_launch_cannot_switch_from_simulation_to_live(tmp_path: Path) -> None:
+    gateway = DryRunGateway()
+    database, service, list_id = await _service_with_import(
+        tmp_path, "invite-mode-snapshot.db", gateway, records=1
+    )
+    async with database.session_factory() as session:
+        account = Account(label="admin", ownership_confirmed=True)
+        session.add(account)
+        await session.commit()
+        await session.refresh(account)
+    campaign = await service.create_campaign(
+        name="Invite mode snapshot",
+        subscriber_list_id=list_id,
+        destination_ref="@owned_channel",
+        segment=SubscriberSegment.ALL,
+        recipient_limit=1,
+        contact_cooldown_days=0,
+        account_ids=[int(account.id)],
+    )
+    launch = await service.launch_campaign(int(campaign.id), consent_confirmed=True)
+    service._settings.dry_run = False
+
+    result = await service.process_next()
+
+    assert result.status == DirectMessageTaskStatus.FAILED
+    assert result.error_code == "launch_mode_changed"
+    assert (await service.get_launch_view(int(launch.id))).simulated is True
+    assert gateway._next_message_id == 10_000
     await database.dispose()
 
 
@@ -314,7 +728,7 @@ async def test_pre_rpc_invite_failures_do_not_become_delivery_unconfirmed(
     assert retry_view.next_scheduled_for is not None
     assert (DirectMessageTaskStatus.QUEUED, code, 1) in retry_view.issues
     retry_text = invite_launch_text(retry_view)
-    assert "Ближайшая безопасная попытка" in retry_text
+    assert "Следующая проверка очереди" in retry_text
     assert "Основные причины" in retry_text
     async with database.session_factory() as session:
         task = await session.scalar(
@@ -427,6 +841,7 @@ async def test_subscriber_invite_marks_expired_started_request_as_unknown(
         task.lease_token = "stale-token"
         task.lease_until = now - timedelta(seconds=1)
         task.delivery_attempted_at = now
+        task.sender_account_id = int(account.id)
         await session.commit()
 
     assert await service.process_next() is None
@@ -443,6 +858,8 @@ async def test_subscriber_invite_marks_expired_started_request_as_unknown(
         assert subscriber.reserved_invite_launch_id is None
         assert subscriber.last_invited_at is None
         assert subscriber.last_invite_attempt_at is not None
+        sender = await session.get(Account, int(account.id))
+        assert sender.sent_today == 1
     view = await service.get_launch_view(int(launch.id))
     assert view.launch.status == DirectLaunchStatus.FAILED
     await database.dispose()
@@ -677,13 +1094,15 @@ async def test_subscriber_invite_preflight_reports_each_unavailable_admin(tmp_pa
 
 
 def test_subscriber_invite_destination_normalization() -> None:
+    assert normalize_invite_destination_ref("@rare") == ("@rare", "@rare")
+    assert normalize_invite_destination_ref("https://t.me/Rare/42") == ("@Rare", "@rare")
     assert normalize_invite_destination_ref("https://t.me/Owned_Channel") == (
         "@Owned_Channel",
         "@owned_channel",
     )
     assert normalize_invite_destination_ref("https://t.me/+A1_b2") == (
         "https://t.me/+A1_b2",
-        "https://t.me/+a1_b2",
+        "https://t.me/+A1_b2",
     )
     normalized_public = normalize_invite_destination_ref(
         "https://www.telegram.me/s/Owned_Channel/42?single"
@@ -694,7 +1113,7 @@ def test_subscriber_invite_destination_normalization() -> None:
     )
     assert normalize_invite_destination_ref("https://telegram.me/joinchat/A1_b2#details") == (
         "https://t.me/+A1_b2",
-        "https://t.me/+a1_b2",
+        "https://t.me/+A1_b2",
     )
     with pytest.raises(ValueError):
         normalize_invite_destination_ref("https://example.com/not-a-chat")

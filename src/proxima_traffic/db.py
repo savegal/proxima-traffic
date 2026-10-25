@@ -1,15 +1,56 @@
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import event, inspect, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from proxima_traffic.instance_lock import BotInstanceAlreadyRunning, BotInstanceLock
+
+_SQLITE_TRANSIENT_LOCK_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+)
+
+
+@dataclass(slots=True)
+class SqlTiming:
+    query_count: int = 0
+    total_seconds: float = 0.0
+
+
+_sql_timing: ContextVar[SqlTiming | None] = ContextVar("sql_timing", default=None)
+
+
+def begin_sql_timing() -> Token[SqlTiming | None]:
+    return _sql_timing.set(SqlTiming())
+
+
+def end_sql_timing(token: Token[SqlTiming | None]) -> SqlTiming:
+    timing = _sql_timing.get() or SqlTiming()
+    _sql_timing.reset(token)
+    return timing
+
+
+def is_transient_sqlite_lock(exc: OperationalError) -> bool:
+    """Recognize SQLite's recoverable single-writer contention.
+
+    The durable workers use this to wait for a large import or an operator
+    action to finish instead of treating an ordinary SQLite write collision as
+    a delivery failure.  Other database errors must still be surfaced.
+    """
+
+    message = str(getattr(exc, "orig", exc)).casefold()
+    return any(marker in message for marker in _SQLITE_TRANSIENT_LOCK_MARKERS)
 
 
 class Database:
@@ -24,6 +65,8 @@ class Database:
         self.engine = create_async_engine(url, pool_pre_ping=True)
         if url.startswith("sqlite+aiosqlite:"):
             event.listen(self.engine.sync_engine, "connect", self._enable_sqlite_foreign_keys)
+            event.listen(self.engine.sync_engine, "before_cursor_execute", self._before_sql)
+            event.listen(self.engine.sync_engine, "after_cursor_execute", self._after_sql)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -150,7 +193,40 @@ class Database:
         del connection_record
         cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        # A bounded wait avoids blocking the control panel behind a broken
+        # external writer.  Durable workers recognize a timeout as transient
+        # and retry after a brief pause.
+        cursor.execute("PRAGMA busy_timeout=60000")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
+
+    @staticmethod
+    def _before_sql(
+        connection: object,
+        cursor: object,
+        statement: object,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        del connection, cursor, statement, parameters, executemany
+        timing = _sql_timing.get()
+        if timing is not None:
+            timing.query_count += 1
+            context._proxima_started_at = time.perf_counter()  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _after_sql(
+        connection: object,
+        cursor: object,
+        statement: object,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        del connection, cursor, statement, parameters, executemany
+        timing = _sql_timing.get()
+        started_at = getattr(context, "_proxima_started_at", None)
+        if timing is not None and started_at is not None:
+            timing.total_seconds += time.perf_counter() - float(started_at)

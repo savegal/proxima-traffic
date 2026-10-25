@@ -5,9 +5,8 @@ Revises: 0063_campaign_queue_poll_indexes
 Create Date: 2026-08-19
 """
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision = "0064_channel_comment_formatted_text"
 down_revision = "0063_campaign_queue_poll_indexes"

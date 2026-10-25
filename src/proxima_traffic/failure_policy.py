@@ -23,6 +23,21 @@ class FailureScope(StrEnum):
 
 
 ACCOUNT_FATAL_CODES = frozenset({"account_dead", "account_unauthorized"})
+CAMPAIGN_UNCERTAIN_CODES = frozenset(
+    {
+        "delivery_unconfirmed",
+        "step_timeout",
+        "unhandled_execution_error",
+        "account_chat_access_lost",
+        "cancelled_outcome_unknown",
+    }
+)
+CAMPAIGN_NON_RETRYABLE_CODES = CAMPAIGN_UNCERTAIN_CODES | frozenset({
+    "lease_expired", "post_deleted_by_moderation", "album_partial_missing",
+})
+ACCEPTED_CAMPAIGN_ACTION_CODES = frozenset({
+    "post_deleted_by_moderation", "membership_gate_recovered", "album_partial_missing",
+})
 ACCOUNT_TEMPORARY_CODES = frozenset(
     {
         "account_restricted",
@@ -85,6 +100,7 @@ TRANSIENT_CODES = frozenset(
         "comment_timeout",
         "delivery_unconfirmed",
         "join_throttled",
+        "join_completed",
         "network_error",
         "proxy_unavailable",
         "reaction_delivery_unconfirmed",
@@ -111,8 +127,9 @@ _FAILURE_LABELS = {
     "account_missing_post_rights": "аккаунту не выдано право публиковать в канале",
     "account_operation_busy": "аккаунт занят другой операцией",
     "account_pacing": "отправка отложена безопасным лимитом аккаунта",
+    "join_completed": "аккаунт вступил в чат; пауза перед публикацией",
     "account_paused": "аккаунт поставлен на паузу",
-    "account_restricted": "Telegram временно ограничил аккаунт",
+    "account_restricted": "Telegram отказал в отправке с аккаунта",
     "account_send_forbidden": (
         "этому аккаунту сейчас запрещено писать в чате (бан не подтверждён)"
     ),
@@ -133,11 +150,20 @@ _FAILURE_LABELS = {
     "comment_invalid": "текст или настройки комментария некорректны",
     "comment_timeout": "отправка комментария не завершилась вовремя",
     "comments_unavailable": "комментарии к публикации отключены или недоступны",
+    "comment_thread_changed": "ветка обсуждения изменилась",
+    "comment_execution_mode_changed": "режим тестовой / реальной отправки изменился",
+    "comment_paid_message_required": "обсуждение требует оплату Stars",
+    "comment_sender_requires_premium": "для комментария требуется Telegram Premium",
     "completed_during_cancel": "операция завершилась во время остановки",
     "contact_invalid": "данные контакта некорректны",
     "content_forbidden": "выбранный тип содержимого запрещён в чате",
     "content_invalid": "содержимое сообщения некорректно",
-    "delivery_unconfirmed": "Telegram принял запрос, но доставка ещё не подтверждена",
+    "delivery_unconfirmed": "результат отправки Telegram не подтверждён",
+    "delivery_outcome_unknown": "отправка прервалась; результат Telegram неизвестен",
+    "launch_mode_changed": "режим симуляции изменился после создания запуска",
+    "database_busy": "подготовка отложена из-за занятости базы данных",
+    "telegram_forbidden": "Telegram запретил запрос; причина не распознана",
+    "recipient_content_forbidden": "получатель не принимает этот тип сообщения",
     "flood_wait": "Telegram потребовал паузу перед следующей операцией",
     "gateway_error": "Telegram-шлюз вернул ошибку",
     "gateway_permanent": "Telegram окончательно отклонил операцию",
@@ -146,14 +172,33 @@ _FAILURE_LABELS = {
     "join_request_pending": "заявка на вступление ожидает одобрения",
     "join_throttled": "вступление отложено безопасным лимитом",
     "invite_already_participant": "человек уже состоит в выбранной цели",
+    "invite_admin_manager_rights": "у главного аккаунта нет права назначать администраторов",
+    "invite_admin_limit": "в цели достигнут лимит администраторов",
+    "invite_admin_fresh_restriction": "Telegram пока запрещает новому администратору менять права",
+    "invite_admin_update_unconfirmed": "изменение прав администратора не подтверждено",
+    "invite_admin_target_unresolvable": (
+        "Telegram не смог найти аккаунт для назначения администратором"
+    ),
     "invite_delivery_unconfirmed": "результат приглашения Telegram не подтверждён",
     "invite_destination_full": "в выбранной цели достигнут лимит участников",
-    "invite_destination_invalid": "цель приглашения не является каналом или супергруппой",
+    "invite_destination_changed": "адрес теперь ведёт к другому каналу или группе",
+    "invite_destination_unverified": "в старом запуске не сохранён ID цели Telegram",
+    "invite_destination_invalid": "цель приглашения недействительна или не поддерживается",
+    "invite_destination_link_invalid": "приватная ссылка приглашения недействительна или истекла",
     "invite_destination_rights": "у аккаунта нет права приглашать участников в цель",
     "invite_destination_unavailable": "выбранная цель недоступна этому аккаунту",
     "invite_launch_cancelled": "запуск приглашений остановлен",
     "invite_recipient_limit": "у человека достигнут лимит каналов и групп Telegram",
     "invite_recipient_privacy": "настройки человека не разрешают это приглашение",
+    "invite_recipient_privacy_premium_pm": (
+        "приватность запрещает приглашение; для личной ссылки также требуется Premium"
+    ),
+    "invite_recipient_contact_required": "приглашение доступно только взаимным контактам",
+    "invite_sender_requires_premium": "для приглашения нужен Premium у приглашающего аккаунта",
+    "invite_recipient_kicked": "человек исключён из выбранной цели",
+    "invite_recipient_segment_changed": "текущий Premium-статус человека не соответствует сегменту",
+    "invite_preflight_unavailable": "проверка перед приглашением временно недоступна",
+    "invite_request_rejected": "Telegram отказал в добавлении участника",
     "invite_recipient_unavailable": "человека нельзя пригласить по сохранённым данным",
     "invite_recipient_unresolvable": "аккаунт не может безопасно разрешить человека",
     "invite_reservation_lost": "человек уже занят другим запуском приглашений",
@@ -170,7 +215,10 @@ _FAILURE_LABELS = {
     "participant_reaction_timeout": "авто-реакция не завершилась вовремя",
     "peer_flood": "Telegram ограничил активность аккаунта",
     "premium_emoji_unavailable": "Telegram не принял Premium Emoji в сообщении",
-    "post_deleted_by_moderation": "публикация удалена модерацией сразу после отправки",
+    "post_deleted_by_moderation": "публикация не найдена после отправки",
+    "album_partial_missing": "часть отправленного альбома отсутствует",
+    "preparation_timeout": "подготовка сообщения не завершилась вовремя",
+    "preparation_failed": "сбой подготовки до отправки",
     "primary_account_auto_replaced": "основной аккаунт автоматически заменён",
     "preflight_dialogue_not_ready": "не все аккаунты диалога готовы к этому чату",
     "preflight_account_cooldown": "аккаунт временно на защитной паузе Telegram",
@@ -189,10 +237,17 @@ _FAILURE_LABELS = {
     "recipient_reservation_lost": "получатель уже занят другим запуском",
     "recipient_unavailable": "получатель удалён или больше недоступен",
     "recipient_unresolvable": "получателя нельзя безопасно разрешить по сохранённым данным",
+    "service_already_set": "настройка уже установлена; нового сервисного сообщения нет",
+    "service_username_required": "для сервисного действия нужен @username",
+    "service_recipient_not_premium": "у получателя больше нет Premium",
+    "service_sender_requires_premium": "для этого действия нужен Premium у аккаунта",
+    "service_sender_unavailable": "назначенный аккаунт не готов; автозамена запрещена",
+    "service_forbidden": "Telegram запретил изменение настройки диалога",
+    "service_unsupported": "клиент не поддерживает настройку личного диалога",
+    "service_invalid": "неверная настройка сервисного действия",
+    "service_notification_unconfirmed": "настройка подтверждена; сервисное сообщение не проверено",
     "reaction_invalid": "выбранная реакция некорректна",
-    "reaction_delivery_unconfirmed": (
-        "Telegram принял реакцию, но не подтвердил её отображение"
-    ),
+    "reaction_delivery_unconfirmed": ("Telegram принял реакцию, но не подтвердил её отображение"),
     "reaction_timeout": "реакция не завершилась вовремя",
     "reaction_unavailable": (
         "выбранная реакция запрещена в этом сообщении или недоступна аккаунту"
@@ -207,6 +262,7 @@ _FAILURE_LABELS = {
     "rule_auto_paused": "правило автоматически остановлено после постоянной ошибки",
     "rule_paused": "правило остановлено",
     "sender_unavailable": "назначенный аккаунт недоступен",
+    "sender_refused_in_launch": "аккаунт исключён из запуска после отказа Telegram",
     "slow_mode": "в чате действует медленный режим",
     "spambot_unavailable": "@SpamBot не ответил или недоступен этому аккаунту",
     "step_timeout": "этап отправки не завершился вовремя",
@@ -238,7 +294,10 @@ _FAILURE_HINTS = {
     ),
     "account_operation_busy": "Сервис повторит операцию после освобождения аккаунта.",
     "account_pacing": "Ничего делать не нужно: сервис продолжит автоматически.",
-    "account_restricted": "Аккаунт поставлен на паузу и будет перепроверен автоматически.",
+    "account_restricted": (
+        "Telegram не сообщил срок снятия ограничения. Проверьте статус аккаунта; "
+        "отказ сам по себе не означает обязательное ожидание 24 часов."
+    ),
     "account_send_forbidden": (
         "Сервис исключит только эту пару; это может быть режим чата или ограничение прав."
     ),
@@ -256,21 +315,54 @@ _FAILURE_HINTS = {
     "comment_edit_unavailable": "Проверьте автора комментария и допустимый срок редактирования.",
     "comment_timeout": "Сервис проверит результат и выполнит безопасный повтор.",
     "comments_unavailable": "Проверьте, включено ли обсуждение у публикации канала.",
+    "comment_thread_changed": (
+        "Продолжение остановлено, чтобы не написать в другую ветку. Проверьте обсуждение канала."
+    ),
+    "comment_execution_mode_changed": (
+        "Начатая цепочка или редактирование остановлены. Новые посты используют текущий режим."
+    ),
+    "comment_paid_message_required": (
+        "Сервис не оплачивает комментарии. Выберите обсуждение без обязательной оплаты."
+    ),
+    "comment_sender_requires_premium": (
+        "Проверьте подписку выбранного аккаунта; автоповтор не выполняется."
+    ),
     "content_forbidden": (
         "Измените тип медиа или разрешения чата; текстовая отправка не блокируется."
     ),
     "content_invalid": "Исправьте текст, разметку или вложения перед повтором.",
     "delivery_unconfirmed": (
-        "Не запускайте задачу вручную: сервис сначала проверит возможный дубль."
+        "Проверьте диалог или чат отправителя до ручного повтора, чтобы избежать дубля."
     ),
+    "launch_mode_changed": "Создайте новый запуск в текущем режиме работы сервиса.",
     "flood_wait": "Сервис соблюдёт паузу Telegram и продолжит автоматически.",
     "join_request_pending": "Дождитесь одобрения заявки или выберите другой доступный чат.",
     "join_throttled": "Ничего делать не нужно: вступление продолжится после безопасной паузы.",
     "invite_delivery_unconfirmed": (
         "Повтор не выполняется автоматически: Telegram мог добавить человека до потери ответа."
     ),
+    "invite_admin_manager_rights": (
+        "Сделайте главный аккаунт владельцем или дайте ему право «Добавлять администраторов / "
+        "Add new admins», затем повторите подготовку прав."
+    ),
+    "invite_admin_limit": "Уберите ненужных администраторов перед повторной подготовкой.",
+    "invite_admin_fresh_restriction": "Дождитесь снятия ограничения Telegram; срок не указан.",
+    "invite_admin_update_unconfirmed": (
+        "Проверьте фактические права выбранного аккаунта в Telegram."
+    ),
+    "invite_admin_target_unresolvable": (
+        "Обновите @username аккаунта или сделайте его доступным главному аккаунту; одного "
+        "числового Telegram ID для назначения обычно недостаточно."
+    ),
     "invite_destination_full": "Освободите место в цели или выберите другую цель.",
+    "invite_destination_changed": "Проверьте адрес и создайте новый запуск для нужной цели.",
+    "invite_destination_unverified": (
+        "Создайте новый запуск: сервис заново проверит и закрепит цель."
+    ),
     "invite_destination_invalid": "Укажите канал или супергруппу, которыми вы управляете.",
+    "invite_destination_link_invalid": (
+        "Укажите действующую приватную ссылку и создайте новый запуск."
+    ),
     "invite_destination_rights": (
         "Выдайте выбранному аккаунту права администратора с разрешением приглашать участников."
     ),
@@ -283,7 +375,22 @@ _FAILURE_HINTS = {
     ),
     "invite_recipient_limit": "Запись пропущена без повторных попыток.",
     "invite_recipient_privacy": (
-        "Сервис может попробовать другой выбранный аккаунт, но не добавляет человека в контакты."
+        "Контакт пропущен. Автоматический повтор через другие аккаунты не выполняется."
+    ),
+    "invite_recipient_privacy_premium_pm": (
+        "Premium нужен для личной ссылки, но не снимает запрет на добавление. Контакт пропущен."
+    ),
+    "invite_recipient_contact_required": "Контакт пропущен; сервис не меняет контакты аккаунтов.",
+    "invite_sender_requires_premium": (
+        "Контакт пропущен. Проверьте подписку приглашающего аккаунта перед ручным новым запуском."
+    ),
+    "invite_recipient_kicked": "Контакт пропущен; сервис не снимает запреты администраторов.",
+    "invite_recipient_segment_changed": "Контакт пропущен: сегмент проверен по текущему профилю.",
+    "invite_preflight_unavailable": (
+        "Приглашение ещё не отправлено; проверка повторится после паузы."
+    ),
+    "invite_request_rejected": (
+        "Участник не добавлен. Технический ответ Telegram сохранён в отчёте."
     ),
     "invite_recipient_unavailable": "Обновите базу подписчиков; запись пропущена безопасно.",
     "invite_recipient_unresolvable": (
@@ -304,6 +411,11 @@ _FAILURE_HINTS = {
     "membership_gate_verification_failed": "Проверьте требования бота-модератора вручную.",
     "network_error": "Сервис повторит операцию автоматически.",
     "post_deleted_by_moderation": "Проверьте правила чата и требования его бота-модератора.",
+    "album_partial_missing": (
+        "Повтор альбома запрещён, чтобы не дублировать сохранившиеся элементы."
+    ),
+    "preparation_timeout": "Запрос отправки ещё не начался; подготовка повторится после паузы.",
+    "preparation_failed": "Запрос отправки ещё не начался; устраните причину и повторите задачу.",
     "primary_account_auto_replaced": (
         "Новый аккаунт прошёл проверку канала; будущие первые комментарии пойдут от него."
     ),
@@ -325,10 +437,16 @@ _FAILURE_HINTS = {
         "Добавьте или включите рабочий HTTP(S)/SOCKS5-прокси."
     ),
     "recipient_identity_mismatch": "Запись пропущена, чтобы сообщение не ушло другому человеку.",
+    "delivery_outcome_unknown": (
+        "Проверьте диалог отправителя вручную; автоматическая повторная отправка запрещена."
+    ),
+    "telegram_forbidden": "Сохранён исходный код Telegram; проверьте детали ошибки в запуске.",
+    "recipient_content_forbidden": "Для этого получателя нужен другой разрешённый тип сообщения.",
+    "database_busy": "Подготовка повторится автоматически, когда база освободится.",
     "recipient_blacklisted": "Запись пропущена без попытки отправки.",
     "recipient_opted_out": "Запись пропущена без попытки отправки.",
     "recipient_paid_message_required": (
-        "Запись пропущена: сервис никогда не списывает Stars без отдельного разрешения."
+        "Получатель в карантине ЛС; сервис не оплачивает Stars. Доступна проверка без отправки."
     ),
     "recipient_privacy_restricted": (
         "Запись пропущена; повтор с этого аккаунта не поможет без изменения приватности."
@@ -336,7 +454,10 @@ _FAILURE_HINTS = {
     "recipient_requires_premium": "Выберите Premium-аккаунт отправителя либо исключите запись.",
     "recipient_route_blocked": "Сервис попробует другой выбранный аккаунт, если он доступен.",
     "recipient_reservation_lost": "Запись не будет отправлена повторно.",
-    "recipient_unavailable": "Обновите базу; запись останется недоступной для новых запусков.",
+    "recipient_unavailable": (
+        "Получатель в карантине ЛС; импорт не снимает его. "
+        "Доступна проверка свежих данных Telegram."
+    ),
     "recipient_unresolvable": "Нужен актуальный username или доступ аккаунта к общему чату.",
     "reactor_removed_from_rule": (
         "Задача отменена до отправки: правило теперь использует другой набор аккаунтов."
@@ -369,6 +490,8 @@ CHANNEL_COMMENT_AUTO_PAUSE_CODES = (
             "account_paused",
             "channel_required",
             "comment_invalid",
+            "comment_paid_message_required",
+            "comment_sender_requires_premium",
             "content_forbidden",
             "join_request_pending",
             "media_unavailable",

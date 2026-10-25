@@ -6,7 +6,14 @@ import logging
 from html import escape
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import CallbackQuery, ErrorEvent, Message, Update
+from aiogram.types import (
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from sqlalchemy.exc import SQLAlchemyError
 
 from proxima_traffic.accounts import (
@@ -18,6 +25,7 @@ from proxima_traffic.accounts import (
 from proxima_traffic.content import ContentError
 from proxima_traffic.proxies import ProxyInputError, ProxyRouteUnavailable
 from proxima_traffic.services import ConflictError, DomainError, NotFoundError, safe_error_message
+from proxima_traffic.subscriber_import import SubscriberImportError
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +68,8 @@ def operator_error_message(exception: Exception) -> str:
         return safe_error_message(exception)[:500]
     if isinstance(exception, ContentError):
         return safe_error_message(exception)[:500]
+    if isinstance(exception, SubscriberImportError):
+        return str(exception)[:500]
     if isinstance(exception, (ValueError, KeyError, IndexError)):
         return "Эта кнопка или введённые данные устарели. Обновите экран и повторите действие."
     if isinstance(exception, DomainError):
@@ -109,12 +119,19 @@ async def _answer_callback(callback: CallbackQuery, message: str) -> None:
         await callback.answer(message[:190], show_alert=True)
     except Exception:  # Callback may have expired while the failed action ran.
         logger.debug("Could not acknowledge failed callback", exc_info=True)
+        if isinstance(callback.message, Message):
+            await _answer_message(callback.message, message)
 
 
 async def _answer_message(message: Message, text: str) -> None:
     try:
         await message.answer(
-            "⚠️ <b>Действие не выполнено</b>\n" + escape(text),
+            "! <b>Не удалось завершить действие</b>\n" + escape(text),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⌂ Открыть панель", callback_data="menu:home")]
+                ]
+            ),
         )
     except Exception:
         logger.debug("Could not answer failed message", exc_info=True)

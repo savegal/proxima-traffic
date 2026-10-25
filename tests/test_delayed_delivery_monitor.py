@@ -125,6 +125,7 @@ async def _sent_action(app, *, account_label: str = "monitor-account") -> tuple[
             target_id=target.id,
             kind=ActionKind.PRIMARY_MESSAGE,
             status=ActionStatus.SUCCEEDED,
+            simulated=False,
             external_message_id=77_001,
             text="Allowed update",
             created_at=utc_now() - timedelta(minutes=11),
@@ -165,7 +166,7 @@ async def test_delayed_monitor_marks_confirmed_removed_post_as_bad_target(app) -
         assert action.error_code == "post_deleted_by_moderation"
         assert action.delayed_delivery_checked_at is not None
         assert target is not None and target.quality_status == "bad"
-        assert "moderation" in (target.quality_reason or "")
+        assert "причина неизвестна" in (target.quality_reason or "")
 
 
 async def test_delayed_monitor_recovers_a_subscription_gate_and_requeues_latest_step(app) -> None:

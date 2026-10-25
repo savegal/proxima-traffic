@@ -755,7 +755,7 @@ async def test_successful_check_recovers_only_expired_temporary_cooldown(
 
     async def healthy(*args: object) -> object:
         del args
-        return type("Me", (), {"id": 42})()
+        return type("Me", (), {"id": account.telegram_user_id})()
 
     monkeypatch.setattr(service, "_fetch_me", healthy)
     result = await service.check_account(int(account.id))
@@ -776,7 +776,7 @@ def test_account_check_error_masks_proxy_passwords() -> None:
     assert "secret-password" not in safe
 
 
-def test_account_check_classifies_all_fatal_auth_failures() -> None:
+def test_account_check_does_not_revoke_sessions_on_ambiguous_auth_failures() -> None:
     auth_key_error = type("AuthKeyError", (Exception,), {})()
     raw_auth_error = type(
         "RpcError",
@@ -784,8 +784,8 @@ def test_account_check_classifies_all_fatal_auth_failures() -> None:
         {"message": "AUTH_KEY_PERM_EMPTY"},
     )()
 
-    assert _account_check_failure_code(auth_key_error) == "account_dead"
-    assert _account_check_failure_code(raw_auth_error) == "account_dead"
+    assert _account_check_failure_code(auth_key_error) == "account_check_unavailable"
+    assert _account_check_failure_code(raw_auth_error) == "account_check_unavailable"
 
 
 def test_account_session_import_requires_a_dedicated_encryption_key(tmp_path: pathlib.Path) -> None:

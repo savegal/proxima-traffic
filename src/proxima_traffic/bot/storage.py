@@ -7,6 +7,7 @@ from typing import Any
 
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
+from sqlalchemy import delete
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -64,6 +65,15 @@ class DatabaseFsmStorage(BaseStorage):
             except (TypeError, json.JSONDecodeError):
                 return {}
             return data if isinstance(data, dict) else {}
+
+    async def clear(self, key: StorageKey) -> None:
+        """Clear state and data atomically with one write and one commit."""
+
+        async with self._session_factory() as session:
+            await session.execute(
+                delete(BotFsmState).where(BotFsmState.storage_key == self._key(key))
+            )
+            await session.commit()
 
     async def close(self) -> None:
         return None

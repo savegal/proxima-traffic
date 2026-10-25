@@ -292,6 +292,8 @@ def cleanup_media_orphans(
             continue
         scanned += 1
         resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            continue
         if resolved in references:
             continue
         modified_at = datetime.fromtimestamp(candidate.stat().st_mtime, UTC)
@@ -323,17 +325,19 @@ def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         if "campaigns" in tables:
-            for media_path, variants_json in connection.execute(
-                "SELECT primary_media_path, content_variants_json FROM campaigns"
+            for media_path, variants_json, dialogue_json in connection.execute(
+                "SELECT primary_media_path, content_variants_json, dialogue_steps_json "
+                "FROM campaigns"
             ):
                 if isinstance(media_path, str):
                     raw_paths.add(media_path)
                 raw_paths.update(_media_paths_from_json(variants_json))
+                raw_paths.update(_media_paths_from_json(dialogue_json))
         if "campaign_runs" in tables:
-            for media_path, media_json, variants_json in connection.execute(
+            for media_path, media_json, variants_json, dialogue_json in connection.execute(
                 """
                 SELECT primary_media_path_snapshot, media_items_snapshot_json,
-                       content_variants_snapshot_json
+                       content_variants_snapshot_json, dialogue_steps_snapshot_json
                 FROM campaign_runs
                 """
             ):
@@ -341,6 +345,7 @@ def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
                     raw_paths.add(media_path)
                 raw_paths.update(_media_paths_from_json(media_json))
                 raw_paths.update(_media_paths_from_json(variants_json))
+                raw_paths.update(_media_paths_from_json(dialogue_json))
         if "direct_campaigns" in tables:
             for (media_path,) in connection.execute(
                 "SELECT primary_media_path FROM direct_campaigns"
@@ -353,6 +358,10 @@ def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
             ):
                 if isinstance(media_path, str):
                     raw_paths.add(media_path)
+        if "story_tagging_campaigns" in tables:
+            for (media_path,) in connection.execute("SELECT media_path FROM story_tagging_campaigns"):
+                if isinstance(media_path, str):
+                    raw_paths.add(media_path)
         if "channel_comment_rules" in tables:
             for media_path, dialogue_steps_json in connection.execute(
                 "SELECT primary_media_path, dialogue_steps_json FROM channel_comment_rules"
@@ -360,6 +369,9 @@ def _media_references(database_url: str, storage_root: Path) -> frozenset[Path]:
                 if isinstance(media_path, str):
                     raw_paths.add(media_path)
                 raw_paths.update(_media_paths_from_json(dialogue_steps_json))
+        if "bot_fsm_states" in tables:
+            for (draft_json,) in connection.execute("SELECT data_json FROM bot_fsm_states"):
+                raw_paths.update(_media_paths_from_json(draft_json))
     return frozenset(
         resolved
         for raw_path in raw_paths
@@ -378,9 +390,12 @@ def _media_paths_from_json(raw_json: object) -> set[str]:
 
     def visit(value: object) -> None:
         if isinstance(value, dict):
-            path = value.get("path")
-            if isinstance(path, str):
-                paths.add(path)
+            for key, path in value.items():
+                if (
+                    key in {"path", "media_path", "profile_avatar_draft_path"}
+                    or key.endswith("_media_path")
+                ) and isinstance(path, str):
+                    paths.add(path)
             for nested in value.values():
                 visit(nested)
         elif isinstance(value, list):

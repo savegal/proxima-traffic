@@ -58,6 +58,10 @@ class _DraftState:
     async def get_data(self) -> dict[str, object]:
         return dict(self.data)
 
+    async def update_data(self, **values: object) -> dict[str, object]:
+        self.data.update(values)
+        return dict(self.data)
+
     async def clear(self) -> None:
         self.clear_count += 1
         self.data.clear()
@@ -268,7 +272,7 @@ async def test_order_launch_ignores_a_second_tap_while_preflight_is_running(monk
         create_calls += 1
         return campaign
 
-    async def inspect(_callback, _service, _campaign_id):  # type: ignore[no-untyped-def]
+    async def inspect(_callback, _service, _campaign_id, **_kwargs):  # type: ignore[no-untyped-def]
         started.set()
         await proceed.wait()
         return SimpleNamespace(launchable_units=1, target_count=1, deferred_pairs=0)
@@ -308,7 +312,7 @@ async def test_order_launch_ignores_a_second_tap_while_preflight_is_running(monk
         )
     )
     try:
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=10)
         await handlers.launch_order_draft(
             second,  # type: ignore[arg-type]
             state,  # type: ignore[arg-type]

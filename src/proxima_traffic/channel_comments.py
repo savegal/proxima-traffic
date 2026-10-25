@@ -4,23 +4,26 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from sqlalchemy import func, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxima_traffic.content import (
     ALLOWED_MEDIA_KINDS,
     ContentError,
     render_spintax,
+    render_telegram_html,
     resolve_media_path,
     validate_telegram_text,
 )
+from proxima_traffic.db import is_transient_sqlite_lock
 from proxima_traffic.dialogues import DialogueStep, parse_dialogue_steps, serialize_dialogue_steps
 from proxima_traffic.failure_policy import (
     ACCOUNT_CHAT_BLOCK_CODES,
@@ -53,6 +56,7 @@ from proxima_traffic.models import (
     Account,
     AccountStatus,
     ChannelCommentMentionState,
+    ChannelCommentMessage,
     ChannelCommentMode,
     ChannelCommentReactionAccountState,
     ChannelCommentRule,
@@ -87,8 +91,25 @@ AUTO_REPLACE_PRIMARY_ACCOUNT_CODES = (
 )
 
 
-class _ChannelCommentCancelled(Exception):
-    pass
+class _ChannelCommentCancelled(PermanentGatewayError):
+    def __init__(self) -> None:
+        super().__init__("Правило остановлено до отправки", code="cancelled_before_send")
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelCommentDeliverySummary:
+    """Physical messages, partitioned by their most recent late observation."""
+
+    confirmed: int = 0
+    simulated: int = 0
+    present: int = 0
+    missing: int = 0
+    unavailable: int = 0
+    pending: int = 0
+    scheduled: int = 0
+    checked_at: datetime | None = None
+    next_check_at: datetime | None = None
+    history_incomplete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +120,9 @@ class ChannelCommentRuleView:
     succeeded: int
     failed: int
     skipped: int
+    uncertain: int = 0
+    cancelled: int = 0
+    simulated_finished: int = 0
     mentions_resolved_posts: int = 0
     mentions_skipped_posts: int = 0
     mention_count: int = 0
@@ -109,6 +133,8 @@ class ChannelCommentRuleView:
     reaction_failed: int = 0
     reaction_skipped: int = 0
     reaction_cancelled: int = 0
+    delivery: ChannelCommentDeliverySummary = ChannelCommentDeliverySummary()
+    legacy_runs_with_incomplete_delivery: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +229,7 @@ class ChannelCommentService:
         message_edit_initial_html: str | None = None,
         message_edit_delay_seconds: int | None = None,
         preflight_failures: list[tuple[str, str]] | None = None,
+        before_create: Callable[[], Awaitable[None]] | None = None,
         actor: str = "control-bot",
     ) -> list[ChannelCommentRule]:
         """Create identical comment rules for several channels atomically.
@@ -370,6 +397,8 @@ class ChannelCommentService:
         # loop will re-check membership and start on its own after approval.
         ready_rules: list[tuple[str, str, ChannelCommentPreflight | None, str | None]] = []
         for rule_name, channel_ref in candidate_rules:
+            if before_create is not None:
+                await before_create()
             try:
                 ready_rules.append(
                     (
@@ -441,6 +470,8 @@ class ChannelCommentService:
                 overlapping_rules = [rule for rule in overlapping_rules if not rule.enabled]
 
             retired_at = utc_now()
+            if before_create is not None:
+                await before_create()
             for predecessor in overlapping_rules:
                 predecessor.enabled = False
                 predecessor.archived_at = retired_at
@@ -597,6 +628,65 @@ class ChannelCommentService:
                 )
             )
 
+    async def recent_run_delivery_summaries(
+        self, run_ids: list[int]
+    ) -> dict[int, ChannelCommentDeliverySummary]:
+        async with self._session_factory() as session:
+            return await self._delivery_summaries(session, run_ids)
+
+    @staticmethod
+    async def _delivery_summaries(
+        session: AsyncSession, ids: list[int], *, by_rule: bool = False
+    ) -> dict[int, ChannelCommentDeliverySummary]:
+        normalized_ids = list(dict.fromkeys(value for value in ids if value > 0))
+        if not normalized_ids:
+            return {}
+        group = ChannelCommentRun.rule_id if by_rule else ChannelCommentMessage.run_id
+        result = await session.execute(
+            select(
+                group,
+                ChannelCommentMessage.status,
+                func.count(ChannelCommentMessage.id),
+                func.count(ChannelCommentMessage.next_check_at),
+                func.max(ChannelCommentMessage.checked_at),
+                func.min(ChannelCommentMessage.next_check_at),
+                func.min(ChannelCommentMessage.step_index),
+            )
+            .select_from(ChannelCommentMessage)
+            .join(ChannelCommentRun, ChannelCommentRun.id == ChannelCommentMessage.run_id)
+            .where(group.in_(normalized_ids))
+            .group_by(group, ChannelCommentMessage.status)
+        )
+        states: dict[int, dict[str, int]] = {value: {} for value in normalized_ids}
+        scheduled: dict[int, int] = dict.fromkeys(normalized_ids, 0)
+        checked: dict[int, list[datetime]] = {value: [] for value in normalized_ids}
+        due: dict[int, list[datetime]] = {value: [] for value in normalized_ids}
+        first_steps: dict[int, list[int]] = {value: [] for value in normalized_ids}
+        for value, status, count, next_count, checked_at, next_at, first_step in result:
+            value = int(value)
+            states[value][status] = int(count)
+            scheduled[value] += int(next_count)
+            first_steps[value].append(int(first_step))
+            if checked_at is not None:
+                checked[value].append(ensure_utc(checked_at))
+            if next_at is not None:
+                due[value].append(ensure_utc(next_at))
+        return {
+            value: ChannelCommentDeliverySummary(
+                confirmed=sum(counts.values()) - counts.get("simulated", 0),
+                simulated=counts.get("simulated", 0),
+                present=counts.get("present", 0),
+                missing=counts.get("missing", 0),
+                unavailable=counts.get("unavailable", 0),
+                pending=counts.get("pending", 0),
+                scheduled=scheduled[value],
+                checked_at=max(checked[value], default=None),
+                next_check_at=min(due[value], default=None),
+                history_incomplete=min(first_steps[value], default=0) > 0,
+            )
+            for value, counts in states.items()
+        }
+
     async def recent_run_reaction_summaries(
         self,
         run_ids: list[int],
@@ -655,6 +745,14 @@ class ChannelCommentService:
                 # Resume from this moment: posts published while paused are never backfilled.
                 rule.armed_at = utc_now()
             else:
+                await session.execute(
+                    update(ChannelCommentRun)
+                    .where(
+                        ChannelCommentRun.rule_id == rule.id,
+                        ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
+                    )
+                    .values(cancel_requested=True)
+                )
                 queued_ids = list(
                     await session.scalars(
                         select(ChannelCommentRun.id).where(
@@ -1166,6 +1264,11 @@ class ChannelCommentService:
             if rule is None or not rule.enabled or not rule.approved_by_operator:
                 return
             account = await session.get(Account, rule.primary_account_id)
+            if account is not None and (
+                (cooldown := ensure_utc(account.cooldown_until)) is not None
+                and cooldown > utc_now()
+            ):
+                return
             try:
                 self._validate_account(account)
             except ConflictError as exc:
@@ -1239,15 +1342,37 @@ class ChannelCommentService:
 
     async def run_forever(self, reporter: WorkerIterationReporter | None = None) -> None:
         self._running = True
+        scan_task: asyncio.Task[int] | None = None
         try:
             while not self._stop_event.is_set():
                 processed = False
                 try:
-                    await self.scan_due_rules()
+                    if scan_task is None or scan_task.done():
+                        if scan_task is not None:
+                            completed_scan = scan_task
+                            scan_task = None
+                            completed_scan.result()
+                        scan_task = asyncio.create_task(
+                            self.scan_due_rules(), name="channel-comment-scans"
+                        )
                     for _ in range(10):
+                        if self._stop_event.is_set():
+                            break
                         if not await self.process_next():
                             break
                         processed = True
+                except OperationalError as exc:
+                    if is_transient_sqlite_lock(exc):
+                        # A concurrent import, UI action or another durable
+                        # worker briefly owns SQLite's single write slot.  This
+                        # is recoverable; retry quietly instead of reporting a
+                        # worker crash and leaving the interface looking broken.
+                        logger.warning("Channel-comment worker waits for a busy SQLite writer")
+                        await asyncio.sleep(0.5)
+                    else:
+                        logger.exception("Channel-comment worker iteration failed")
+                        if reporter is not None:
+                            await reporter(exc)
                 except Exception as exc:  # noqa: BLE001 - a bad rule must not stop all rules
                     logger.exception("Channel-comment worker iteration failed")
                     if reporter is not None:
@@ -1265,6 +1390,10 @@ class ChannelCommentService:
                 except TimeoutError:
                     pass
         finally:
+            if scan_task is not None:
+                scan_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await scan_task
             self._running = False
 
     def stop(self) -> None:
@@ -1283,6 +1412,7 @@ class ChannelCommentService:
             if scan.title:
                 rule.channel_title = scan.title[:255]
             highest_seen = int(rule.last_seen_post_id or 0)
+            previous_grouped_id = rule.last_seen_grouped_id
             armed_at = ensure_utc(rule.armed_at) or now
             max_age = timedelta(seconds=self._settings.channel_comments_max_post_age_seconds)
             flow_delay_seconds = rule.initial_delay_seconds + sum(
@@ -1299,6 +1429,8 @@ class ChannelCommentService:
             )
             for post in scan.posts:
                 highest_seen = max(highest_seen, post.message_id)
+                if post.grouped_id is not None and post.grouped_id == previous_grouped_id:
+                    continue
                 published_at = ensure_utc(post.published_at) or now
                 if published_at <= armed_at:
                     continue
@@ -1334,6 +1466,13 @@ class ChannelCommentService:
                     finished_at=now if status == ChannelCommentRunStatus.SKIPPED else None,
                 )
                 session.add(run)
+            if scan.last_seen_message_id is not None and scan.last_seen_message_id >= highest_seen:
+                highest_seen = scan.last_seen_message_id
+                rule.last_seen_grouped_id = scan.last_seen_grouped_id
+            elif scan.posts and highest_seen > int(rule.last_seen_post_id or 0):
+                rule.last_seen_grouped_id = max(
+                    scan.posts, key=lambda post: post.message_id
+                ).grouped_id
             rule.last_seen_post_id = highest_seen or rule.last_seen_post_id
             rule.last_scanned_at = now
             rule.last_error = None
@@ -1473,7 +1612,36 @@ class ChannelCommentService:
             return
         run, rule, steps, step = context
         account_id = step.account_id
+
+        async def before_send() -> None:
+            await self._mark_comment_dispatch(run_id, lease_token, account_id)
+
+        dispatch_kwargs = (
+            {"before_send": before_send}
+            if getattr(self._gateway, "supports_channel_comment_dispatch_hook", False)
+            else {}
+        )
+        if dispatch_kwargs and run.step_index > 0:
+            async with self._session_factory() as session:
+                original = await session.scalar(
+                    select(ChannelCommentMessage)
+                    .where(ChannelCommentMessage.run_id == run.id)
+                    .order_by(ChannelCommentMessage.step_index)
+                    .limit(1)
+                )
+            dispatch_kwargs.update(
+                expected_discussion_peer_id=original.discussion_peer_id
+                if original is not None
+                else None,
+                expected_thread_root_message_id=run.thread_root_message_id,
+            )
         is_message_edit = rule.mode == ChannelCommentMode.MESSAGE_EDIT and run.step_index == 1
+        content_key = f"channel-comment:{run.id}:step:{run.step_index}"
+        idempotency_key = content_key
+        if run.membership_gate_retry_count > 0:
+            idempotency_key = (
+                f"{content_key}:membership-gate-retry:{run.membership_gate_retry_count}"
+            )
 
         async def deliver() -> ChannelCommentDelivery | datetime:
             async with self._session_factory() as session:
@@ -1492,12 +1660,6 @@ class ChannelCommentService:
                     if resume_at is not None:
                         return resume_at
                 self._validate_account(account)
-            content_key = f"channel-comment:{run.id}:step:{run.step_index}"
-            idempotency_key = content_key
-            if run.membership_gate_retry_count > 0:
-                idempotency_key = (
-                    f"{content_key}:membership-gate-retry:{run.membership_gate_retry_count}"
-                )
             try:
                 text = render_spintax(step.text, seed=content_key)
                 html_text = (
@@ -1510,6 +1672,8 @@ class ChannelCommentService:
             if is_message_edit:
                 if run.last_comment_message_id is None:
                     raise ConflictError("не найден комментарий для отложенного редактирования")
+                if not dispatch_kwargs:
+                    await before_send()
                 sent = await self._gateway.edit_channel_comment(
                     account=account,
                     channel_ref=rule.channel_ref,
@@ -1518,6 +1682,7 @@ class ChannelCommentService:
                     text=text,
                     html_text=html_text,
                     idempotency_key=idempotency_key,
+                    **dispatch_kwargs,
                 )
             else:
                 reply_to = None
@@ -1537,12 +1702,18 @@ class ChannelCommentService:
                         account,
                         text=text,
                         selection_key=f"{content_key}:hidden-mentions",
+                        message_limit=1024 if step.media_path is not None else 4096,
                     )
                 html_text = append_hidden_mentions(
                     text=text,
                     html_text=html_text,
                     user_ids=mention_ids,
+                    message_limit=1024 if step.media_path is not None else 4096,
                 )
+                if mention_ids and html_text is not None:
+                    text = render_telegram_html(html_text)
+                if not dispatch_kwargs:
+                    await before_send()
                 sent = await self._gateway.send_channel_comment(
                     account=account,
                     channel_ref=rule.channel_ref,
@@ -1554,15 +1725,63 @@ class ChannelCommentService:
                     media_path=step.media_path,
                     media_kind=step.media_kind,
                     media_name=step.media_name,
+                    **dispatch_kwargs,
                 )
-                await self._runner.record_external_account_send(
-                    account_id,
-                    operation_key=idempotency_key,
-                )
+                try:
+                    if not sent.simulated:
+                        await self._runner.record_external_account_send(
+                            account_id,
+                            operation_key=idempotency_key,
+                        )
+                except Exception as exc:  # noqa: BLE001 - the comment already reached Telegram
+                    raise PermanentGatewayError(
+                        "Telegram принял комментарий, но учёт действия не удалось сохранить; "
+                        "повтор запрещён",
+                        code="delivery_unconfirmed",
+                        external_message_id=sent.message_id,
+                    ) from exc
             return sent
 
+        account_failure_applied = False
+
+        async def guarded_deliver() -> datetime | None:
+            nonlocal account_failure_applied
+            try:
+                result = await deliver()
+                if isinstance(result, datetime):
+                    return result
+                try:
+                    await self._record_delivery(run_id, lease_token, rule, steps, result)
+                except (ConflictError, NotFoundError):
+                    # A concurrent stop, delete or lease recovery owns this run.
+                    return None
+                except Exception as exc:  # noqa: BLE001 - Telegram already returned a receipt
+                    raise PermanentGatewayError(
+                        "Telegram принял комментарий, но результат не удалось сохранить; "
+                        "повтор запрещён",
+                        code="delivery_unconfirmed",
+                        external_message_id=result.message_id,
+                    ) from exc
+                return None
+            except GatewayError as exc:
+                if isinstance(exc.__cause__, GatewayError):
+                    await self._runner.handle_external_account_failure(account_id, exc.__cause__)
+                await self._runner.handle_external_account_failure(account_id, exc)
+                account_failure_applied = True
+                if exc.code == "delivery_unconfirmed":
+                    await self._runner.record_external_account_send(
+                        account_id,
+                        operation_key=idempotency_key,
+                    )
+                raise
+
         try:
-            result = await self._runner.run_account_send_operation(account_id, deliver)
+            operation = (
+                self._runner.run_account_operation
+                if getattr(self._gateway, "simulated", False)
+                else self._runner.run_account_send_operation
+            )
+            result = await operation(account_id, guarded_deliver)
         except _ChannelCommentCancelled:
             await self._finish_cancelled(run_id, lease_token, "cancelled_before_send")
             return
@@ -1584,17 +1803,59 @@ class ChannelCommentService:
                 )
             else:
                 logger.exception("Channel-comment run %s delivery failed", run_id)
-            await self._handle_delivery_error(run_id, lease_token, account_id, exc)
+            await self._handle_delivery_error(
+                run_id,
+                lease_token,
+                account_id,
+                exc,
+                account_failure_applied=account_failure_applied,
+            )
             return
         if isinstance(result, datetime):
             await self._defer_run(run_id, lease_token, result, reason="account_pacing")
             return
-        try:
-            await self._record_delivery(run_id, lease_token, rule, steps, result)
-        except (ConflictError, NotFoundError):
-            # The comment has already reached Telegram, but a concurrent stop,
-            # delete or lease recovery owns the durable state now.
-            return
+
+    async def _mark_comment_dispatch(self, run_id: int, lease_token: str, account_id: int) -> None:
+        """Persist the last cancellation check immediately before the Telegram mutation."""
+        now = utc_now()
+        active_rule_ids = select(ChannelCommentRule.id).where(
+            ChannelCommentRule.enabled.is_(True),
+            ChannelCommentRule.approved_by_operator.is_(True),
+            ChannelCommentRule.archived_at.is_(None),
+        )
+        async with self._session_factory() as session:
+            changed = await session.execute(
+                update(ChannelCommentRun)
+                .where(
+                    ChannelCommentRun.id == run_id,
+                    ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
+                    ChannelCommentRun.lease_owner == self._worker_id,
+                    ChannelCommentRun.lease_token == lease_token,
+                    ChannelCommentRun.lease_until > now,
+                    ChannelCommentRun.cancel_requested.is_(False),
+                    ChannelCommentRun.rule_id.in_(active_rule_ids),
+                    or_(ChannelCommentRun.expires_at.is_(None), ChannelCommentRun.expires_at > now),
+                )
+                .values(
+                    dispatch_started_at=now,
+                    dispatch_account_id=account_id,
+                    simulated=bool(getattr(self._gateway, "simulated", False)),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            if changed.rowcount != 1:
+                stored = await self._require_running(session, run_id, lease_token)
+                expires_at = ensure_utc(stored.expires_at)
+                if (
+                    not stored.cancel_requested
+                    and expires_at is not None
+                    and expires_at <= utc_now()
+                ):
+                    raise PermanentGatewayError(
+                        "Срок актуальности комментария истёк", code="comment_expired"
+                    )
+                raise _ChannelCommentCancelled
 
     async def _load_run_context(
         self,
@@ -1611,6 +1872,19 @@ class ChannelCommentService:
                 run.finished_at = utc_now()
                 run.error = "cancel requested before comment delivery started"
                 run.error_code = "cancelled_before_send"
+                await self._release_mention_reservations(session, run_ids=[run.id])
+                self._release_lease(run)
+                await session.commit()
+                return None
+            if run.sent_steps > 0 and run.simulated != bool(
+                getattr(self._gateway, "simulated", False)
+            ):
+                run.status = ChannelCommentRunStatus.CANCELLED
+                run.finished_at = utc_now()
+                run.error = (
+                    "Режим отправки изменился; начатая обработка не смешивает тест и Telegram"
+                )
+                run.error_code = "comment_execution_mode_changed"
                 await self._release_mention_reservations(session, run_ids=[run.id])
                 self._release_lease(run)
                 await session.commit()
@@ -1651,6 +1925,7 @@ class ChannelCommentService:
         *,
         text: str,
         selection_key: str,
+        message_limit: int = 4096,
     ) -> tuple[int, ...]:
         # Existing queued rows from before this feature have no snapshot and
         # must not gain mentions when an operator enables the rule later.
@@ -1658,18 +1933,34 @@ class ChannelCommentService:
             return ()
         async with self._session_factory() as session:
             excluded_user_ids = await load_mention_exclusion_user_ids(session)
+        maximum_count = min(
+            HIDDEN_MENTION_MAXIMUM, hidden_mention_capacity(text, message_limit=message_limit)
+        )
         if run.hidden_mention_user_ids_snapshot_json is not None:
             parsed = self._parse_hidden_mention_snapshot(
                 run.hidden_mention_user_ids_snapshot_json,
                 exclude_user_ids=excluded_user_ids,
             )
+            parsed = parsed[:maximum_count]
+            if len(parsed) < HIDDEN_MENTION_MINIMUM:
+                parsed = ()
+            checker = getattr(self._gateway, "filter_mentionable_user_ids", None)
+            if checker is not None:
+                try:
+                    parsed = await checker(account=account, user_ids=parsed)
+                    if len(parsed) < HIDDEN_MENTION_MINIMUM:
+                        parsed = ()
+                except Exception as exc:  # noqa: BLE001 - publish without unchecked mentions
+                    if failure_code(exc) in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES:
+                        raise
+                    logger.info("Could not recheck hidden mention usernames for run %s", run.id)
+                    parsed = ()
             if run.hidden_mention_resolved_count != len(parsed):
                 await self._update_channel_comment_hidden_mention_snapshot(run, parsed)
             return parsed
 
         reason: str | None = None
         candidates: tuple[int, ...] = ()
-        maximum_count = min(HIDDEN_MENTION_MAXIMUM, hidden_mention_capacity(text))
         if maximum_count < HIDDEN_MENTION_MINIMUM:
             reason = "message_has_no_room_for_mentions"
         else:
@@ -1691,6 +1982,8 @@ class ChannelCommentService:
                     if len(candidates) < HIDDEN_MENTION_MINIMUM:
                         reason = "fewer_than_five_eligible_members"
                 except Exception as exc:  # noqa: BLE001 - a list failure must not lose a comment
+                    if failure_code(exc) in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES:
+                        raise
                     logger.info(
                         "Hidden mentions were skipped for channel comment run %s: %s",
                         run.id,
@@ -2004,18 +2297,82 @@ class ChannelCommentService:
                 rule_snapshot.mode == ChannelCommentMode.MESSAGE_EDIT and run.step_index == 1
             )
             delivered_at = utc_now()
-            if run.step_index == 0:
+            if sent.message_id <= 0 or sent.thread_root_message_id <= 0:
+                raise PermanentGatewayError(
+                    "Нет подтверждённого ID комментария", code="delivery_unconfirmed"
+                )
+            source_account_id = int(steps[run.step_index].account_id)
+            if not was_message_edit:
+                session.add(
+                    ChannelCommentMessage(
+                        run_id=run.id,
+                        account_id=source_account_id,
+                        step_index=int(run.step_index),
+                        channel_ref=rule_snapshot.channel_ref,
+                        source_post_id=run.source_post_id,
+                        message_id=int(sent.message_id),
+                        discussion_peer_id=sent.discussion_peer_id,
+                        discussion_access_hash=sent.discussion_access_hash,
+                        delivered_at=delivered_at,
+                        status="simulated" if sent.simulated else "pending",
+                        next_check_at=None
+                        if sent.simulated
+                        else delivered_at
+                        + timedelta(
+                            seconds=int(self._settings.delayed_delivery_verify_delay_seconds)
+                        ),
+                    )
+                )
+            else:
+                message = await session.scalar(
+                    select(ChannelCommentMessage).where(
+                        ChannelCommentMessage.run_id == run.id,
+                        ChannelCommentMessage.message_id == sent.message_id,
+                        ChannelCommentMessage.account_id == source_account_id,
+                    )
+                )
+                if message is not None:
+                    # One physical message: an edit re-arms observation of its
+                    # latest content and invalidates any in-flight old read.
+                    message.edited_at = delivered_at
+                    message.status = "simulated" if sent.simulated else "pending"
+                    message.check_stage = 0
+                    message.checked_at = None
+                    message.first_checked_at = None
+                    message.first_check_status = None
+                    message.attempt_count = 0
+                    message.error = None
+                    message.error_code = None
+                    message.next_check_at = (
+                        None
+                        if sent.simulated
+                        else delivered_at
+                        + timedelta(
+                            seconds=int(self._settings.delayed_delivery_verify_delay_seconds)
+                        )
+                    )
+                    message.lease_owner = None
+                    message.lease_token = None
+                    message.lease_until = None
+            if run.step_index == 0 and not sent.simulated:
                 await self._finalize_hidden_mentions(
                     session,
                     run,
                     delivered_at=delivered_at,
                 )
-            if not was_message_edit:
+            elif sent.simulated:
+                await self._release_mention_reservations(session, run_ids=[run.id])
+            if (
+                not was_message_edit
+                and not sent.simulated
+                and rule.enabled
+                and not run.cancel_requested
+            ):
                 await self._schedule_comment_reactions(
                     session,
                     run,
                     rule_snapshot,
-                    source_account_id=int(steps[run.step_index].account_id),
+                    source_account_id=source_account_id,
                     message_id=int(sent.message_id),
                     dialogue_step=int(run.step_index) + 1,
                     now=delivered_at,
@@ -2024,6 +2381,9 @@ class ChannelCommentService:
             run.last_comment_message_id = sent.message_id
             run.sent_steps += 1
             run.step_index += 1
+            run.simulated = sent.simulated
+            run.dispatch_started_at = None
+            run.dispatch_account_id = None
             run.error = None
             run.error_code = None
             if run.cancel_requested:
@@ -2063,6 +2423,8 @@ class ChannelCommentService:
                     "source_post_id": run.source_post_id,
                     "step": run.step_index,
                     "message_id": sent.message_id,
+                    "account_id": source_account_id,
+                    "discussion_peer_id": sent.discussion_peer_id,
                     "action": "edit" if was_message_edit else "send",
                 },
                 actor="channel-comment-worker",
@@ -2075,9 +2437,49 @@ class ChannelCommentService:
         lease_token: str,
         account_id: int,
         exc: BaseException,
+        *,
+        account_failure_applied: bool = False,
     ) -> None:
         code = failure_code(exc, "delivery_failed")
-        if code in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES:
+        async with self._session_factory() as session:
+            run = await self._require_running(session, run_id, lease_token)
+            if run.dispatch_started_at is not None:
+                account_id = int(run.dispatch_account_id or account_id)
+                if code == "comment_timeout" or not isinstance(exc, (GatewayError, ConflictError)):
+                    exc = PermanentGatewayError(
+                        "Операция прервана после начала отправки; "
+                        "результат Telegram неизвестен, повтор запрещён",
+                        code="delivery_unconfirmed",
+                    )
+                    code = "delivery_unconfirmed"
+                if code != "delivery_unconfirmed":
+                    # An explicit Telegram rejection proves no message was accepted.
+                    run.dispatch_started_at = None
+                    run.dispatch_account_id = None
+                    await session.commit()
+        if not account_failure_applied and isinstance(exc.__cause__, GatewayError):
+            await self._runner.handle_external_account_failure(account_id, exc.__cause__)
+        if code == "delivery_unconfirmed":
+            if not account_failure_applied and account_id > 0:
+                await self._runner.record_external_account_send(
+                    account_id,
+                    operation_key=f"channel-comment:{run_id}:step:{run.step_index}"
+                    + (
+                        f":membership-gate-retry:{run.membership_gate_retry_count}"
+                        if run.membership_gate_retry_count
+                        else ""
+                    ),
+                )
+            await self._finish_failed(run_id, lease_token, exc, permanent=True)
+            return
+        if code in {"account_restricted", "peer_flood"} and (
+            self._settings.account_restriction_cooldown_hours == 0
+        ):
+            if not account_failure_applied:
+                await self._runner.handle_external_account_failure(account_id, exc)
+            await self._finish_failed(run_id, lease_token, exc, permanent=True)
+            return
+        if code in ACCOUNT_FATAL_CODES | ACCOUNT_TEMPORARY_CODES and not account_failure_applied:
             await self._runner.handle_external_account_failure(account_id, exc)
         replaced = False
         if code in AUTO_REPLACE_PRIMARY_ACCOUNT_CODES:
@@ -2128,17 +2530,23 @@ class ChannelCommentService:
             "account_restricted",
             "network_error",
             "rpc_error",
-            "delivery_unconfirmed",
             "comment_timeout",
+            "join_request_pending",
         }:
             retry_after = int(getattr(exc, "retry_after", None) or 60)
+            resume_at = utc_now() + timedelta(seconds=max(1, retry_after))
+            if account_id > 0 and code in ACCOUNT_TEMPORARY_CODES:
+                async with self._session_factory() as session:
+                    account = await session.get(Account, account_id)
+                    cooldown = ensure_utc(account.cooldown_until) if account is not None else None
+                    if cooldown is not None:
+                        resume_at = max(resume_at, cooldown)
             await self._defer_run(
                 run_id,
                 lease_token,
-                utc_now() + timedelta(seconds=max(1, retry_after)),
+                resume_at,
                 reason=code,
-                consume_attempt=code
-                in {"network_error", "rpc_error", "delivery_unconfirmed", "comment_timeout"},
+                consume_attempt=code in {"network_error", "rpc_error", "comment_timeout"},
                 error=safe_error_message(exc),
             )
             return
@@ -2314,14 +2722,18 @@ class ChannelCommentService:
             run = await self._require_running(session, run_id, lease_token)
             rule = await session.get(ChannelCommentRule, run.rule_id)
             exhausted = run.attempt_count >= run.max_attempts
-            if run.cancel_requested:
+            if run.cancel_requested and code != "delivery_unconfirmed":
                 run.status = ChannelCommentRunStatus.CANCELLED
                 run.finished_at = utc_now()
                 code = "cancelled_before_send"
             elif code in {"comments_unavailable", "post_deleted_by_moderation"} or (
                 code == "comment_expired" and run.sent_steps == 0
             ):
-                run.status = ChannelCommentRunStatus.SKIPPED
+                run.status = (
+                    ChannelCommentRunStatus.FAILED
+                    if run.sent_steps
+                    else ChannelCommentRunStatus.SKIPPED
+                )
                 run.finished_at = utc_now()
             elif permanent or exhausted:
                 run.status = ChannelCommentRunStatus.FAILED
@@ -2385,6 +2797,50 @@ class ChannelCommentService:
     async def _recover_expired_leases(self) -> None:
         now = utc_now()
         async with self._session_factory() as session:
+            uncertain_runs = list(
+                await session.scalars(
+                    select(ChannelCommentRun).where(
+                        ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
+                        ChannelCommentRun.lease_until < now,
+                        ChannelCommentRun.dispatch_started_at.is_not(None),
+                        ChannelCommentRun.dispatch_account_id.is_not(None),
+                    )
+                )
+            )
+        for run in uncertain_runs:
+            if run.simulated:
+                continue
+            await self._runner.record_external_account_send(
+                int(run.dispatch_account_id),
+                operation_key=f"channel-comment:{run.id}:step:{run.step_index}"
+                + (
+                    f":membership-gate-retry:{run.membership_gate_retry_count}"
+                    if run.membership_gate_retry_count
+                    else ""
+                ),
+            )
+        async with self._session_factory() as session:
+            await session.execute(
+                update(ChannelCommentRun)
+                .where(
+                    ChannelCommentRun.status == ChannelCommentRunStatus.RUNNING,
+                    ChannelCommentRun.lease_until < now,
+                    ChannelCommentRun.dispatch_started_at.is_not(None),
+                )
+                .values(
+                    status=ChannelCommentRunStatus.FAILED,
+                    finished_at=now,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_until=None,
+                    error=(
+                        "Процесс прервался после начала отправки. "
+                        "Результат Telegram неизвестен; повтор запрещён"
+                    ),
+                    error_code="delivery_unconfirmed",
+                )
+                .execution_options(synchronize_session=False)
+            )
             await session.execute(
                 update(ChannelCommentRun)
                 .execution_options(synchronize_session=False)
@@ -2489,16 +2945,30 @@ class ChannelCommentService:
             select(
                 ChannelCommentRun.rule_id,
                 ChannelCommentRun.status,
+                ChannelCommentRun.error_code,
+                ChannelCommentRun.simulated,
                 func.count(ChannelCommentRun.id),
             )
             .where(ChannelCommentRun.rule_id.in_(rule_ids))
-            .group_by(ChannelCommentRun.rule_id, ChannelCommentRun.status)
+            .group_by(
+                ChannelCommentRun.rule_id,
+                ChannelCommentRun.status,
+                ChannelCommentRun.error_code,
+                ChannelCommentRun.simulated,
+            )
         )
         counts: dict[int, dict[ChannelCommentRunStatus, int]] = {
             rule_id: {} for rule_id in rule_ids
         }
-        for rule_id, status, count in result:
-            counts[int(rule_id)][status] = int(count)
+        uncertain_counts = dict.fromkeys(rule_ids, 0)
+        simulated_counts = dict.fromkeys(rule_ids, 0)
+        for rule_id, status, code, simulated, count in result:
+            if code in {"delivery_unconfirmed", "cancelled_outcome_unknown"}:
+                uncertain_counts[int(rule_id)] += int(count)
+            elif simulated and status == ChannelCommentRunStatus.SUCCEEDED:
+                simulated_counts[int(rule_id)] += int(count)
+            else:
+                counts[int(rule_id)][status] = counts[int(rule_id)].get(status, 0) + int(count)
         mention_result = await session.execute(
             select(
                 ChannelCommentRun.rule_id,
@@ -2509,6 +2979,7 @@ class ChannelCommentService:
             .where(
                 ChannelCommentRun.rule_id.in_(rule_ids),
                 ChannelCommentRun.hidden_mentions_enabled_snapshot.is_(True),
+                ChannelCommentRun.simulated.is_(False),
                 ChannelCommentRun.hidden_mention_user_ids_snapshot_json.is_not(None),
                 ChannelCommentRun.sent_steps > 0,
             )
@@ -2540,6 +3011,22 @@ class ChannelCommentService:
         }
         for rule_id, status, count in reaction_result:
             reaction_counts[int(rule_id)][status] = int(count)
+        delivery_summaries = await self._delivery_summaries(session, rule_ids, by_rule=True)
+        legacy_result = await session.execute(
+            select(ChannelCommentRun.rule_id, func.count(ChannelCommentRun.id))
+            .outerjoin(
+                ChannelCommentMessage,
+                (ChannelCommentMessage.run_id == ChannelCommentRun.id)
+                & (ChannelCommentMessage.step_index == 0),
+            )
+            .where(
+                ChannelCommentRun.rule_id.in_(rule_ids),
+                ChannelCommentRun.sent_steps > 0,
+                ChannelCommentMessage.id.is_(None),
+            )
+            .group_by(ChannelCommentRun.rule_id)
+        )
+        legacy_counts = {int(rule_id): int(count) for rule_id, count in legacy_result}
         return [
             ChannelCommentRuleView(
                 rule=rule,
@@ -2548,6 +3035,11 @@ class ChannelCommentService:
                 succeeded=counts[int(rule.id)].get(ChannelCommentRunStatus.SUCCEEDED, 0),
                 failed=counts[int(rule.id)].get(ChannelCommentRunStatus.FAILED, 0),
                 skipped=counts[int(rule.id)].get(ChannelCommentRunStatus.SKIPPED, 0),
+                cancelled=counts[int(rule.id)].get(ChannelCommentRunStatus.CANCELLED, 0),
+                uncertain=uncertain_counts[int(rule.id)],
+                simulated_finished=simulated_counts[int(rule.id)],
+                delivery=delivery_summaries[int(rule.id)],
+                legacy_runs_with_incomplete_delivery=legacy_counts.get(int(rule.id), 0),
                 mentions_resolved_posts=sum(
                     post_count
                     for reason, (post_count, _) in mention_stats[int(rule.id)].items()
@@ -2717,6 +3209,14 @@ class ChannelCommentService:
             return None
         result: ChannelCommentPreflight | None = None
         for account in accounts:
+            cooldown = ensure_utc(account.cooldown_until)
+            if cooldown is not None and cooldown > utc_now():
+                paused = ConflictError(
+                    f"Аккаунт «{account.label}» ожидает окончания паузы Telegram "
+                    f"до {cooldown:%d.%m %H:%M UTC}"
+                )
+                paused.code = "preflight_account_cooldown"  # type: ignore[attr-defined]
+                raise paused
             try:
                 async with asyncio.timeout(self._settings.channel_comments_scan_timeout_seconds):
                     current = await preflight(account=account, channel_ref=channel_ref)
@@ -3277,9 +3777,9 @@ class ChannelCommentService:
             if not invite_hash or "/" in invite_hash or len(invite_hash) > 200:
                 raise ConflictError("приватная invite-ссылка указана неверно")
             return "https://t.me/+" + invite_hash
-        if not normalized.startswith("@") or not 5 <= len(normalized) <= 33:
+        if not normalized.startswith("@") or not 2 <= len(normalized) <= 33:
             raise ConflictError("укажите публичную ссылку канала в формате @channel")
-        if not normalized[1:].replace("_", "").isalnum():
+        if not normalized[1:].isascii() or not normalized[1:].replace("_", "").isalnum():
             raise ConflictError("ссылка канала содержит недопустимые символы")
         return normalized.lower()
 

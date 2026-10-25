@@ -1,5 +1,5 @@
 from aiogram.fsm.storage.base import StorageKey
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from proxima_traffic.bot.handlers import _proxy_draft_url
 from proxima_traffic.bot.states import CampaignCreateState
@@ -32,6 +32,26 @@ async def test_database_fsm_storage_survives_a_storage_instance_restart(app) -> 
     updated = await second.update_data(key, {"target_id": 77})
     assert updated["campaign_name"] == "Durable draft"
     assert updated["target_id"] == 77
+
+    statements: list[str] = []
+
+    def capture_statement(
+        connection, cursor, statement, parameters, context, executemany
+    ) -> None:
+        del connection, cursor, parameters, context, executemany
+        statements.append(str(statement))
+
+    event.listen(app.state.database.engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        await second.clear(key)
+    finally:
+        event.remove(
+            app.state.database.engine.sync_engine, "before_cursor_execute", capture_statement
+        )
+    assert len(statements) == 1
+    assert statements[0].lstrip().upper().startswith("DELETE FROM BOT_FSM_STATES")
+    assert await second.get_state(key) is None
+    assert await second.get_data(key) == {}
 
 
 async def test_proxy_wizard_draft_does_not_persist_credentials_in_plaintext(app) -> None:

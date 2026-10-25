@@ -368,13 +368,17 @@ def generate_profile_names(
     selected: list[ProfileName] = []
     selected_keys: set[str] = set()
     for style in ("first", "initial", "full"):
+        remaining = quotas[style]
+        if remaining == 0:
+            continue
         for candidate in pools[style]:
             key = _name_key(candidate.display_name)
             if key in excluded or key in selected_keys:
                 continue
             selected.append(candidate)
             selected_keys.add(key)
-            if sum(item.style == style for item in selected) >= quotas[style]:
+            remaining -= 1
+            if remaining == 0:
                 break
 
     if len(selected) < count:

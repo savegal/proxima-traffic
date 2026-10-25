@@ -6,10 +6,15 @@ import hashlib
 from collections.abc import Iterable
 from html import escape
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from proxima_traffic.models import Account, MentionBlacklistEntry
+from proxima_traffic.models import (
+    Account,
+    MentionBlacklistEntry,
+    MentionBlacklistUsernameEntry,
+    Subscriber,
+)
 
 HIDDEN_MENTION_MINIMUM = 5
 HIDDEN_MENTION_MAXIMUM = 10
@@ -27,9 +32,14 @@ async def load_mention_exclusion_user_ids(session: AsyncSession) -> set[int]:
         )
     )
     blacklisted = await session.scalars(select(MentionBlacklistEntry.telegram_user_id))
+    matched_usernames = await session.scalars(
+        select(Subscriber.telegram_user_id).where(
+            func.lower(Subscriber.username).in_(select(MentionBlacklistUsernameEntry.username))
+        )
+    )
     return {
         int(user_id)
-        for user_id in (*owned.all(), *blacklisted.all())
+        for user_id in (*owned.all(), *blacklisted.all(), *matched_usernames.all())
         if user_id is not None and int(user_id) > 0
     }
 

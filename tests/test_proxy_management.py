@@ -23,10 +23,25 @@ from proxima_traffic.proxies import (
     ProxyFilter,
     ProxyInputError,
     ProxyRouteUnavailable,
+    ProxyService,
     _ProxyProbeResult,
     parse_proxy,
 )
 from proxima_traffic.services import ConflictError, NotFoundError
+
+
+@pytest.fixture(autouse=True)
+def isolate_proxy_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proxy creation probes immediately; unit tests must use controlled results."""
+
+    async def healthy_http_probe(self, proxy_url: str) -> _ProxyProbeResult:
+        return _ProxyProbeResult(True, 20, "203.0.113.1", None)
+
+    async def healthy_mtproto_probe(self, host, port, secret) -> _ProxyProbeResult:
+        return _ProxyProbeResult(True, 20, None, None)
+
+    monkeypatch.setattr(ProxyService, "_probe_proxy_url", healthy_http_probe)
+    monkeypatch.setattr(ProxyService, "_probe_mtproto_proxy", healthy_mtproto_probe)
 
 
 def test_proxy_parser_supports_common_formats_and_rejects_unsafe_values() -> None:
@@ -106,6 +121,8 @@ async def test_proxy_lifecycle_encrypts_secrets_and_enforces_assignments(app: Fa
     )
     assert created.masked_endpoint == "http://alice:***@127.0.0.1:1"
     assert created.group_name == "EU pool"
+    assert created.proxy.status == ProxyStatus.HEALTHY
+    assert created.proxy.last_checked_at is not None
 
     async with app.state.database.session_factory() as session:
         stored = await session.scalar(
@@ -174,11 +191,20 @@ async def test_proxy_route_changes_bump_the_account_connection_generation(
         assert stored is not None and stored.connection_generation == 3
 
 
-async def test_failed_checks_move_proxy_to_quarantine(app: FastAPI) -> None:
+async def test_failed_checks_move_proxy_to_quarantine(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = app.state.proxy_service
+
+    async def failed_probe(proxy_url: str) -> _ProxyProbeResult:
+        return _ProxyProbeResult(False, None, None, "ConnectError: test proxy is offline")
+
+    monkeypatch.setattr(service, "_probe_proxy_url", failed_probe)
     view = await service.add_proxy("http://127.0.0.1:1", label="Offline")
+    assert view.proxy.status == ProxyStatus.UNHEALTHY
+    assert view.proxy.consecutive_failures == 1
     for expected_status in (
-        ProxyStatus.UNHEALTHY,
         ProxyStatus.UNHEALTHY,
         ProxyStatus.QUARANTINED,
     ):
@@ -406,6 +432,11 @@ async def test_account_route_is_fail_closed_and_uses_remote_dns(app: FastAPI) ->
         "socks5://alice:p%40ss@proxy.example:1080",
         label="Account route",
     )
+    async with app.state.database.session_factory() as session:
+        endpoint = await session.get(ProxyEndpoint, view.proxy.id)
+        assert endpoint is not None
+        endpoint.status = ProxyStatus.UNKNOWN
+        await session.commit()
     await service.assign_proxy(view.proxy.id, "account:42", "Telegram account #42")
     second_assignment = await service.assign_proxy(
         view.proxy.id, "account:43", "Telegram account #43"
@@ -620,12 +651,14 @@ async def test_account_profile_name_and_avatar_operations_are_persisted(
         last_name="Operator",
         username="alice_operator",
         phone="123",
-        photo=object(),
+        photo=SimpleNamespace(photo_id=42),
     )
 
     class FakeClient:
         async def __call__(self, request):
             requests.append(request)
+            if type(request).__name__ == "UploadProfilePhotoRequest":
+                return SimpleNamespace(photo=SimpleNamespace(id=42))
             return None
 
         async def upload_file(self, payload: bytes, *, file_name: str):
@@ -634,6 +667,7 @@ async def test_account_profile_name_and_avatar_operations_are_persisted(
 
         async def get_profile_photos(self, entity: str):
             assert entity == "me"
+            me.photo = None
             return []
 
     async def fake_profile_operation(profile_account_id: int, operation):

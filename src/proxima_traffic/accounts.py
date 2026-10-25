@@ -23,18 +23,22 @@ import stat
 import struct
 import tempfile
 import zipfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Protocol
+from uuid import uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxima_traffic.account_groups import sync_premium_account_group
+from proxima_traffic.account_leases import AccountOperationLeaseCoordinator
+from proxima_traffic.account_state import apply_flood_pause, locked_account, session_fingerprint
 from proxima_traffic.config import Settings
+from proxima_traffic.gateways import GatewayError, PermanentGatewayError
 from proxima_traffic.models import (
     Account,
     AccountGroup,
@@ -140,12 +144,20 @@ class AccountImportError(DomainError):
     """Raised when an uploaded tdata/session cannot be turned into a session."""
 
 
+class AccountSessionChangedError(ConflictError):
+    """A removal must not erase credentials restored after the session check."""
+
+
 class AccountOperationError(DomainError):
     """Base error for an authenticated Telegram account operation."""
 
 
 class AccountProfileError(AccountOperationError):
     """Raised when Telegram rejects or cannot apply a profile change."""
+
+
+class AccountIdentityError(AccountProfileError):
+    """The session belongs to a different Telegram user than the account card."""
 
 
 class ChatFolderError(AccountOperationError):
@@ -227,6 +239,7 @@ class AccountBulkCheckEntry:
     label: str
     result: AccountCheckResult | None
     error: str | None = None
+    session_fingerprint: str | None = field(default=None, repr=False)
 
     @property
     def ready(self) -> bool:
@@ -242,6 +255,7 @@ class AccountBulkCheckEntry:
         """
         return bool(
             self.result is not None
+            and not self.result.authorized
             and self.result.failure_code in {"account_dead", "account_unauthorized"}
         )
 
@@ -432,6 +446,12 @@ class AccountService:
         self._proxy_service = proxy_service
         self._cipher = AccountSecretCipher.from_settings(settings)
         self._client_coordinator: AccountClientCoordinator | None = None
+        self._operation_leases = AccountOperationLeaseCoordinator(
+            session_factory,
+            owner_id=f"account-service-{uuid4().hex}",
+            lease_seconds=settings.worker_lease_seconds,
+            heartbeat_seconds=settings.worker_heartbeat_seconds,
+        )
 
     def bind_client_coordinator(self, coordinator: AccountClientCoordinator) -> None:
         """Route checks/profile/folder operations through the live gateway client pool."""
@@ -691,11 +711,14 @@ class AccountService:
                 raise NotFoundError("account not found")
             return account
 
-    async def delete_account(self, account_id: int, *, actor: str = "control-bot") -> None:
+    async def delete_account(
+        self, account_id: int, *, actor: str = "control-bot",
+        expected_session_fingerprint: str | None = None,
+    ) -> None:
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
-            if account is None:
-                raise NotFoundError("account not found")
+            account = await self._account_for_removal(
+                session, account_id, expected_session_fingerprint
+            )
             configured_comment_rule = await session.scalar(
                 select(ChannelCommentRule.id).where(
                     ChannelCommentRule.primary_account_id == account_id
@@ -940,6 +963,7 @@ class AccountService:
         account_id: int,
         *,
         actor: str = "control-bot",
+        expected_session_fingerprint: str | None = None,
     ) -> AccountRemovalResult:
         """Delete an account when possible, otherwise revoke only its live access.
 
@@ -956,9 +980,17 @@ class AccountService:
             )
         label = plan.label
         try:
-            await self.delete_account(account_id, actor=actor)
+            await self.delete_account(
+                account_id, actor=actor,
+                expected_session_fingerprint=expected_session_fingerprint,
+            )
+        except AccountSessionChangedError:
+            raise
         except ConflictError:
-            await self.clear_session(account_id, actor=actor)
+            await self.clear_session(
+                account_id, actor=actor,
+                expected_session_fingerprint=expected_session_fingerprint,
+            )
             async with self._session_factory() as session:
                 add_audit_event(
                     session,
@@ -982,7 +1014,33 @@ class AccountService:
             preserved_for_history=False,
         )
 
-    async def clear_session(self, account_id: int, *, actor: str = "control-bot") -> Account:
+    async def _account_for_removal(
+        self, session: AsyncSession, account_id: int, expected_fingerprint: str | None
+    ) -> Account:
+        # Serialize ordinary removal as well as cleanup against new work and
+        # session replacement before checking the live references.
+        await session.execute(
+            update(Account)
+            .where(Account.id == account_id)
+            .values(connection_generation=Account.connection_generation)
+        )
+        account = await session.get(Account, account_id)
+        if account is None:
+            raise NotFoundError("account not found")
+        if (
+            expected_fingerprint is not None
+            and _session_fingerprint(account) != expected_fingerprint
+        ):
+            raise AccountSessionChangedError("сессия изменилась после проверки; удаление отменено")
+        plan = await self.account_removal_plan(account_id)
+        if not plan.can_remove:
+            raise ConflictError("аккаунт занят: " + "; ".join(plan.active_work))
+        return account
+
+    async def clear_session(
+        self, account_id: int, *, actor: str = "control-bot",
+        expected_session_fingerprint: str | None = None,
+    ) -> Account:
         """Revoke stored Telegram access while keeping the historical account row.
 
         Access must never be removed from underneath a queued or running task.
@@ -997,9 +1055,9 @@ class AccountService:
                 "завершения: " + "; ".join(plan.active_work)
             )
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
-            if account is None:
-                raise NotFoundError("account not found")
+            account = await self._account_for_removal(
+                session, account_id, expected_session_fingerprint
+            )
             account.status = AccountStatus.DISABLED
             account.session_source = AccountSessionSource.NONE
             account.session_encrypted = None
@@ -1108,6 +1166,7 @@ class AccountService:
         that Telegram revoked the account, so the last known authorization is
         preserved and the safe cleanup action will never remove it.
         """
+        expected_fingerprint = await self._observation_fingerprint(account_id)
         try:
             decrypted = await self.load_session(account_id)
         except NotFoundError:
@@ -1120,6 +1179,7 @@ class AccountService:
                 error=_safe_account_error(exc),
                 failure_code="session_material_invalid",
                 actor=actor,
+                expected_session_fingerprint=expected_fingerprint,
             )
         except Exception as exc:  # noqa: BLE001 - keep a damaged local cipher actionable
             logger.warning(
@@ -1134,6 +1194,7 @@ class AccountService:
                 error=_safe_account_error(exc),
                 failure_code="session_material_invalid",
                 actor=actor,
+                expected_session_fingerprint=expected_fingerprint,
             )
         transport = TelethonTransport(proxy=None)
         if self._proxy_service is not None:
@@ -1157,18 +1218,23 @@ class AccountService:
                         ),
                         failure_code="proxy_unavailable",
                         actor=actor,
+                        expected_session_fingerprint=expected_fingerprint,
                     )
         try:
             me = await self._fetch_me(decrypted, transport)
         except Exception as exc:  # noqa: BLE001 - report any connection failure safely
             failure_code = _account_check_failure_code(exc)
+            await self._record_operation_failure(account_id, exc, expected_fingerprint)
             return await self._record_check(
                 account_id,
-                authorized=False if failure_code == "account_dead" else None,
+                authorized=(
+                    False if failure_code in {"account_dead", "account_unauthorized"} else None
+                ),
                 me=None,
                 error=_safe_account_error(exc),
                 failure_code=failure_code,
                 actor=actor,
+                expected_session_fingerprint=expected_fingerprint,
             )
         return await self._record_check(
             account_id,
@@ -1177,6 +1243,7 @@ class AccountService:
             error=None,
             failure_code=None if me is not None else "account_unauthorized",
             actor=actor,
+            expected_session_fingerprint=expected_fingerprint,
         )
 
     async def check_all_sessions(
@@ -1185,6 +1252,7 @@ class AccountService:
         actor: str = "control-bot",
         concurrency: int = 3,
         on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+        account_ids: Sequence[int] | None = None,
     ) -> AccountBulkCheckSummary:
         """Verify every stored Telegram session without sending any messages.
 
@@ -1193,11 +1261,17 @@ class AccountService:
         timeout into a very long operator wait.  The small, bounded fan-out
         retains independent account leases/routes without a connection burst.
         """
+        conditions = [Account.session_source != AccountSessionSource.NONE]
+        if account_ids is not None:
+            conditions.append(Account.id.in_(tuple(set(account_ids))))
         async with self._session_factory() as session:
             accounts = list(
                 await session.execute(
-                    select(Account.id, Account.label)
-                    .where(Account.session_source != AccountSessionSource.NONE)
+                    select(
+                        Account.id, Account.label, Account.session_source,
+                        Account.session_encrypted, Account.api_id, Account.api_hash_encrypted,
+                    )
+                    .where(*conditions)
                     .order_by(Account.id)
                 )
             )
@@ -1218,7 +1292,9 @@ class AccountService:
         if on_progress is not None:
             await on_progress(0, total)
 
-        async def run_check(account_id: int, label: str) -> AccountBulkCheckEntry:
+        async def run_check(
+            account_id: int, label: str, fingerprint: str
+        ) -> AccountBulkCheckEntry:
             try:
                 result = await self.check_account(account_id, actor=actor)
             except (AccountImportError, NotFoundError) as exc:
@@ -1245,19 +1321,21 @@ class AccountService:
                 label=label,
                 result=result,
                 error=result.error,
+                session_fingerprint=fingerprint,
             )
 
-        async def check_one(account_id: int, label: str) -> AccountBulkCheckEntry:
+        async def check_one(account) -> AccountBulkCheckEntry:
             async with semaphore:
                 try:
-                    return await run_check(account_id, label)
+                    return await run_check(int(account.id), str(account.label),
+                                           _session_fingerprint(account))
                 finally:
                     await report_progress()
 
         # gather preserves database order, so the report remains easy to
         # reconcile with the account list despite parallel checks.
         entries = await asyncio.gather(
-            *(check_one(int(account_id), str(label)) for account_id, label in accounts)
+            *(check_one(account) for account in accounts)
         )
         return AccountBulkCheckSummary(entries=tuple(entries))
 
@@ -1266,6 +1344,9 @@ class AccountService:
         *,
         actor: str = "control-bot",
         concurrency: int = 3,
+        account_ids: Sequence[int] | None = None,
+        expected_session_fingerprints: Mapping[int, str] | None = None,
+        on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> AccountInvalidSessionCleanupSummary:
         """Recheck all stored sessions, then remove only Telegram-confirmed dead access.
 
@@ -1275,12 +1356,30 @@ class AccountService:
         timeouts, proxy failures and flood waits are merely reported, never
         converted into account deletion.
         """
-        check_summary = await self.check_all_sessions(actor=actor, concurrency=concurrency)
+        check_summary = await self.check_all_sessions(
+            actor=actor, concurrency=concurrency, account_ids=account_ids, on_progress=on_progress
+        )
         removed: list[AccountRemovalResult] = []
         skipped: list[AccountInvalidSessionCleanupIssue] = []
         for entry in check_summary.session_revoked:
             try:
-                removed.append(await self.remove_account_safely(entry.account_id, actor=actor))
+                if (
+                    entry.session_fingerprint is None
+                    or (
+                        expected_session_fingerprints is not None
+                        and expected_session_fingerprints.get(entry.account_id)
+                        != entry.session_fingerprint
+                    )
+                ):
+                    raise AccountSessionChangedError("сессия изменилась; повторите просмотр списка")
+                removed.append(await self.remove_account_safely(
+                    entry.account_id, actor=actor,
+                    expected_session_fingerprint=entry.session_fingerprint,
+                ))
+            except AccountSessionChangedError as exc:
+                skipped.append(AccountInvalidSessionCleanupIssue(
+                    account_id=entry.account_id, label=entry.label, reason=str(exc)
+                ))
             except ConflictError:
                 try:
                     plan = await self.account_removal_plan(entry.account_id)
@@ -1342,6 +1441,8 @@ class AccountService:
         normalized_first = _validate_telegram_name(first_name, required=True)
         normalized_last = _validate_telegram_name(last_name, required=False)
 
+        expected_fingerprint = await self._observation_fingerprint(account_id)
+
         async def update(client: object) -> None:
             from telethon.tl.functions.account import (  # noqa: PLC0415
                 UpdateProfileRequest,
@@ -1355,12 +1456,19 @@ class AccountService:
             )
 
         me, _ = await self._run_profile_operation(account_id, update)
+        if (getattr(me, "first_name", None) or "") != normalized_first or (
+            getattr(me, "last_name", None) or ""
+        ) != normalized_last:
+            raise AccountProfileError(
+                "Telegram не подтвердил новое имя. Проверьте профиль перед повторением операции"
+            )
         return await self._record_profile(
             account_id,
             me,
             event_type="account.profile_name_updated",
             details={"first_name": normalized_first, "last_name": normalized_last},
             actor=actor,
+            expected_session_fingerprint=expected_fingerprint,
         )
 
     async def rename_account_label(
@@ -1404,21 +1512,30 @@ class AccountService:
     ) -> Account:
         normalized_about = _validate_telegram_about(about)
 
-        async def update(client: object) -> None:
+        expected_fingerprint = await self._observation_fingerprint(account_id)
+
+        async def update(client: object) -> str:
             from telethon.tl.functions.account import (  # noqa: PLC0415
                 UpdateProfileRequest,
             )
 
             await client(UpdateProfileRequest(about=normalized_about))  # type: ignore[operator]
+            observed_about = await _read_profile_about(client)
+            if observed_about != normalized_about:
+                raise AccountProfileError(
+                    "Telegram не подтвердил описание. Проверьте профиль перед повторением операции"
+                )
+            return observed_about
 
-        me, _ = await self._run_profile_operation(account_id, update)
+        me, observed_about = await self._run_profile_operation(account_id, update)
         return await self._record_profile(
             account_id,
             me,
             event_type="account.profile_about_updated",
             details={"has_about": bool(normalized_about), "length": len(normalized_about)},
             actor=actor,
-            about_override=normalized_about,
+            about_override=str(observed_about),
+            expected_session_fingerprint=expected_fingerprint,
         )
 
     async def bulk_update_profile_about(
@@ -1441,8 +1558,10 @@ class AccountService:
             async with semaphore:
                 try:
                     return await self.update_profile_about(account_id, about=about, actor=actor)
-                except (NotFoundError, AccountImportError, AccountProfileError) as exc:
-                    return ProfileNameFailure(account_id=account_id, error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - each account has its own outcome
+                    return ProfileNameFailure(
+                        account_id=account_id, error=_safe_account_operation_error(exc)
+                    )
 
         results = await asyncio.gather(*(apply_about(account_id) for account_id in normalized_ids))
         updated = tuple(item for item in results if isinstance(item, Account))
@@ -1490,8 +1609,10 @@ class AccountService:
                         last_name=profile_name.last_name,
                         actor=actor,
                     )
-                except (NotFoundError, AccountImportError, AccountProfileError) as exc:
-                    return ProfileNameFailure(account_id=account_id, error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - each account has its own outcome
+                    return ProfileNameFailure(
+                        account_id=account_id, error=_safe_account_operation_error(exc)
+                    )
 
         results = await asyncio.gather(
             *(
@@ -1533,7 +1654,9 @@ class AccountService:
             raise AccountProfileError("аватар больше 10 МБ")
         safe_name = _validate_profile_photo_name(file_name)
 
-        async def update(client: object) -> None:
+        expected_fingerprint = await self._observation_fingerprint(account_id)
+
+        async def update(client: object) -> object:
             from telethon.tl.functions.photos import (  # noqa: PLC0415
                 UploadProfilePhotoRequest,
             )
@@ -1542,16 +1665,22 @@ class AccountService:
                 photo_bytes,
                 file_name=safe_name,
             )
-            await client(UploadProfilePhotoRequest(file=uploaded))  # type: ignore[operator]
+            return await client(UploadProfilePhotoRequest(file=uploaded))  # type: ignore[operator]
 
-        me, _ = await self._run_profile_operation(account_id, update)
+        me, response = await self._run_profile_operation(account_id, update)
+        photo_id = getattr(getattr(response, "photo", None), "id", None)
+        current_photo_id = getattr(getattr(me, "photo", None), "photo_id", None)
+        if not photo_id or current_photo_id != photo_id:
+            raise AccountProfileError(
+                "Telegram не подтвердил новый аватар. Проверьте профиль перед повторением операции"
+            )
         return await self._record_profile(
             account_id,
             me,
             event_type="account.profile_photo_updated",
             details={"file_name": safe_name, "size": len(photo_bytes)},
             actor=actor,
-            photo_override=True,
+            expected_session_fingerprint=expected_fingerprint,
         )
 
     async def bulk_update_profile_photos(
@@ -1586,8 +1715,10 @@ class AccountService:
                         file_name=safe_name,
                         actor=actor,
                     )
-                except (NotFoundError, AccountImportError, AccountProfileError) as exc:
-                    return ProfileNameFailure(account_id=account_id, error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - each account has its own outcome
+                    return ProfileNameFailure(
+                        account_id=account_id, error=_safe_account_operation_error(exc)
+                    )
 
         results = await asyncio.gather(*(apply_photo(account_id) for account_id in normalized_ids))
         updated = tuple(item for item in results if isinstance(item, Account))
@@ -1618,30 +1749,54 @@ class AccountService:
         *,
         actor: str = "control-bot",
     ) -> tuple[Account, int]:
-        async def delete(client: object) -> int:
+        expected_fingerprint = await self._observation_fingerprint(account_id)
+
+        async def delete(client: object) -> tuple[int, int, int]:
             from telethon import utils  # noqa: PLC0415
             from telethon.tl.functions.photos import DeletePhotosRequest  # noqa: PLC0415
 
             photos = list(await client.get_profile_photos("me"))  # type: ignore[attr-defined]
-            deleted = 0
+            confirmed_ids: set[int] = set()
             for offset in range(0, len(photos), 100):
                 photo_ids = [
                     utils.get_input_photo(photo) for photo in photos[offset : offset + 100]
                 ]
                 if photo_ids:
-                    await client(DeletePhotosRequest(id=photo_ids))  # type: ignore[operator]
-                    deleted += len(photo_ids)
-            return deleted
+                    response = await client(DeletePhotosRequest(id=photo_ids))  # type: ignore[operator]
+                    requested = {int(photo.id) for photo in photo_ids}
+                    if isinstance(response, (list, tuple)):
+                        confirmed_ids.update(
+                            int(value)
+                            for value in response
+                            if isinstance(value, int) and value in requested
+                        )
+            remaining = list(await client.get_profile_photos("me"))  # type: ignore[attr-defined]
+            return (
+                len(confirmed_ids),
+                len(remaining),
+                len({int(photo.id) for photo in photos}) - len(confirmed_ids),
+            )
 
-        me, deleted = await self._run_profile_operation(account_id, delete)
+        me, outcome = await self._run_profile_operation(account_id, delete)
+        deleted, remaining, unconfirmed = outcome
         account = await self._record_profile(
             account_id,
             me,
             event_type="account.profile_photos_deleted",
-            details={"count": int(deleted)},
+            details={
+                "count": int(deleted),
+                "remaining": int(remaining),
+                "unconfirmed": int(unconfirmed),
+            },
             actor=actor,
-            photo_override=False,
+            expected_session_fingerprint=expected_fingerprint,
         )
+        if remaining or unconfirmed or getattr(me, "photo", None) is not None:
+            raise AccountProfileError(
+                f"Удаление завершено частично: Telegram подтвердил {deleted}, "
+                f"осталось {remaining}. "
+                f"Не подтверждено удалений: {unconfirmed}. Проверьте профиль"
+            )
         return account, int(deleted)
 
     async def inspect_chat_folder(
@@ -1723,6 +1878,19 @@ class AccountService:
                 account.next_send_at = None
                 account.cooldown_until = None
                 account.cooldown_reason = None
+                if account.operator_paused:
+                    account.status = AccountStatus.PAUSED
+                if account.spambot_status in {
+                    "temporary_restriction",
+                    "active_restriction",
+                    "restriction_unclear",
+                    "permanent_restriction",
+                }:
+                    account.status = AccountStatus.PAUSED
+                    account.cooldown_reason = "spambot_restriction_no_expiry"
+                    account.cooldown_until = utc_now()
+                    account.spambot_checked_at = None
+                    account.last_error = "@SpamBot: прежнее ограничение требует новой проверки"
             else:
                 resolved_label = label or await self._available_import_label(session, converted)
                 account = Account(
@@ -1799,6 +1967,7 @@ class AccountService:
         error: str | None,
         failure_code: str | None = None,
         actor: str,
+        expected_session_fingerprint: str | None = None,
     ) -> AccountCheckResult:
         telegram_user_id = getattr(me, "id", None)
         first_name = getattr(me, "first_name", None)
@@ -1809,9 +1978,21 @@ class AccountService:
         checked_at = utc_now()
         recovered_expired_cooldown = False
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
+            account = await self._account_for_observation(
+                session, account_id, expected_session_fingerprint
+            )
             if account is None:
                 raise NotFoundError("account not found")
+            if authorized is True:
+                try:
+                    _require_profile_identity(account, me)
+                except AccountIdentityError as exc:
+                    authorized = None
+                    error = str(exc)
+                    failure_code = "account_identity_mismatch"
+                    telegram_user_id = phone = username = None
+                    account.status = AccountStatus.PAUSED
+                    account.cooldown_reason = failure_code
             if authorized is not None:
                 account.authorized = authorized
             account.last_checked_at = checked_at
@@ -1827,17 +2008,27 @@ class AccountService:
                 # Telegram/@SpamBot bans remain disabled.
                 cooldown_until = ensure_utc(account.cooldown_until)
                 if (
-                    account.status is AccountStatus.DISABLED
+                    account.status in {AccountStatus.DISABLED, AccountStatus.PAUSED}
+                    and account.spambot_status
+                    not in {
+                        "temporary_restriction",
+                        "active_restriction",
+                        "restriction_unclear",
+                        "permanent_restriction",
+                    }
                     and account.cooldown_reason
                     in {
                         "account_restricted",
                         "flood_escalation",
                         "flood_wait",
                         "peer_flood",
+                        "account_identity_mismatch",
                     }
                     and (cooldown_until is None or cooldown_until <= checked_at)
                 ):
-                    account.status = AccountStatus.ACTIVE
+                    account.status = (
+                        AccountStatus.PAUSED if account.operator_paused else AccountStatus.ACTIVE
+                    )
                     account.cooldown_until = None
                     account.cooldown_reason = None
                     recovered_expired_cooldown = True
@@ -1849,6 +2040,9 @@ class AccountService:
                 account.last_name = str(last_name)[:64] if last_name else None
                 account.username = str(username)[:64] if username else None
                 account.has_profile_photo = getattr(me, "photo", None) is not None
+                observed_about = getattr(me, "_proxima_observed_about", None)
+                if isinstance(observed_about, str):
+                    account.about = observed_about
                 if is_premium is not None:
                     account.is_premium = is_premium
                     account.premium_checked_at = checked_at
@@ -1894,11 +2088,15 @@ class AccountService:
         actor: str,
         photo_override: bool | None = None,
         about_override: str | None = None,
+        expected_session_fingerprint: str | None = None,
     ) -> Account:
         async with self._session_factory() as session:
-            account = await session.get(Account, account_id)
+            account = await self._account_for_observation(
+                session, account_id, expected_session_fingerprint
+            )
             if account is None:
                 raise NotFoundError("account not found")
+            _require_profile_identity(account, me)
             account.first_name = _optional_profile_value(getattr(me, "first_name", None))
             account.last_name = _optional_profile_value(getattr(me, "last_name", None))
             account.username = _optional_profile_value(getattr(me, "username", None))
@@ -1939,10 +2137,123 @@ class AccountService:
     ) -> tuple[object, object]:
         try:
             return await self._run_account_operation(account_id, operation)
-        except AccountOperationError as exc:
+        except (AccountOperationError, AccountSessionChangedError) as exc:
             raise AccountProfileError(str(exc)) from exc
 
+    async def _observation_fingerprint(self, account_id: int) -> str:
+        return _session_fingerprint(await self.get_account(account_id))
+
+    async def _account_for_observation(
+        self,
+        session: AsyncSession,
+        account_id: int,
+        expected: str | None,
+    ) -> Account:
+        account = await locked_account(session, account_id)
+        if account is None:
+            raise NotFoundError("account not found")
+        if expected is not None and _session_fingerprint(account) != expected:
+            raise AccountSessionChangedError(
+                "Сессия изменилась во время операции. Проверьте аккаунт заново"
+            )
+        return account
+
+    async def _record_operation_failure(
+        self, account_id: int, error: BaseException, expected: str
+    ) -> None:
+        code = _account_check_failure_code(error)
+        if code not in {
+            "flood_wait",
+            "account_dead",
+            "account_unauthorized",
+            "account_identity_mismatch",
+        }:
+            return
+        origin = error
+        while origin.__cause__ is not None:
+            origin = origin.__cause__
+        async with self._session_factory() as session:
+            account = await locked_account(session, account_id)
+            if account is None or _session_fingerprint(account) != expected:
+                return
+            if code == "flood_wait":
+                seconds = (
+                    getattr(error, "retry_after", None)
+                    or getattr(origin, "retry_after", None)
+                    or getattr(origin, "seconds", 0)
+                    or 0
+                )
+                apply_flood_pause(
+                    account, float(seconds), minimum=self._settings.flood_min_pause_seconds
+                )
+            elif code == "account_identity_mismatch":
+                account.status = AccountStatus.PAUSED
+                account.cooldown_reason = code
+                account.last_error = _safe_account_operation_error(error)[:500]
+            else:
+                account.status = AccountStatus.DISABLED
+                account.authorized = False
+                account.cooldown_reason = code
+                account.last_error = _safe_account_operation_error(error)[:500]
+            add_audit_event(
+                session,
+                event_type="account.operation_failed",
+                entity_type="account",
+                entity_id=account_id,
+                details={"failure_code": code},
+                actor="account-service",
+            )
+            await session.commit()
+
     async def _run_account_operation(
+        self,
+        account_id: int,
+        operation: Callable[[object], Awaitable[object]],
+    ) -> tuple[object, object]:
+        expected = await self._observation_fingerprint(account_id)
+
+        async def guarded_operation(client: object) -> object:
+            account = await self.get_account(account_id)
+            if _session_fingerprint(account) != expected:
+                raise AccountSessionChangedError(
+                    "Сессия изменилась. Повторите операцию из новой карточки"
+                )
+            cooldown = ensure_utc(account.cooldown_until)
+            if account.cooldown_reason == "flood_wait" and cooldown and cooldown > utc_now():
+                raise AccountOperationError(
+                    "Telegram FloodWait: дождитесь окончания защитной паузы"
+                )
+            if account.telegram_user_id is not None:
+                me = await client.get_me()  # type: ignore[attr-defined]
+                if me is None:
+                    raise PermanentGatewayError(
+                        "сессия аккаунта недействительна", code="account_unauthorized"
+                    )
+                _require_profile_identity(account, me)
+            return await operation(client)
+
+        try:
+            async with asyncio.timeout(max(60, self._settings.account_connect_timeout_seconds * 3)):
+                if self._client_coordinator is not None:
+                    return await self._perform_account_operation(account_id, guarded_operation)
+                async with self._operation_leases.hold(account_id) as token:
+                    if token is None:
+                        raise AccountOperationError(
+                            "Аккаунт сейчас выполняет другую операцию. Повторите позже"
+                        )
+                    return await self._perform_account_operation(account_id, guarded_operation)
+        except Exception as exc:  # noqa: BLE001 - translate every operational failure safely
+            await self._record_operation_failure(account_id, exc, expected)
+            if isinstance(exc, (AccountOperationError, AccountSessionChangedError, NotFoundError)):
+                raise
+            if isinstance(exc, TimeoutError):
+                raise AccountOperationError(
+                    "Telegram не подтвердил результат вовремя. "
+                    "Проверьте профиль перед повторением операции"
+                ) from exc
+            raise AccountOperationError(_safe_account_operation_error(exc)) from exc
+
+    async def _perform_account_operation(
         self,
         account_id: int,
         operation: Callable[[object], Awaitable[object]],
@@ -1987,18 +2298,24 @@ class AccountService:
             **transport.client_kwargs(),
             connection_retries=1,
             timeout=int(self._settings.account_connect_timeout_seconds),
-            flood_sleep_threshold=self._settings.account_flood_sleep_threshold,
+            request_retries=0,
+            flood_sleep_threshold=0,
+            raise_last_call_error=True,
         )
         try:
             await asyncio.wait_for(
                 client.connect(), timeout=self._settings.account_connect_timeout_seconds
             )
             if not await client.is_user_authorized():
-                raise AccountOperationError("сессия аккаунта недействительна")
+                raise PermanentGatewayError(
+                    "сессия аккаунта недействительна", code="account_unauthorized"
+                )
             result = await operation(client)
             me = await client.get_me()
             if me is None:
-                raise AccountOperationError("Telegram не вернул профиль аккаунта")
+                raise PermanentGatewayError(
+                    "Telegram не вернул профиль аккаунта", code="account_unauthorized"
+                )
             return me, result
         except AccountOperationError:
             raise
@@ -2006,7 +2323,7 @@ class AccountService:
             raise AccountOperationError(_safe_account_operation_error(exc)) from exc
         finally:
             try:
-                await client.disconnect()
+                await asyncio.wait_for(client.disconnect(), timeout=5)
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 logger.debug("profile client disconnect failed", exc_info=True)
 
@@ -2015,40 +2332,22 @@ class AccountService:
         decrypted: DecryptedSession,
         transport: TelethonTransport,
     ) -> object | None:
-        if self._client_coordinator is not None:
-
-            async def no_operation(_client: object) -> None:
-                return None
-
-            me, _ = await self._client_coordinator.run_account_operation(
-                decrypted.account_id,
-                no_operation,
-            )
-            return me
-
-        from telethon import TelegramClient  # noqa: PLC0415 - lazy heavy import
-        from telethon.sessions import StringSession  # noqa: PLC0415
-
-        client = TelegramClient(
-            StringSession(decrypted.session_string),
-            decrypted.api_id,
-            decrypted.api_hash,
-            **transport.client_kwargs(),
-            connection_retries=1,
-            timeout=int(self._settings.account_connect_timeout_seconds),
-        )
-        try:
-            await asyncio.wait_for(
-                client.connect(), timeout=self._settings.account_connect_timeout_seconds
-            )
-            if not await client.is_user_authorized():
-                return None
-            return await client.get_me()
-        finally:
+        async def inspect_profile(client: object) -> str | None:
             try:
-                await client.disconnect()
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                logger.debug("account %s disconnect failed", decrypted.account_id, exc_info=True)
+                return await _read_profile_about(client)
+            except Exception as exc:  # noqa: BLE001 - a bio read failure does not revoke a session
+                if _account_check_failure_code(exc) in {
+                    "flood_wait",
+                    "account_dead",
+                    "account_unauthorized",
+                }:
+                    raise
+                return None
+
+        me, about = await self._run_account_operation(decrypted.account_id, inspect_profile)
+        if isinstance(about, str):
+            me._proxima_observed_about = about  # type: ignore[attr-defined]
+        return me
 
     def _require_api(self) -> tuple[int, str]:
         api = self._settings.telegram_api
@@ -2773,11 +3072,54 @@ def _safe_account_error(error: BaseException) -> str:
 
 def _account_check_failure_code(error: BaseException) -> str:
     """Separate a dead authorization from a temporary connectivity failure."""
-    error_name = type(error).__name__
-    rpc_message = str(getattr(error, "message", "") or "").upper()
+    origin = error
+    while origin.__cause__ is not None:
+        origin = origin.__cause__
+    if isinstance(origin, AccountIdentityError):
+        return "account_identity_mismatch"
+    origin_name = type(origin).__name__
+    origin_message = str(getattr(origin, "message", "") or "").upper()
+    # API credentials and temporary key binding are not evidence of a revoked
+    # user session, even if an older gateway called their wrapper account_dead.
+    if (
+        origin_name
+        in {
+            "ApiIdPublishedFloodError",
+            "ApiIdInvalidError",
+            "AuthKeyPermEmptyError",
+            "PremiumCurrentlyUnavailableError",
+        }
+        or origin_message
+        in {
+            "API_ID_PUBLISHED_FLOOD",
+            "API_ID_INVALID",
+            "AUTH_KEY_PERM_EMPTY",
+            "AUTH_KEY_UNSYNCHRONIZED",
+        }
+        or (
+            origin_name == "AuthKeyError"
+            and origin_message
+            not in {
+                "AUTH_KEY_DUPLICATED",
+                "AUTH_KEY_INVALID",
+                "AUTH_KEY_UNREGISTERED",
+            }
+        )
+    ):
+        return "account_check_unavailable"
+    if origin_name in {
+        "FloodWaitError",
+        "FloodPremiumWaitError",
+        "FloodTestPhoneWaitError",
+    } or origin_message.startswith("FLOOD_WAIT"):
+        return "flood_wait"
+    if isinstance(error, GatewayError):
+        return error.code or "account_check_unavailable"
+    if isinstance(origin, GatewayError):
+        return origin.code or "account_check_unavailable"
+    error_name = type(origin).__name__
+    rpc_message = str(getattr(origin, "message", "") or "").upper()
     fatal_names = {
-        "ApiIdPublishedFloodError",
-        "AuthKeyError",
         "AuthKeyDuplicatedError",
         "AuthKeyInvalidError",
         "AuthKeyUnregisteredError",
@@ -2791,9 +3133,7 @@ def _account_check_failure_code(error: BaseException) -> str:
     fatal_messages = {
         "AUTH_KEY_DUPLICATED",
         "AUTH_KEY_INVALID",
-        "AUTH_KEY_PERM_EMPTY",
         "AUTH_KEY_UNREGISTERED",
-        "AUTH_KEY_UNSYNCHRONIZED",
         "PHONE_NUMBER_BANNED",
         "SESSION_EXPIRED",
         "SESSION_REVOKED",
@@ -2803,6 +3143,31 @@ def _account_check_failure_code(error: BaseException) -> str:
     if error_name in fatal_names or rpc_message in fatal_messages:
         return "account_dead"
     return "account_check_unavailable"
+
+
+def _session_fingerprint(account: object) -> str:
+    return session_fingerprint(account)
+
+
+async def _read_profile_about(client: object) -> str:
+    from telethon.tl.functions.users import GetFullUserRequest  # noqa: PLC0415
+    from telethon.tl.types import InputUserSelf  # noqa: PLC0415
+
+    response = await client(GetFullUserRequest(id=InputUserSelf()))  # type: ignore[operator]
+    full_user = getattr(response, "full_user", None)
+    if full_user is None:
+        raise AccountProfileError("Telegram не подтвердил описание профиля")
+    return str(getattr(full_user, "about", None) or "")
+
+
+def _require_profile_identity(account: Account, me: object) -> None:
+    observed_id = getattr(me, "id", None)
+    if (
+        account.telegram_user_id is not None
+        and observed_id is not None
+        and account.telegram_user_id != observed_id
+    ):
+        raise AccountIdentityError("Telegram вернул другой аккаунт. Проверьте загруженную сессию")
 
 
 def _validate_telegram_name(value: str, *, required: bool) -> str:

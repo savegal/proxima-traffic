@@ -17,13 +17,13 @@ def participant_reactions_menu(
     views: list[ParticipantReactionRuleView], *, page: int, total: int, page_size: int
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="＋ Настроить реакции", callback_data="pr:add"))
     for view in views:
         builder.button(
-            text=f"{'🟢' if view.rule.enabled else '⏸'} {view.rule.name}",
+            text=f"{'●' if view.rule.enabled else 'Ⅱ'} {view.rule.name}",
             callback_data=f"pr:details:{view.rule.id}:{page}",
         )
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="➕ Настроить реакции", callback_data="pr:add"))
     pages = max(1, (total + page_size - 1) // page_size)
     if pages > 1:
         row = []
@@ -33,39 +33,41 @@ def participant_reactions_menu(
         if page + 1 < pages:
             row.append(InlineKeyboardButton(text="›", callback_data=f"pr:home:{page + 1}"))
         builder.row(*row)
-    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"pr:home:{page}"))
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"pr:home:{page}"),
+        InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"),
+    )
     return builder.as_markup()
 
 
 def participant_reaction_details_menu(
     view: ParticipantReactionRuleView, *, page: int
 ) -> InlineKeyboardMarkup:
-    action = "⏸ Остановить" if view.rule.enabled else "▶️ Включить"
+    action = "Ⅱ Остановить" if view.rule.enabled else "› Включить"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=action, callback_data=f"pr:toggle:{view.rule.id}:{page}")],
             [
                 InlineKeyboardButton(
-                    text="⚙️ Настроить", callback_data=f"pr:edit:{view.rule.id}:{page}"
+                    text="Настроить", callback_data=f"pr:edit:{view.rule.id}:{page}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔄 Проверить сейчас", callback_data=f"pr:scan:{view.rule.id}:{page}"
+                    text="↻ Проверить сейчас", callback_data=f"pr:scan:{view.rule.id}:{page}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📋 Последние реакции", callback_data=f"pr:runs:{view.rule.id}:{page}"
+                    text="Последние реакции", callback_data=f"pr:runs:{view.rule.id}:{page}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🗑 Удалить", callback_data=f"pr:delete:ask:{view.rule.id}:{page}"
+                    text="× Удалить", callback_data=f"pr:delete:ask:{view.rule.id}:{page}"
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К авто-реакциям", callback_data=f"pr:home:{page}")],
+            [InlineKeyboardButton(text="‹ К реакциям участникам", callback_data=f"pr:home:{page}")],
         ]
     )
 
@@ -75,10 +77,10 @@ def participant_reaction_delete_menu(rule_id: int, page: int) -> InlineKeyboardM
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить", callback_data=f"pr:delete:confirm:{rule_id}:{page}"
+                    text="× Да, удалить", callback_data=f"pr:delete:confirm:{rule_id}:{page}"
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data=f"pr:details:{rule_id}:{page}")],
+            [InlineKeyboardButton(text="× Отмена", callback_data=f"pr:details:{rule_id}:{page}")],
         ]
     )
 
@@ -87,7 +89,7 @@ def participant_reaction_list_picker(page: Page[TargetListView]) -> InlineKeyboa
     builder = InlineKeyboardBuilder()
     for item in page.items:
         builder.button(
-            text=f"📚 {item.name} · {item.approved_count}", callback_data=f"pr:list:pick:{item.id}"
+            text=f"{item.name} · {item.approved_count}", callback_data=f"pr:list:pick:{item.id}"
         )
     builder.adjust(1)
     if page.pages > 1:
@@ -102,7 +104,7 @@ def participant_reaction_list_picker(page: Page[TargetListView]) -> InlineKeyboa
                 InlineKeyboardButton(text="›", callback_data=f"pr:list:page:{page.page + 1}")
             )
         builder.row(*row)
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="pr:home:0"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="pr:home:0"))
     return builder.as_markup()
 
 
@@ -113,7 +115,7 @@ def participant_reaction_account_picker(
     pages = max(1, (len(accounts) + size - 1) // size)
     builder = InlineKeyboardBuilder()
     for account in accounts[page * size : (page + 1) * size]:
-        mark = "✅" if account.id in selected else "▫️"
+        mark = "✓" if account.id in selected else "○"
         builder.button(
             text=f"{mark} {account.label}", callback_data=f"pr:account:{account.id}:{page}"
         )
@@ -128,10 +130,10 @@ def participant_reaction_account_picker(
         builder.row(*row)
     builder.row(
         InlineKeyboardButton(
-            text=f"✅ Готово · выбрано {len(selected)}", callback_data="pr:account:done"
+            text=f"✓ Готово · выбрано {len(selected)}", callback_data="pr:account:done"
         )
     )
-    builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="pr:home:0"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="pr:home:0"))
     return builder.as_markup()
 
 
@@ -146,7 +148,7 @@ def participant_reaction_sample_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="3 из 10 · заметно", callback_data="pr:sample:3:10"),
                 InlineKeyboardButton(text="5 из 10 · часто", callback_data="pr:sample:5:10"),
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="pr:home:0")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="pr:home:0")],
         ]
     )
 
@@ -160,38 +162,40 @@ def participant_reaction_emoji_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="❤️", callback_data="pr:emoji:heart"),
                 InlineKeyboardButton(text="⚡", callback_data="pr:emoji:bolt"),
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="pr:home:0")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="pr:home:0")],
         ]
     )
 
 
 def participant_reaction_confirm_menu(
-    callback_data: str = "pr:create", *, label: str = "✅ Сохранить и включить"
+    callback_data: str = "pr:create", *, label: str = "✓ Сохранить и включить"
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=label, callback_data=callback_data)],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="pr:home:0")],
+            [InlineKeyboardButton(text="× Отмена", callback_data="pr:home:0")],
         ]
     )
 
 
 def participant_reactions_text(views: list[ParticipantReactionRuleView], total: int) -> str:
+    active = sum(view.rule.enabled for view in views)
+    queued = sum(view.queued for view in views)
+    running = sum(view.running for view in views)
     text = (
         screen_title(
-            "Авто-реакции в чатах",
-            "Выборочные реакции только на новые сообщения обычных участников.",
+            "Реакции участникам",
+            "На новые сообщения в выбранных чатах",
         )
         + "\n\n"
+        f"{section('Состояние')}\n"
+        f"Правил: <b>{total}</b> · включено на этой странице: <b>{active}</b>\n"
+        f"Здесь в очереди: <b>{queued}</b> · выполняется: <b>{running}</b>\n\n"
         f"{section('Как это работает')}\n"
-        "• для каждого правила выбираются список чатов, набор аккаунтов, эмодзи и частота;\n"
-        "• одну реакцию ставит один свободный аккаунт <b>строго из выбранного набора</b>; "
-        "другие аккаунты не используются;\n"
-        "• боты, каналы, собственные аккаунты, старые сообщения и недавние получатели "
-        "автоматически исключаются;\n"
-        "• причины пропуска и ошибки остаются в истории правила.\n\n"
-        f"\n{section('Состояние')}\n"
-        f"Правил: <b>{total}</b>"
+        "Выберите список чатов, аккаунты, реакцию и частоту. "
+        "Используются только выбранные аккаунты.\n\n"
+        "Старые сообщения, боты, каналы и собственные аккаунты исключаются. "
+        "Пропуски и ошибки доступны в истории правила."
     )
     return (
         text
@@ -213,26 +217,26 @@ def participant_reaction_details_text(
     lines = [
         screen_title(
             escape(rule.name),
-            "🟢 Правило включено" if rule.enabled else "⏸ Правило остановлено",
+            "Правило включено" if rule.enabled else "Ⅱ Правило остановлено",
         ),
         "",
         section("Где и кем"),
-        f"🎯 Список чатов: <b>{escape(view.target_list_name)}</b> · {view.target_count} чатов",
-        f"👥 Только эти аккаунты: {accounts}\n",
+        f"Список чатов: <b>{escape(view.target_list_name)}</b> · {view.target_count} чатов",
+        f"Только эти аккаунты: {accounts}\n",
         section("Как реагировать"),
         f"Реакция: <b>{rule.emoji}</b>",
         f"Частота: <b>{frequency}</b>\n",
         section("Результаты"),
-        f"🕒 В очереди: <b>{view.queued}</b> · выполняется: <b>{view.running}</b>",
-        f"✅ Готово: <b>{view.succeeded}</b> · ⏭ Пропущено: <b>{view.skipped}</b> "
-        f"· ❌ Ошибки: <b>{view.failed}</b>",
+        f"В очереди: <b>{view.queued}</b> · выполняется: <b>{view.running}</b>",
+        f"✓ Готово: <b>{view.succeeded}</b> · ›› Пропущено: <b>{view.skipped}</b> "
+        f"· × Ошибки: <b>{view.failed}</b>",
     ]
     if rule.last_error:
         label = failure_label(rule.last_error_code) if rule.last_error_code else "ошибка правила"
-        lines.extend(["", f"⚠️ <b>Последняя проблема: {escape(label)}</b>"])
+        lines.extend(["", f"! <b>Последняя проблема: {escape(label)}</b>"])
         hint = failure_hint(rule.last_error_code)
         if hint:
-            lines.append(f"💡 {escape(hint)}")
+            lines.append(f"· {escape(hint)}")
         lines.append(f"<code>{escape(rule.last_error[:300])}</code>")
     return "\n".join(lines)
 
@@ -245,7 +249,7 @@ def participant_reaction_draft_text(
     numerator = int(data.get("pr_numerator", 1))
     denominator = int(data.get("pr_denominator", 10))
     return (
-        screen_title("Новое правило авто-реакций", "Проверьте настройки перед включением.") + "\n\n"
+        screen_title("Новое правило реакций", "Проверьте настройки перед включением.") + "\n\n"
         f"Название: <b>{escape(str(data.get('pr_name', '')))}</b>\n"
         f"Список чатов: <b>{escape(list_name)}</b>\n"
         f"Только эти аккаунты: {accounts}\n"
@@ -264,14 +268,14 @@ def participant_reaction_runs_text(
     target_labels: dict[int, str] | None = None,
 ) -> str:
     labels = {
-        ParticipantReactionTaskStatus.QUEUED: "🕒 ждёт",
-        ParticipantReactionTaskStatus.RUNNING: "🔵 выполняется",
-        ParticipantReactionTaskStatus.SUCCEEDED: "✅ готово",
-        ParticipantReactionTaskStatus.SKIPPED: "⏭ пропущено",
-        ParticipantReactionTaskStatus.FAILED: "❌ ошибка",
-        ParticipantReactionTaskStatus.CANCELLED: "⏸ отменено",
+        ParticipantReactionTaskStatus.QUEUED: "ждёт",
+        ParticipantReactionTaskStatus.RUNNING: "выполняется",
+        ParticipantReactionTaskStatus.SUCCEEDED: "✓ готово",
+        ParticipantReactionTaskStatus.SKIPPED: "›› пропущено",
+        ParticipantReactionTaskStatus.FAILED: "× ошибка",
+        ParticipantReactionTaskStatus.CANCELLED: "Ⅱ отменено",
     }
-    lines = [screen_title("Последние авто-реакции"), ""]
+    lines = [screen_title("История реакций"), ""]
     account_labels = account_labels or {}
     target_labels = target_labels or {}
     for task in tasks:

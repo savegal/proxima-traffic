@@ -55,3 +55,39 @@ def test_profile_name_generator_rejects_invalid_requests() -> None:
         generate_profile_names(-1)
     with pytest.raises(ValueError, match="unknown"):
         generate_profile_names(1, locale="unknown")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("locale", ["ru", "en", "mixed"])
+@pytest.mark.parametrize("count", [1, 2, 3, 5, 10, 200])
+def test_profile_names_match_requested_batch_size_for_small_and_large_selections(locale, count):
+    for seed in range(10):
+        names = generate_profile_names(count, locale=locale, rng=random.Random(seed))
+        assert len(names) == count
+        assert len({name.display_name.casefold() for name in names}) == count
+
+
+@pytest.mark.parametrize("style", ["first", "initial", "full"])
+def test_single_name_uses_only_the_selected_style(style):
+    class SingleStyleRandom(random.Random):
+        def choices(self, population, weights=None, *, cum_weights=None, k=1):
+            return [style] * k
+
+    names = generate_profile_names(1, locale="ru", rng=SingleStyleRandom(7))
+    assert len(names) == 1 and names[0].style == style
+
+
+def test_name_generation_falls_back_when_the_selected_style_has_no_free_names():
+    class FirstNameRandom(random.Random):
+        def choices(self, population, weights=None, *, cum_weights=None, k=1):
+            return ["first"] * k
+
+    used_names = set()
+    while True:
+        names = generate_profile_names(
+            1, locale="ru", used_names=used_names, rng=FirstNameRandom(3)
+        )
+        if names[0].style != "first":
+            break
+        used_names.add(names[0].display_name)
+    assert names[0].display_name not in used_names
+    assert names[0].style in {"initial", "full"}

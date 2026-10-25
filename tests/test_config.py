@@ -10,6 +10,14 @@ from proxima_traffic.config import Settings
 from proxima_traffic.db import Database
 
 
+def test_unknown_restriction_has_no_guessed_pause_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("PROXIMA_ACCOUNT_RESTRICTION_COOLDOWN_HOURS", raising=False)
+    assert Settings(_env_file=None).account_restriction_cooldown_hours == 0
+    assert Settings(account_restriction_cooldown_hours=0).account_restriction_cooldown_hours == 0
+    with pytest.raises(ValidationError, match="must be >= 0"):
+        Settings(account_restriction_cooldown_hours=-1)
+
+
 @pytest.mark.parametrize(
     ("platform_name", "environment_name", "directory_name"),
     [
@@ -85,6 +93,22 @@ def test_channel_comment_settings_have_bounded_safe_defaults() -> None:
         Settings(worker_enabled=False, channel_comments_max_post_age_seconds=59)
     with pytest.raises(ValidationError, match="SCAN_LIMIT"):
         Settings(worker_enabled=False, channel_comments_scan_limit=101)
+
+
+def test_account_send_and_flood_pause_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "PROXIMA_ACCOUNT_PACE_MIN_SECONDS",
+        "PROXIMA_ACCOUNT_PACE_MAX_SECONDS",
+        "PROXIMA_FLOOD_MIN_PAUSE_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None, worker_enabled=False)
+    assert settings.account_pace_min_seconds == 60
+    assert settings.account_pace_max_seconds == 600
+    assert settings.flood_min_pause_seconds == 500
+
+    with pytest.raises(ValidationError, match="FLOOD_MIN_PAUSE_SECONDS"):
+        Settings(worker_enabled=False, flood_min_pause_seconds=0)
 
 
 def test_typing_settings_have_short_safe_defaults() -> None:

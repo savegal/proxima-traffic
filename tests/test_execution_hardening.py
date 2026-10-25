@@ -73,7 +73,7 @@ class LeaseReleasingRunner:
         return run
 
 
-async def test_stale_runner_is_fenced_after_lease_is_reclaimed(tmp_path) -> None:
+async def test_expired_dispatched_run_is_terminal_and_stale_runner_is_fenced(tmp_path) -> None:
     gateway = BlockingGateway()
     app = create_app(settings=_settings(tmp_path, "fencing.db"), gateway=gateway)
     await app.state.database.create_schema()
@@ -89,15 +89,15 @@ async def test_stale_runner_is_fenced_after_lease_is_reclaimed(tmp_path) -> None
     await _expire_lease(app, first.id)
     assert await app.state.run_queue.recover_expired_leases() == 1
     second = await app.state.run_queue.claim_next("worker-new")
-    assert second is not None and second.lease_token is not None
-    assert second.lease_token != first.lease_token
+    assert second is None
 
     gateway.release.set()
     with pytest.raises(LeaseLostError):
         await old_execution
     stored = await app.state.run_queue.get_run(queued.id)
-    assert stored.status.value == "running"
-    assert stored.lease_token == second.lease_token
+    assert stored.status.value == "failed"
+    assert stored.error_code == "delivery_unconfirmed"
+    assert stored.lease_token is None
     assert stored.primary_message_id is None
     assert gateway.idempotency_keys == ["fencing-request:primary"]
 
@@ -216,18 +216,25 @@ async def test_gateway_error_classification(
     await app.state.database.dispose()
 
 
-async def test_step_timeout_is_terminal_to_avoid_ambiguous_duplicate_send(tmp_path) -> None:
+async def test_timeout_after_dispatch_is_terminal_to_avoid_duplicate_send(
+    tmp_path, monkeypatch
+) -> None:
     gateway = BlockingGateway()
     settings = _settings(tmp_path, "timeout.db")
-    settings.worker_step_timeout_seconds = 0.05
+    settings.worker_step_timeout_seconds = 60
     app = create_app(settings=settings, gateway=gateway)
     await app.state.database.create_schema()
     campaign_id = await _create_ready_campaign(app)
     await app.state.run_queue.enqueue(campaign_id, "timeout-request")
-    result = await app.state.queue_worker.process_next()
+    deadline = asyncio.timeout(60)
+    monkeypatch.setattr("proxima_traffic.services.asyncio.timeout", lambda _seconds: deadline)
+    task = asyncio.create_task(app.state.queue_worker.process_next())
+    await asyncio.wait_for(gateway.started.wait(), timeout=10)
+    deadline.reschedule(asyncio.get_running_loop().time())
+    result = await task
     assert result is not None
     assert result.status.value == "failed"
-    assert result.error_code == "step_timeout"
+    assert result.error_code == "delivery_unconfirmed"
     assert result.attempt_count == 1
     await app.state.database.dispose()
 

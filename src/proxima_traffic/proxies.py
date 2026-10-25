@@ -6,11 +6,14 @@ import hashlib
 import ipaddress
 import json
 import logging
+import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import timedelta
 from enum import StrEnum
+from html import unescape
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import httpx
@@ -256,6 +259,40 @@ class ProxySecretCipher:
             ) from exc
 
 
+def proxy_import_values(content: str, *, linked_urls: Sequence[str] = ()) -> list[str]:
+    """Extract pasted MTProxy links while retaining ordinary one-per-line imports."""
+
+    pattern = re.compile(
+        r"(?:https?://(?:t\.me|telegram\.me)/proxy\?|tg://proxy\?|mtproto://)[^\s<>\[\]()]+",
+        re.IGNORECASE,
+    )
+    values: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Markdown's visible label can itself be the same URL as its target.
+        # Extract that target once, but retain actual repeated input entries so
+        # the service can report its normal duplicate count.
+        stripped = re.sub(r"\[[^\]]*\]\(([^)]+)\)", r"\1", stripped)
+        links = pattern.findall(stripped)
+        if links:
+            values.extend(unescape(link).replace("\\&", "&").strip("`\"'") for link in links)
+        else:
+            values.append(stripped)
+    # A Telegram text_link entity can contain the whole proxy URL while the
+    # visible text is just "Connect". Do not count that label as a bad proxy.
+    if linked_urls:
+        # Channel captions often contain "Port:22" and "Secret:...". Those
+        # descriptive fields must not become fabricated HTTP proxy entries.
+        values = [value for value in values if "://" in value]
+        for link in linked_urls:
+            normalized = unescape(link).replace("\\&", "&")
+            if normalized not in values:
+                values.append(normalized)
+    return values
+
+
 def parse_proxy(value: str) -> ParsedProxy:
     raw = value.strip()
     if not raw or raw.startswith("#"):
@@ -362,6 +399,29 @@ def _validate_mtproto_secret(value: str) -> str:
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_+/=")
     if any(character not in allowed for character in secret):
         raise ProxyInputError("secret MTProto содержит недопустимые символы")
+
+    # If already a valid hex string (with or without ee/dd prefix):
+    prefix = secret.lower()[:2]
+    hex_body = secret[2:] if prefix in {"ee", "dd"} else secret
+    try:
+        bytes.fromhex(hex_body)
+        return secret
+    except ValueError:
+        pass
+
+    # Support base64 and URL-safe base64 secrets (common in Telegram share links)
+    import base64
+    for candidate_body, keep_prefix in [
+        (secret[2:], prefix if prefix in {"ee", "dd"} else ""),
+        (secret, ""),
+    ]:
+        for pad in ["", "=", "==", "==="]:
+            try:
+                decoded = base64.urlsafe_b64decode(candidate_body + pad)
+                if len(decoded) >= 16:
+                    return keep_prefix + decoded.hex()
+            except Exception:
+                pass
     return secret
 
 
@@ -529,6 +589,10 @@ class ProxyService:
                 actor=actor,
             )
             await session.commit()
+            try:
+                await self.check_proxy(endpoint.id, actor=actor)
+            except Exception:
+                pass
             return await self.get_proxy(endpoint.id)
 
     async def import_proxies(
@@ -829,8 +893,15 @@ class ProxyService:
         assignment_key = f"account:{account_id}"
         assigned = await self.proxy_for_assignment(assignment_key)
         if assigned is None:
+            try:
+                assigned = await self.allocate_proxy(
+                    assignment_key, purpose=f"account:{account_id}", actor=actor
+                )
+            except Exception:
+                assigned = None
+        if assigned is None:
             raise ProxyRouteUnavailable(
-                f"для аккаунта #{account_id} не назначен прокси; прямое соединение запрещено"
+                f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных прокси в пуле; добавьте рабочий прокси"
             )
         if await self._assigned_proxy_is_healthy(assigned, actor=actor):
             return await self.require_account_route(account_id)
@@ -841,8 +912,15 @@ class ProxyService:
         async with self._account_route_recovery_lock:
             assigned = await self.proxy_for_assignment(assignment_key)
             if assigned is None:
+                try:
+                    assigned = await self.allocate_proxy(
+                        assignment_key, purpose=f"account:{account_id}", actor=actor
+                    )
+                except Exception:
+                    assigned = None
+            if assigned is None:
                 raise ProxyRouteUnavailable(
-                    f"для аккаунта #{account_id} не назначен прокси; прямое соединение запрещено"
+                    f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных прокси в пуле; добавьте рабочий прокси"
                 )
             current_is_healthy = assigned.proxy.status == ProxyStatus.HEALTHY
             if not current_is_healthy:
@@ -868,6 +946,25 @@ class ProxyService:
                 "назначенный прокси не работает; проверены все включённые прокси, "
                 "но рабочего не найдено. Добавьте рабочий HTTP(S)/SOCKS5-прокси."
             )
+
+    async def auto_assign_healthy_proxies(self, *, actor: str = "runtime") -> int:
+        """Assign available healthy proxies to authorized accounts lacking a working route."""
+        async with self._session_factory() as session:
+            accounts = list(
+                await session.scalars(
+                    select(Account).where(Account.authorized == 1)
+                )
+            )
+        assigned_count = 0
+        for acc in accounts:
+            try:
+                assignment = await self.proxy_for_assignment(f"account:{acc.id}")
+                if assignment is None or assignment.proxy.status != ProxyStatus.HEALTHY:
+                    await self.ensure_account_route(int(acc.id), actor=actor)
+                    assigned_count += 1
+            except Exception:
+                pass
+        return assigned_count
 
     async def account_route_check_due(self, account_id: int, *, max_age_seconds: float) -> bool:
         """Whether a cached Telegram client needs a new route health check."""

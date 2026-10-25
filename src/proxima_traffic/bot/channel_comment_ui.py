@@ -9,8 +9,9 @@ from math import ceil
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from proxima_traffic.bot.ui import screen_title, section, themed_keyboard
+from proxima_traffic.bot.ui import screen_title, section, themed_keyboard, wizard_title
 from proxima_traffic.channel_comments import (
+    ChannelCommentDeliverySummary,
     ChannelCommentReactionSummary,
     ChannelCommentRuleView,
 )
@@ -35,6 +36,11 @@ from proxima_traffic.models import (
 _RUN_CODES_WITHOUT_RAW_DETAILS = frozenset({"album_duplicate"})
 
 
+def channel_comment_wizard_title(title: str, step: int, mode: str) -> str:
+    total = 6 if mode == ChannelCommentMode.MESSAGE_EDIT else 5
+    return wizard_title(f"Автокомментарии · {title}", step, total)
+
+
 def channel_comments_menu(
     views: list[ChannelCommentRuleView],
     *,
@@ -43,10 +49,10 @@ def channel_comments_menu(
     page_size: int,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="➕ Настроить канал", callback_data="comments:add"))
+    builder.row(InlineKeyboardButton(text="＋ Настроить канал", callback_data="comments:add"))
     for view in views:
         rule = view.rule
-        state = "🟢" if rule.enabled else "⏸"
+        state = "●" if rule.enabled else "Ⅱ"
         mode = {
             ChannelCommentMode.SINGLE: "комментарий",
             ChannelCommentMode.DIALOGUE: "цепочка",
@@ -67,8 +73,10 @@ def channel_comments_menu(
                 text="›", callback_data=f"comments:home:{min(pages - 1, page + 1)}"
             ),
         )
-    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"comments:home:{page}"))
-    builder.row(InlineKeyboardButton(text="🏠 Главная", callback_data="menu:home"))
+    builder.row(
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"comments:home:{page}"),
+        InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"),
+    )
     return builder.as_markup()
 
 
@@ -81,23 +89,23 @@ def channel_comment_details_menu(
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="⏸ Остановить" if rule.enabled else "▶️ Включить",
+            text="Ⅱ Остановить" if rule.enabled else "› Включить",
             callback_data=f"comments:toggle:{rule.id}:{page}",
         ),
-        InlineKeyboardButton(text="🔍 Проверить", callback_data=f"comments:check:{rule.id}:{page}"),
+        InlineKeyboardButton(text="⌕ Проверить", callback_data=f"comments:check:{rule.id}:{page}"),
     )
     builder.row(
         InlineKeyboardButton(
-            text="👤 Аккаунт для комментария",
+            text="○ Аккаунт для комментария",
             callback_data=f"comments:account:replace:{rule.id}:{page}",
         ),
     )
     builder.row(
         InlineKeyboardButton(
             text=(
-                "🔁 Автозамена аккаунта · включена"
+                "↻ Автозамена аккаунта · включена"
                 if rule.auto_replace_primary_account
-                else "🔁 Автозамена аккаунта · выключена"
+                else "↻ Автозамена аккаунта · выключена"
             ),
             callback_data=f"comments:autoreplace:{rule.id}:{page}",
         )
@@ -105,39 +113,39 @@ def channel_comment_details_menu(
     builder.row(
         InlineKeyboardButton(
             text=(
-                "🔔 Отметки участников · включены"
+                "◇ Отметки участников · включены"
                 if rule.hidden_mentions_enabled
-                else "🔔 Отметки участников · выключены"
+                else "◇ Отметки участников · выключены"
             ),
             callback_data=f"comments:mentions:toggle:{rule.id}:{page}",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text=f"🔄 Не повторять отметку · {rule.mention_cooldown_days} дн.",
+            text=f"↻ Не повторять отметку · {rule.mention_cooldown_days} дн.",
             callback_data=f"comments:mentions:cooldown:{rule.id}:{page}",
         )
     )
     builder.row(
         InlineKeyboardButton(
             text=(
-                f"👍 Реакции на комментарий · {rule.reaction_count}"
+                f"Реакции на комментарий · {rule.reaction_count}"
                 if rule.reactions_enabled and rule.reaction_count
-                else "👍 Реакции на комментарий · ВЫКЛ"
+                else "Реакции на комментарий · выкл."
             ),
             callback_data=f"comments:reactions:open:{rule.id}:{page}",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="🧾 Последние обработки", callback_data=f"comments:runs:{rule.id}:{page}"
+            text="Последние обработки", callback_data=f"comments:runs:{rule.id}:{page}"
         )
     )
     builder.row(
-        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"comments:delete:{rule.id}:{page}")
+        InlineKeyboardButton(text="× Удалить", callback_data=f"comments:delete:{rule.id}:{page}")
     )
     builder.row(
-        InlineKeyboardButton(text="⬅️ К автокомментариям", callback_data=f"comments:home:{page}")
+        InlineKeyboardButton(text="‹ К автокомментариям", callback_data=f"comments:home:{page}")
     )
     return builder.as_markup()
 
@@ -151,11 +159,11 @@ def channel_comment_reactions_menu(
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="⏸ Выключить" if rule.reactions_enabled else "▶️ Включить",
+            text="Ⅱ Выключить" if rule.reactions_enabled else "› Включить",
             callback_data=f"comments:reactions:toggle:{rule.id}:{page}",
         ),
         InlineKeyboardButton(
-            text="👥 Аккаунты",
+            text="○ Аккаунты",
             callback_data=f"comments:reactions:accounts:{rule.id}:{page}:0",
         ),
     )
@@ -192,7 +200,7 @@ def channel_comment_reactions_menu(
             )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К правилу",
+            text="‹ К правилу",
             callback_data=f"comments:details:{rule.id}:{page}",
         )
     )
@@ -211,7 +219,7 @@ def channel_comment_reactions_text(
         )
         or "не выбраны"
     )
-    state = "🟢 включены" if rule.reactions_enabled and rule.reaction_count else "⏸ выключены"
+    state = "включены" if rule.reactions_enabled and rule.reaction_count else "Ⅱ выключены"
     steps = _channel_comment_steps(rule)
     selected_step = min(max(1, int(rule.reaction_dialogue_step)), len(steps))
     source_account_id = int(steps[selected_step - 1].account_id)
@@ -229,11 +237,11 @@ def channel_comment_reactions_text(
             f"Аккаунты: {account_labels}\n",
             f"Максимум по выбранному набору: <b>{maximum_reactors}</b> реакций\n",
             section("Результаты"),
-            f"🕒 В очереди: <b>{view.reaction_queued}</b> · "
+            f"В очереди: <b>{view.reaction_queued}</b> · "
             f"выполняется: <b>{view.reaction_running}</b>",
-            f"✅ Готово: <b>{view.reaction_succeeded}</b> · "
-            f"⏭ Пропущено: <b>{view.reaction_skipped}</b> · "
-            f"❌ Ошибки: <b>{view.reaction_failed}</b> · "
+            f"✓ Готово: <b>{view.reaction_succeeded}</b> · "
+            f"›› Пропущено: <b>{view.reaction_skipped}</b> · "
+            f"× Ошибки: <b>{view.reaction_failed}</b> · "
             f"⏹ Отменено: <b>{view.reaction_cancelled}</b>\n",
             "<i>Автор комментария всегда исключается. Если выбранный аккаунт "
             "заблокирован в обсуждении или временно недоступен, сервис выберет другой "
@@ -244,7 +252,7 @@ def channel_comment_reactions_text(
     if rule.reactions_enabled and rule.reaction_count > maximum_reactors:
         lines.insert(
             -1,
-            "⚠️ <b>Реакций будет меньше настройки:</b> автор исключается, а один "
+            "! <b>Реакций будет меньше настройки:</b> автор исключается, а один "
             "аккаунт ставит не больше одной реакции.",
         )
     return "\n".join(lines)
@@ -265,7 +273,7 @@ def channel_comment_reaction_account_picker(
     for account in accounts[active_page * size : (active_page + 1) * size]:
         builder.row(
             InlineKeyboardButton(
-                text=f"{'✅' if int(account.id) in selected else '▫️'} {account.label}",
+                text=f"{'✓' if int(account.id) in selected else '○'} {account.label}",
                 callback_data=(
                     f"comments:reactions:account:{rule_id}:{page}:{active_page}:{account.id}"
                 ),
@@ -295,7 +303,7 @@ def channel_comment_reaction_account_picker(
         builder.row(*row)
     builder.row(
         InlineKeyboardButton(
-            text=f"✅ Готово · выбрано {len(selected)}",
+            text=f"✓ Готово · выбрано {len(selected)}",
             callback_data=f"comments:reactions:open:{rule_id}:{page}",
         )
     )
@@ -343,10 +351,10 @@ def channel_comment_delete_menu(rule_id: int, *, page: int) -> InlineKeyboardMar
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🗑 Да, удалить", callback_data=f"comments:delete:confirm:{rule_id}:{page}"
+                    text="× Да, удалить", callback_data=f"comments:delete:confirm:{rule_id}:{page}"
                 ),
                 InlineKeyboardButton(
-                    text="✖️ Отмена", callback_data=f"comments:details:{rule_id}:{page}"
+                    text="× Отмена", callback_data=f"comments:details:{rule_id}:{page}"
                 ),
             ]
         ]
@@ -372,13 +380,13 @@ def channel_comment_mention_cooldown_menu(
         )
     builder.row(
         InlineKeyboardButton(
-            text="✍️ Другое значение",
+            text="✎ Другое значение",
             callback_data=f"comments:mentions:custom:{rule_id}:{page}",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⬅️ К правилу",
+            text="‹ К правилу",
             callback_data=f"comments:details:{rule_id}:{page}",
         )
     )
@@ -390,21 +398,21 @@ def channel_comment_mode_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💬 Один комментарий", callback_data="comments:draft:single"
+                    text="↳ Один комментарий", callback_data="comments:draft:single"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🧩 Цепочка аккаунтов", callback_data="comments:draft:dialogue"
+                    text="Цепочка аккаунтов", callback_data="comments:draft:dialogue"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✏️ Комментарий с редактированием",
+                    text="✎ Комментарий с редактированием",
                     callback_data="comments:draft:message_edit",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ К автокомментариям", callback_data="comments:home:0")],
+            [InlineKeyboardButton(text="‹ К автокомментариям", callback_data="comments:home:0")],
         ]
     )
 
@@ -436,7 +444,7 @@ def channel_comment_account_picker(
     for account in visible_accounts:
         builder.row(
             InlineKeyboardButton(
-                text=f"👤 {account.label}", callback_data=f"{callback_prefix}:{account.id}"
+                text=f"○ {account.label}", callback_data=f"{callback_prefix}:{account.id}"
             )
         )
 
@@ -451,20 +459,20 @@ def channel_comment_account_picker(
         )
         if page + 1 < total_pages:
             navigation.append(
-                InlineKeyboardButton(text="▶️", callback_data=f"{pager_callback_prefix}:{page + 1}")
+                InlineKeyboardButton(text="›", callback_data=f"{pager_callback_prefix}:{page + 1}")
             )
         builder.row(*navigation)
-    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback))
+    builder.row(InlineKeyboardButton(text="‹ Назад", callback_data=back_callback))
     return builder.as_markup()
 
 
 def channel_comment_chain_menu(step_count: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="➕ Добавить ответ", callback_data="comments:chain:add")]]
+    rows = [[InlineKeyboardButton(text="＋ Добавить ответ", callback_data="comments:chain:add")]]
     if step_count >= 2:
         rows.append(
-            [InlineKeyboardButton(text="✅ Цепочка готова", callback_data="comments:chain:finish")]
+            [InlineKeyboardButton(text="✓ Цепочка готова", callback_data="comments:chain:finish")]
         )
-    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")])
+    rows.append([InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -473,28 +481,38 @@ def channel_comment_confirmation_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="▶️ Включить отслеживание", callback_data="comments:create:confirm"
+                    text="› Включить отслеживание", callback_data="comments:create:confirm"
                 )
             ],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="fsm:cancel")],
+            [
+                InlineKeyboardButton(
+                    text="Изменить каналы", callback_data="comments:review:channels"
+                ),
+                InlineKeyboardButton(
+                    text="Изменить задержку", callback_data="comments:review:delay"
+                ),
+            ],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
         ]
     )
 
 
 def channel_comments_text(views: list[ChannelCommentRuleView], total: int) -> str:
     active = sum(1 for view in views if view.rule.enabled)
+    queued = sum(view.queued for view in views)
+    running = sum(view.running for view in views)
     intro = (
         screen_title(
             "Автокомментарии",
-            "Комментарии только под новыми постами выбранных каналов.",
+            "Новые публикации в выбранных каналах",
         )
         + "\n\n"
         f"{section('Состояние')}\n"
-        f"Правил: <b>{total}</b> · включено на этой странице: <b>{active}</b>\n\n"
+        f"Правил: <b>{total}</b> · включено на этой странице: <b>{active}</b>\n"
+        f"Здесь в очереди: <b>{queued}</b> · выполняется: <b>{running}</b>\n\n"
         f"{section('Как это работает')}\n"
-        "01 — Настройте канал, аккаунт и текст.\n"
-        "02 — Сервис замечает новые публикации и создаёт отдельную задачу.\n"
-        "03 — Доступ, ограничения и результат видны в «Последних обработках».\n\n"
+        "Настройте канал, аккаунт и текст. Для каждой новой публикации создаётся задача. "
+        "Доступ, ограничения и результат видны в истории.\n\n"
         "Можно выбрать один комментарий, цепочку ответов или комментарий с редактированием. "
         "Старые посты не затрагиваются."
     )
@@ -509,22 +527,20 @@ def channel_comments_text(views: list[ChannelCommentRuleView], total: int) -> st
 def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[int, str]) -> str:
     rule = view.rule
     mode = {
-        ChannelCommentMode.SINGLE: "💬 Один комментарий",
-        ChannelCommentMode.DIALOGUE: "🧩 Цепочка",
-        ChannelCommentMode.MESSAGE_EDIT: "✏️ С редактированием",
+        ChannelCommentMode.SINGLE: "Один комментарий",
+        ChannelCommentMode.DIALOGUE: "Цепочка",
+        ChannelCommentMode.MESSAGE_EDIT: "С редактированием",
     }[rule.mode]
     if rule.enabled and rule.last_error_code == "join_request_pending":
-        state = "🕒 Заявка на вступление отправлена — ожидаем одобрения"
+        state = "Заявка на вступление отправлена — ожидаем одобрения"
     elif rule.enabled:
-        state = "🟢 Отслеживание включено"
+        state = "Отслеживание включено"
     elif rule.last_error_code in CHANNEL_COMMENT_AUTO_PAUSE_CODES:
-        state = f"⛔ Автоматически остановлено: {failure_label(rule.last_error_code)}"
+        state = f"× Автоматически остановлено: {failure_label(rule.last_error_code)}"
     else:
-        state = "⏸ Отслеживание остановлено"
+        state = "Ⅱ Отслеживание остановлено"
     title = escape(rule.channel_title or rule.channel_ref)
-    text = escape(rule.primary_text)
-    if len(text) > 500:
-        text = f"{text[:497]}…"
+    text = escape(_comment_preview(rule.primary_text, 500))
     delay = _delay(int(rule.initial_delay_seconds or 0))
     account_label = escape(accounts.get(rule.primary_account_id, f"#{rule.primary_account_id}"))
     last_scanned = _moment(rule.last_scanned_at)
@@ -533,43 +549,41 @@ def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[in
         screen_title(escape(rule.name), state),
         "",
         section("Канал и режим"),
-        f"📢 {title} · <code>{escape(rule.channel_ref)}</code>",
+        f"≡ {title} · <code>{escape(rule.channel_ref)}</code>",
         f"Режим: <b>{mode}</b>\n",
         section("Настройки"),
-        f"👤 Первый аккаунт: <b>{account_label}</b>",
+        f"Первый аккаунт: <b>{account_label}</b>",
         (
-            "🔁 Автозамена первого аккаунта: <b>включена</b> · при блокировке "
+            "Автозамена первого аккаунта: <b>включена</b> · при блокировке "
             "подбирается другой готовый аккаунт после проверки канала"
             "\n<i>Уже начатые цепочки и редактирования не меняются.</i>"
             if rule.auto_replace_primary_account
-            else "🔁 Автозамена первого аккаунта: <b>выключена</b>"
+            else "Автозамена первого аккаунта: <b>выключена</b>"
         ),
         f"⏱ Первый комментарий: <b>{delay}</b> после поста",
         (
-            "🔔 Отметки участников: <b>включены</b> · 5–10 в первом комментарии"
+            "Отметки участников: <b>включены</b> · 5–10 в первом комментарии"
             if rule.hidden_mentions_enabled
-            else "🔔 Отметки участников: <b>выключены</b>"
+            else "Отметки участников: <b>выключены</b>"
         ),
-        f"🔄 Повторная отметка: не раньше чем через <b>{rule.mention_cooldown_days} дн.</b>",
+        f"Повторная отметка: не раньше чем через <b>{rule.mention_cooldown_days} дн.</b>",
         (
-            f"👍 Реакции на свой комментарий: <b>{rule.reaction_emoji} × "
+            f"Реакции на свой комментарий: <b>{rule.reaction_emoji} × "
             f"{rule.reaction_count}</b> · комментарий № {rule.reaction_dialogue_step}"
             if rule.reactions_enabled and rule.reaction_count
-            else "👍 Реакции на свой комментарий: <b>выключены</b>"
+            else "Реакции на свой комментарий: <b>выключены</b>"
         ),
     ]
     if rule.mode == ChannelCommentMode.MESSAGE_EDIT:
-        initial_text = escape(rule.message_edit_initial_text or "")
-        if len(initial_text) > 500:
-            initial_text = f"{initial_text[:497]}…"
+        initial_text = escape(_comment_preview(rule.message_edit_initial_text or "", 500))
         lines.append(
-            f"✏️ Редактирование через: <b>{_delay(int(rule.message_edit_delay_seconds or 0))}</b>"
+            f"Редактирование через: <b>{_delay(int(rule.message_edit_delay_seconds or 0))}</b>"
         )
         lines.extend(
             [
                 "\n" + section("Содержание"),
-                f"🫧 Исходный текст:\n<blockquote>{initial_text}</blockquote>",
-                f"📝 Текст после редактирования:\n<blockquote>{text}</blockquote>",
+                f"Исходный текст:\n<blockquote>{initial_text}</blockquote>",
+                f"Текст после редактирования:\n<blockquote>{text}</blockquote>",
             ]
         )
     else:
@@ -582,28 +596,48 @@ def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[in
                 "voice": "голосовое",
                 "video_note": "видеокружок",
             }.get(rule.primary_media_kind, rule.primary_media_kind)
-            lines.append(f"📎 Медиа: <b>{escape(media_label)}</b>")
+            lines.append(f"Медиа: <b>{escape(media_label)}</b>")
         if text:
-            lines.append(f"📝 Текст:\n<blockquote>{text}</blockquote>")
+            lines.append(f"Текст:\n<blockquote>{text}</blockquote>")
     lines.extend(
         [
             "\n" + section("Работа правила"),
-            f"🔍 Проверка Telegram: <b>{last_scanned}</b>",
-            f"✅ Последний обработанный пост: <b>{last_success}</b>",
-            f"🕒 В очереди: <b>{view.queued}</b> · выполняется: <b>{view.running}</b>",
+            f"Проверка Telegram: <b>{last_scanned}</b>",
+            f"✓ Последний обработанный пост: <b>{last_success}</b>",
+            f"В очереди: <b>{view.queued}</b> · выполняется: <b>{view.running}</b>",
             (
-                f"✅ Готово: <b>{view.succeeded}</b> · ⏭ Пропущено: <b>{view.skipped}</b> "
-                f"· ❌ Ошибки: <b>{view.failed}</b>"
+                f"✓ Готово: <b>{view.succeeded}</b> · ›› Пропущено: <b>{view.skipped}</b> "
+                f"· × Ошибки: <b>{view.failed}</b>"
             ),
+            f"Результат неизвестен: <b>{view.uncertain}</b> · отменено: <b>{view.cancelled}</b>",
         ]
     )
+    if view.simulated_finished:
+        lines.append(f"Тестовых обработок без отправки: <b>{view.simulated_finished}</b>")
+    if (
+        view.delivery.confirmed
+        or view.delivery.simulated
+        or view.legacy_runs_with_incomplete_delivery
+    ):
+        lines.append("\n" + section("Наблюдение за сообщениями"))
+        if view.delivery.confirmed or view.delivery.simulated:
+            lines.append(_run_delivery_status(view.delivery).lstrip("\n"))
+            lines.append(
+                "<i>Отсутствие подтверждается чтением обсуждения. Причина удаления неизвестна; "
+                "недоступная проверка не означает удаление.</i>"
+            )
+        if view.legacy_runs_with_incomplete_delivery:
+            lines.append(
+                f"Старые обработки с неполным журналом: "
+                f"<b>{view.legacy_runs_with_incomplete_delivery}</b>"
+            )
     if rule.hidden_mentions_enabled:
         lines.extend(
             [
                 "\n<b>Отметки участников</b>",
-                f"✅ С отметками: <b>{view.mentions_resolved_posts}</b> постов · "
+                f"✓ С отметками: <b>{view.mentions_resolved_posts}</b> постов · "
                 f"участников отмечено: <b>{view.mention_count}</b>",
-                f"⏭ Без отметок: <b>{view.mentions_skipped_posts}</b> постов",
+                f"›› Без отметок: <b>{view.mentions_skipped_posts}</b> постов",
             ]
         )
         for reason, count in view.mention_skip_reasons[:3]:
@@ -612,17 +646,16 @@ def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[in
         lines.extend(
             [
                 "\n<b>Реакции на комментарии</b>",
-                f"🕒 В очереди: <b>{view.reaction_queued}</b> · "
-                f"идёт: <b>{view.reaction_running}</b>",
-                f"✅ Готово: <b>{view.reaction_succeeded}</b> · "
-                f"⏭ Пропущено: <b>{view.reaction_skipped}</b> · "
-                f"❌ Ошибки: <b>{view.reaction_failed}</b> · "
+                f"В очереди: <b>{view.reaction_queued}</b> · идёт: <b>{view.reaction_running}</b>",
+                f"✓ Готово: <b>{view.reaction_succeeded}</b> · "
+                f"›› Пропущено: <b>{view.reaction_skipped}</b> · "
+                f"× Ошибки: <b>{view.reaction_failed}</b> · "
                 f"⏹ Отменено: <b>{view.reaction_cancelled}</b>",
             ]
         )
     if rule.last_error:
         label = failure_label(rule.last_error_code) if rule.last_error_code else "ошибка правила"
-        lines.append(f"\n⚠️ <b>Последняя проблема: {escape(label)}</b>")
+        lines.append(f"\n! <b>Последняя проблема: {escape(label)}</b>")
         if rule.last_error_account_id is not None:
             failed_account = escape(
                 accounts.get(rule.last_error_account_id, f"#{rule.last_error_account_id}")
@@ -632,7 +665,7 @@ def channel_comment_details_text(view: ChannelCommentRuleView, accounts: dict[in
             )
         hint = failure_hint(rule.last_error_code)
         if hint:
-            lines.append(f"💡 {escape(hint)}")
+            lines.append(f"· {escape(hint)}")
         if rule.enabled:
             lines.append(
                 "Система: эта попытка перенесена или пропущена; наблюдение канала продолжается."
@@ -648,6 +681,7 @@ def channel_comment_runs_text(
     *,
     channel_ref: str,
     reaction_summaries: Mapping[int, ChannelCommentReactionSummary] | None = None,
+    delivery_summaries: Mapping[int, ChannelCommentDeliverySummary] | None = None,
 ) -> str:
     lines = [
         screen_title(
@@ -659,14 +693,14 @@ def channel_comment_runs_text(
         lines.append("\nПока нет новых постов после включения отслеживания.")
         return "\n".join(lines)
     labels = {
-        ChannelCommentRunStatus.QUEUED: "🕒 ждёт",
-        ChannelCommentRunStatus.RUNNING: "🔵 отправляется",
-        ChannelCommentRunStatus.SUCCEEDED: "✅ готово",
-        ChannelCommentRunStatus.SKIPPED: "⏭ пропущен",
-        ChannelCommentRunStatus.FAILED: "❌ ошибка",
-        ChannelCommentRunStatus.CANCELLED: "⏸ отменён",
+        ChannelCommentRunStatus.QUEUED: "ждёт",
+        ChannelCommentRunStatus.RUNNING: "отправляется",
+        ChannelCommentRunStatus.SUCCEEDED: "✓ готово",
+        ChannelCommentRunStatus.SKIPPED: "›› пропущен",
+        ChannelCommentRunStatus.FAILED: "× ошибка",
+        ChannelCommentRunStatus.CANCELLED: "Ⅱ отменён",
     }
-    for run in runs:
+    for index, run in enumerate(runs):
         published = (
             run.source_post_at.astimezone(UTC).strftime("%d.%m %H:%M UTC")
             if run.source_post_at is not None
@@ -675,7 +709,7 @@ def channel_comment_runs_text(
         retry_details = ""
         if run.status == ChannelCommentRunStatus.QUEUED and int(run.attempt_count or 0) > 0:
             retry_details = (
-                f"\n🔁 Попытка: <b>{run.attempt_count}/{run.max_attempts}</b> · "
+                f"\nПопытка: <b>{run.attempt_count}/{run.max_attempts}</b> · "
                 f"следующая: <b>{_moment(run.scheduled_for)}</b>"
             )
         error_details = ""
@@ -683,35 +717,91 @@ def channel_comment_runs_text(
             error_details = f"\nПричина: <b>{escape(failure_label(run.error_code))}</b>"
             hint = failure_hint(run.error_code)
             if hint:
-                error_details += f"\n💡 {escape(hint)}"
+                error_details += f"\n{escape(hint)}"
             if run.error and run.error_code not in _RUN_CODES_WITHOUT_RAW_DETAILS:
                 error_details += f"\n<code>{escape(run.error[:250])}</code>"
         elif run.error:
             error_details = f"\n<code>{escape(run.error[:250])}</code>"
         post_link = _channel_comment_post_link(channel_ref, run.source_post_id)
-        comment_link = _channel_comment_link(
-            channel_ref,
-            run.source_post_id,
-            run.last_comment_message_id,
+        comment_link = (
+            None
+            if run.simulated
+            else _channel_comment_link(
+                channel_ref,
+                run.source_post_id,
+                run.last_comment_message_id,
+            )
         )
         opened_post = f' · <a href="{post_link}">Открыть пост ↗</a>' if post_link else ""
         opened_comment = (
-            f'\n💬 <a href="{comment_link}">Открыть последний комментарий ↗</a>'
+            f'\n<a href="{comment_link}">Открыть последний комментарий ↗</a>'
             if comment_link
             else ""
         )
         mentions = _run_mention_status(run)
         reactions = _run_reaction_status((reaction_summaries or {}).get(int(run.id or 0)))
-        lines.append(
+        delivery = _run_delivery_status((delivery_summaries or {}).get(int(run.id or 0)))
+        if not delivery and int(run.sent_steps or 0) > 0:
+            delivery = "\nНет подробного журнала наблюдения за этой отправкой"
+        status_label = (
+            "? результат неизвестен"
+            if run.error_code in {"delivery_unconfirmed", "cancelled_outcome_unknown"}
+            else "Тест: без отправки"
+            if run.simulated
+            else labels[run.status]
+        )
+        entry = (
             f"\n<b>Пост #{run.source_post_id}</b> · {published}{opened_post}\n"
-            f"{labels[run.status]} · шагов: <b>{int(run.sent_steps or 0)}</b>"
+            f"{status_label} · шагов: <b>{int(run.sent_steps or 0)}</b>"
             + opened_comment
             + mentions
             + reactions
+            + delivery
             + retry_details
             + error_details
         )
+        footer = (
+            f"\n<i>Ещё обработок: {len(runs) - index}. "
+            "Подробности скрыты из-за лимита сообщения Telegram.</i>"
+        )
+        # Reserve room for a whole-entry footer and retain complete HTML tags.
+        # Counting raw HTML in UTF-16 is conservative even with many emoji.
+        candidate = "\n".join([*lines, entry, footer])
+        if len(candidate.encode("utf-16-le")) // 2 > 4096:
+            lines.append(footer)
+            break
+        lines.append(entry)
     return "\n".join(lines)
+
+
+def _run_delivery_status(summary: ChannelCommentDeliverySummary | None) -> str:
+    if summary is None:
+        return ""
+    if not summary.confirmed:
+        return (
+            f"\nТестовых сообщений без отправки: <b>{summary.simulated}</b>"
+            if summary.simulated
+            else ""
+        )
+    text = (
+        f"\nПодтверждено отправлено: <b>{summary.confirmed}</b> сообщений"
+        f"\nПоследнее наблюдение: найдены <b>{summary.present}</b> · "
+        f"отсутствуют <b>{summary.missing}</b> · "
+        f"проверка недоступна <b>{summary.unavailable}</b> · "
+        f"ещё не проверены <b>{summary.pending}</b>"
+    )
+    if summary.checked_at is not None:
+        text += f"\nПроверено: <b>{_moment(summary.checked_at)}</b>"
+    if summary.history_incomplete:
+        text += "\nЖурнал неполный: ранние сообщения этой обработки не охвачены наблюдением"
+    if summary.scheduled:
+        text += (
+            f"\nЗапланировано проверок: <b>{summary.scheduled}</b> · "
+            f"ближайшая: <b>{_moment(summary.next_check_at)}</b>"
+        )
+    if summary.simulated:
+        text += f"\nТестовых сообщений без отправки: <b>{summary.simulated}</b>"
+    return text
 
 
 def _run_mention_status(run: ChannelCommentRun) -> str:
@@ -721,12 +811,12 @@ def _run_mention_status(run: ChannelCommentRun) -> str:
         return ""
     count = int(run.hidden_mention_resolved_count or 0)
     if count:
-        return f"\n🔔 Отметки: добавлено <b>{count}</b>"
+        return f"\nОтметки: добавлено <b>{count}</b>"
     if run.hidden_mention_skip_reason:
-        return f"\n🔔 Отметки: не добавлены — {_mention_skip_label(run.hidden_mention_skip_reason)}"
+        return f"\nОтметки: не добавлены — {_mention_skip_label(run.hidden_mention_skip_reason)}"
     if int(run.sent_steps or 0) > 0:
-        return "\n🔔 Отметки: не добавлены"
-    return "\n🔔 Отметки: будут подобраны перед первой отправкой"
+        return "\nОтметки: не добавлены"
+    return "\nОтметки: будут подобраны перед первой отправкой"
 
 
 def _run_reaction_status(summary: ChannelCommentReactionSummary | None) -> str:
@@ -743,7 +833,7 @@ def _run_reaction_status(summary: ChannelCommentReactionSummary | None) -> str:
         ("отменено", summary.cancelled),
     )
     shown = [f"{label}: <b>{count}</b>" for label, count in items if count]
-    return f"\n👍 Реакции: {' · '.join(shown)}" if shown else ""
+    return f"\nРеакции: {' · '.join(shown)}" if shown else ""
 
 
 def _channel_comment_post_link(channel_ref: str, post_id: int) -> str | None:
@@ -770,9 +860,9 @@ def channel_comment_draft_text(data: dict[str, object], accounts: dict[int, str]
         DialogueStep(**item) for item in data.get("comment_steps", []) if isinstance(item, dict)
     ]
     heading = {
-        ChannelCommentMode.SINGLE: "💬 Комментарий",
-        ChannelCommentMode.DIALOGUE: "🧩 Цепочка",
-        ChannelCommentMode.MESSAGE_EDIT: "✏️ С редактированием",
+        ChannelCommentMode.SINGLE: "Комментарий",
+        ChannelCommentMode.DIALOGUE: "Цепочка",
+        ChannelCommentMode.MESSAGE_EDIT: "С редактированием",
     }[mode]
     raw_refs = data.get("channel_refs")
     channel_refs = (
@@ -805,8 +895,8 @@ def channel_comment_draft_text(data: dict[str, object], accounts: dict[int, str]
         )
     if mode == ChannelCommentMode.SINGLE:
         account_id = int(data.get("primary_account_id") or 0)
-        text = escape(str(data.get("primary_text") or ""))
-        lines.append(f"\n👤 {escape(accounts.get(account_id, 'аккаунт не выбран'))}")
+        text = escape(_comment_preview(str(data.get("primary_text") or ""), 700))
+        lines.append(f"\n{escape(accounts.get(account_id, 'аккаунт не выбран'))}")
         media_kind = str(data.get("primary_media_kind") or "")
         if media_kind:
             media_label = {
@@ -816,7 +906,7 @@ def channel_comment_draft_text(data: dict[str, object], accounts: dict[int, str]
                 "voice": "голосовое",
                 "video_note": "видеокружок",
             }.get(media_kind, media_kind)
-            lines.append(f"📎 {escape(media_label)}")
+            lines.append(f"↗ {escape(media_label)}")
         if text:
             lines.append(f"<blockquote>{text}</blockquote>")
     elif mode == ChannelCommentMode.DIALOGUE:
@@ -824,7 +914,7 @@ def channel_comment_draft_text(data: dict[str, object], accounts: dict[int, str]
         for index, step in enumerate(steps, start=1):
             label = escape(accounts.get(step.account_id, f"#{step.account_id}"))
             delay = "сразу" if index == 1 else f"через {_delay(step.delay_seconds)}"
-            preview = escape(step.text[:160] + ("…" if len(step.text) > 160 else ""))
+            preview = escape(_comment_preview(step.text, 80))
             media = ""
             if step.media_kind:
                 media_kind = {
@@ -836,21 +926,35 @@ def channel_comment_draft_text(data: dict[str, object], accounts: dict[int, str]
                 }.get(step.media_kind, step.media_kind)
                 media = f" · {escape(media_kind)}"
             body = f"\n<blockquote>{preview}</blockquote>" if preview else ""
-            lines.append(f"{index}. <b>{label}</b> · {delay}{media}{body}")
+            entry = f"{index}. <b>{label}</b> · {delay}{media}{body}"
+            if len("\n".join([*lines, entry]).encode("utf-16-le")) // 2 > 3300:
+                lines.append(f"<i>Ещё шагов: {len(steps) - index + 1}. Полный текст сохранён.</i>")
+                break
+            lines.append(entry)
     else:
         account_id = int(data.get("primary_account_id") or 0)
-        initial_text = escape(str(data.get("message_edit_initial_text") or ""))
-        final_text = escape(str(data.get("primary_text") or ""))
+        initial_text = escape(
+            _comment_preview(str(data.get("message_edit_initial_text") or ""), 600)
+        )
+        final_text = escape(_comment_preview(str(data.get("primary_text") or ""), 600))
         delay = _delay(int(data.get("message_edit_delay_seconds") or 0))
         lines.extend(
             [
-                f"\n👤 {escape(accounts.get(account_id, 'аккаунт не выбран'))}",
-                f"🫧 Сначала: <blockquote>{initial_text or 'текст не задан'}</blockquote>",
-                f"📝 Затем: <blockquote>{final_text or 'текст не задан'}</blockquote>",
-                f"✏️ Редактировать через: <b>{delay}</b>",
+                f"\n{escape(accounts.get(account_id, 'аккаунт не выбран'))}",
+                f"Сначала: <blockquote>{initial_text or 'текст не задан'}</blockquote>",
+                f"Затем: <blockquote>{final_text or 'текст не задан'}</blockquote>",
+                f"Редактировать через: <b>{delay}</b>",
             ]
         )
     return "\n".join(lines)
+
+
+def _comment_preview(value: str, maximum: int) -> str:
+    """Bound UTF-16 length before HTML escaping, preserving entities and tags."""
+    encoded = value.encode("utf-16-le")
+    if len(encoded) // 2 <= maximum:
+        return value
+    return encoded[: (maximum - 1) * 2].decode("utf-16-le", errors="ignore") + "…"
 
 
 def _delay(seconds: int) -> str:

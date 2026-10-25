@@ -36,6 +36,7 @@ class AccountCreate(BaseModel):
 
 
 class AccountRead(ORMModel):
+    operator_paused: bool = False
     id: int
     label: str
     telegram_user_id: int | None
@@ -479,6 +480,7 @@ class LaunchArchiveRead(BaseModel):
 
 
 class RunRead(ORMModel):
+    simulated_snapshot: bool | None = None
     id: int
     campaign_id: int
     target_id: int
@@ -530,10 +532,17 @@ class ActionLogRead(ORMModel):
     target_id: int
     kind: ActionKind
     status: ActionStatus
+    simulated: bool | None = None
     external_message_id: int | None
+    external_message_ids_json: str | None = None
+    delayed_delivery_status: str | None = None
+    delayed_delivery_error: str | None = None
+    delayed_delivery_error_code: str | None = None
+    delayed_delivery_checked_at: datetime | None = None
     reply_to_message_id: int | None
     text: str
     error: str | None
+    error_code: str | None = None
     attempt_number: int
     created_at: datetime
 

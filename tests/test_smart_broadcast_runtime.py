@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -41,7 +42,7 @@ from proxima_traffic.models import (
     ensure_utc,
     utc_now,
 )
-from proxima_traffic.services import ConflictError, RunQueue
+from proxima_traffic.services import AccountSendDeferred, ConflictError, RunQueue
 
 
 def _sent_by(kwargs: dict[str, object]) -> int:
@@ -340,6 +341,39 @@ async def _stored_launch_runs(app: object, launch_key: str) -> list[CampaignRun]
         )
 
 
+@pytest.mark.parametrize("rich_content", [False, True])
+@pytest.mark.parametrize("send_failed", [False, True])
+async def test_actual_broadcast_attempt_still_paces_other_flows(
+    tmp_path, monkeypatch, rich_content, send_failed
+):
+    gateway = ContentRecordingGateway() if rich_content else RecordingGateway()
+    send = AsyncMock(
+        side_effect=TemporaryGatewayError("Telegram temporarily unavailable", code="rpc_error")
+        if send_failed
+        else None,
+        return_value=SentMessage(message_id=20001),
+    )
+    monkeypatch.setattr(gateway, "send_message", send)
+    async with _smart_campaign(tmp_path, gateway=gateway) as (app, campaign, accounts, _):
+        await _launch_runs(app, int(campaign["id"]), "actual-send-pacing")
+        app.state.settings.account_pace_min_seconds = 60
+        app.state.settings.account_pace_max_seconds = 60
+        result = await app.state.queue_worker.process_next()
+        assert result is not None
+        assert result.status == (RunStatus.QUEUED if send_failed else RunStatus.SUCCEEDED)
+        send.assert_awaited_once()
+        sender_id = int(accounts[0]["id"])
+        async with app.state.database.session_factory() as session:
+            account = await session.get(Account, sender_id)
+            assert account.sent_today == (0 if send_failed else 1)
+            assert ensure_utc(account.next_send_at) >= utc_now() + timedelta(seconds=59)
+            assert account.send_reservation_token is None
+        with pytest.raises(AccountSendDeferred):
+            await app.state.campaign_runner.run_account_send_operation(
+                sender_id, lambda: asyncio.sleep(0)
+            )
+
+
 @pytest.mark.asyncio
 async def test_independent_accounts_wait_while_managed_post_is_last_in_chat(
     tmp_path: Path,
@@ -520,9 +554,12 @@ async def test_moderation_deleted_post_immediately_quarantines_target_and_counts
             assert stored_target is not None
             assert stored_target.quality_status == "bad"
             assert stored_target.quality_score == 0
-            assert "модерация удаляет" in str(stored_target.quality_reason)
+            assert "публикации исчезают" in str(stored_target.quality_reason)
             assert "подпишитесь" in str(stored_target.quality_reason)
             assert account is not None and account.sent_today == 1
+            action = await session.scalar(select(ActionLog).where(ActionLog.run_id == result.id))
+            # A custom gateway without a mode flag cannot prove simulation.
+            assert action.simulated is None
 
 
 @pytest.mark.asyncio
@@ -735,7 +772,7 @@ async def test_independent_accounts_keep_separate_adaptive_chat_streams(
         launch, launch_runs = await repository.get_launch(initial[0].id)
         targets = await repository.targets_by_ids({int(target["id"])})
         report = launch_details_text(launch, launch_runs, targets)
-        assert "НЕЗАВИСИМО" in report
+        assert "Независимые отправки" in report
         assert "независимых направлений" in report
         assert "Охват направлений" in report
         assert "Авточастота по потокам" in report
@@ -1547,6 +1584,195 @@ async def test_smart_failover_does_not_probe_a_known_unready_backup(tmp_path: Pa
 
         assert result is not None and result.status == RunStatus.FAILED
         assert gateway.account_ids == [primary_id]
+
+
+@pytest.mark.parametrize("failover", [False, True])
+async def test_queued_repeat_checks_route_before_activity_probe(tmp_path, monkeypatch, failover):
+    gateway = LatestAwareActivityGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        backup_senders=1,
+        auto_sender_failover=failover,
+    ) as (app, campaign, accounts, target):
+        await _launch_runs(app, int(campaign["id"]), "queued-unready-route")
+        completed = await app.state.queue_worker.process_next()
+        assert completed.status == RunStatus.SUCCEEDED
+        primary_id, backup_id = (int(a["id"]) for a in accounts)
+        inspector = AsyncMock(
+            side_effect=PermanentGatewayError("account is not a member", code="target_not_joined")
+        )
+        monkeypatch.setattr(gateway, "inspect_activity", inspector)
+        async with app.state.database.session_factory() as session:
+            pending = await session.scalar(
+                select(CampaignRun).where(
+                    CampaignRun.launch_key == "queued-unready-route", CampaignRun.cycle_index == 1
+                )
+            )
+            pending.sender_account_id = backup_id
+            pending.scheduled_for = utc_now()
+            session.add(
+                TargetAccountState(
+                    target_id=int(target["id"]),
+                    account_id=backup_id,
+                    membership_status=MembershipStatus.NOT_MEMBER,
+                    can_send=False,
+                    membership_checked_at=utc_now(),
+                    membership_error_code="target_not_joined",
+                    send_blocked=True,
+                    blocked_reason="target_not_joined",
+                )
+            )
+            await session.commit()
+        result = await app.state.queue_worker.process_next()
+        assert result.status == (RunStatus.QUEUED if failover else RunStatus.FAILED)
+        assert result.sender_account_id == (primary_id if failover else backup_id)
+        if not failover:
+            assert result.error_code == "target_not_joined"
+        inspector.assert_not_awaited()
+        assert gateway.account_ids == [primary_id]
+
+
+async def test_auto_join_precedes_activity_check_and_preserves_post_counter(tmp_path, monkeypatch):
+    gateway = LatestAwareActivityGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        account_auto_join=True,
+    ) as (app, campaign, accounts, target):
+        # A prior managed post makes the activity check mandatory.
+        await _launch_runs(app, int(campaign["id"]), "join-before-activity")
+        await app.state.queue_worker.process_next()
+        joined = False
+
+        async def prepare(**_kwargs):
+            nonlocal joined
+            changed = not joined
+            joined = True
+            return changed
+
+        async def inspect_activity(**_kwargs):
+            assert joined
+            return ChatActivity(latest_message_id=gateway.latest_message_id, checked_at=utc_now())
+
+        monkeypatch.setattr(gateway, "prepare_broadcast_target", prepare, raising=False)
+        monkeypatch.setattr(gateway, "inspect_activity", inspect_activity)
+        app.state.settings.account_pace_min_seconds = 60
+        app.state.settings.account_pace_max_seconds = 60
+        sender_id = int(accounts[0]["id"])
+        async with app.state.database.session_factory() as session:
+            pending = await session.scalar(
+                select(CampaignRun).where(
+                    CampaignRun.launch_key == "join-before-activity", CampaignRun.cycle_index == 1
+                )
+            )
+            pending.scheduled_for = utc_now()
+            timing = await session.scalar(
+                select(TargetAccountState).where(
+                    TargetAccountState.account_id == sender_id,
+                    TargetAccountState.target_id == int(target["id"]),
+                )
+            )
+            timing.membership_status = MembershipStatus.NOT_MEMBER
+            timing.membership_error_code = "target_not_joined"
+            timing.can_send = False
+            timing.send_blocked = True
+            timing.blocked_reason = "target_not_joined"
+            await session.commit()
+        result = await app.state.queue_worker.process_next()
+        assert result.status == RunStatus.QUEUED
+        assert result.error_code == "join_completed"
+        assert len(gateway.account_ids) == 1
+        async with app.state.database.session_factory() as session:
+            account = await session.get(Account, sender_id)
+            assert account.sent_today == 1
+            assert ensure_utc(account.next_send_at) >= utc_now() + timedelta(seconds=59)
+            # Time advances only in this isolated test database.
+            account.next_send_at = utc_now() - timedelta(seconds=1)
+            stored = await session.get(CampaignRun, result.id)
+            stored.scheduled_for = utc_now()
+            await session.commit()
+        idle = await app.state.queue_worker.process_next()
+        assert idle.error_code == "chat_idle_last_managed_post"
+        async with app.state.database.session_factory() as session:
+            account = await session.get(Account, sender_id)
+            assert ensure_utc(account.next_send_at) < utc_now()
+            assert account.sent_today == 1
+        assert len(gateway.account_ids) == 1
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "target_not_joined",
+        "account_chat_access_forbidden",
+        "account_unauthorized",
+    ],
+)
+async def test_activity_route_refusal_is_not_reported_as_an_idle_chat(tmp_path, monkeypatch, code):
+    gateway = LatestAwareActivityGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        backup_senders=1,
+        auto_sender_failover=True,
+    ) as (app, campaign, accounts, _):
+        await _launch_runs(app, int(campaign["id"]), "activity-route-refusal")
+        await app.state.queue_worker.process_next()
+        monkeypatch.setattr(
+            gateway,
+            "inspect_activity",
+            AsyncMock(side_effect=PermanentGatewayError("route refused", code=code)),
+        )
+        async with app.state.database.session_factory() as session:
+            pending = await session.scalar(
+                select(CampaignRun).where(
+                    CampaignRun.launch_key == "activity-route-refusal", CampaignRun.cycle_index == 1
+                )
+            )
+            pending.scheduled_for = utc_now()
+            await session.commit()
+        result = await app.state.queue_worker.process_next()
+        assert result.status == RunStatus.QUEUED
+        assert result.sender_account_id == int(accounts[1]["id"])
+        assert result.error_code != "chat_idle_last_managed_post"
+        assert gateway.account_ids == [int(accounts[0]["id"])]
+
+
+async def test_readback_flood_preserves_unknown_result_quota_and_account_pause(
+    tmp_path, monkeypatch
+):
+    gateway = RecordingGateway()
+    async with _smart_campaign(
+        tmp_path,
+        gateway=gateway,
+        backup_senders=1,
+        auto_sender_failover=True,
+    ) as (app, campaign, accounts, _):
+
+        async def accepted_but_unreadable(**kwargs):
+            gateway.account_ids.append(kwargs["account"].id)
+            cause = TemporaryGatewayError("read-back FloodWait", code="flood_wait", retry_after=720)
+            raise PermanentGatewayError(
+                "accepted publication cannot be verified",
+                code="delivery_unconfirmed",
+                external_message_id=24001,
+            ) from cause
+
+        monkeypatch.setattr(gateway, "send_message", accepted_but_unreadable)
+        await _launch_runs(app, int(campaign["id"]), "readback-flood")
+        result = await app.state.queue_worker.process_next()
+        assert result.status == RunStatus.FAILED
+        assert result.error_code == "delivery_unconfirmed"
+        assert gateway.account_ids == [int(accounts[0]["id"])]
+        async with app.state.database.session_factory() as session:
+            account = await session.get(Account, int(accounts[0]["id"]))
+            assert account.sent_today == 1
+            assert account.flood_hits == 1
+            assert ensure_utc(account.cooldown_until) >= utc_now() + timedelta(seconds=719)
+            action = await session.scalar(select(ActionLog).where(ActionLog.run_id == result.id))
+            assert action.error_code == "delivery_unconfirmed"
+            assert action.external_message_id == 24001
 
 
 @pytest.mark.asyncio

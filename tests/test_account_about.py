@@ -20,12 +20,19 @@ async def test_account_profile_about_is_sent_saved_and_cleared(app, monkeypatch)
         assert profile_account_id == account_id
 
         class Client:
-            async def __call__(self, request: object) -> object:
-                requests.append(request)
-                return SimpleNamespace()
+            about = ""
 
-        await operation(Client())
-        return SimpleNamespace(first_name="Alex", last_name=None, username="alex", photo=None), None
+            async def __call__(self, request: object) -> object:
+                if type(request).__name__ == "UpdateProfileRequest":
+                    requests.append(request)
+                    self.about = request.about
+                    return SimpleNamespace()
+                assert type(request).__name__ == "GetFullUserRequest"
+                return SimpleNamespace(full_user=SimpleNamespace(about=self.about))
+
+        result = await operation(Client())
+        me = SimpleNamespace(first_name="Alex", last_name=None, username="alex", photo=None)
+        return me, result
 
     monkeypatch.setattr(app.state.account_service, "_run_profile_operation", fake_operation)
 

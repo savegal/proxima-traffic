@@ -124,6 +124,11 @@ def parse_dialogue_steps(
     reply_account_id: int | None,
     reply_text: str,
     reply_delay_seconds: int,
+    primary_html: str | None = None,
+    primary_media_path: str | None = None,
+    primary_media_kind: str | None = None,
+    primary_media_name: str | None = None,
+    primary_media_size: int | None = None,
 ) -> list[DialogueStep]:
     if value:
         try:
@@ -140,6 +145,11 @@ def parse_dialogue_steps(
             {
                 "account_id": primary_account_id,
                 "text": primary_text,
+                "html_text": primary_html,
+                "media_path": primary_media_path,
+                "media_kind": primary_media_kind,
+                "media_name": primary_media_name,
+                "media_size": primary_media_size,
                 "delay_seconds": 0,
                 "reply_to_previous": False,
             },

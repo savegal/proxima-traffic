@@ -12,16 +12,19 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from proxima_traffic.blacklist_import import subscriber_blacklisted_condition, user_is_blacklisted
 from proxima_traffic.config import Settings
+from proxima_traffic.db import is_transient_sqlite_lock
 from proxima_traffic.direct_messages import (
     DIRECT_MESSAGE_MAX_RECIPIENTS,
     IMPORT_BATCH_SIZE,
@@ -39,12 +42,12 @@ from proxima_traffic.gateways import (
     MessageGateway,
     PermanentGatewayError,
     SubscriberInviteDelivery,
+    SubscriberInviteDestination,
 )
 from proxima_traffic.models import (
     Account,
     DirectLaunchStatus,
     DirectMessageTaskStatus,
-    MentionBlacklistEntry,
     Subscriber,
     SubscriberInviteAccountRoute,
     SubscriberInviteCampaign,
@@ -58,6 +61,12 @@ from proxima_traffic.models import (
     SubscriberSegment,
     ensure_utc,
     utc_now,
+)
+from proxima_traffic.recipient_reports import (
+    RecipientReportFilter,
+    RecipientReportKind,
+    RecipientReportPage,
+    list_recipient_report,
 )
 from proxima_traffic.services import (
     AccountSendDeferred,
@@ -78,23 +87,58 @@ INVITE_TERMINAL_STATUSES = frozenset(
         DirectMessageTaskStatus.CANCELLED,
     }
 )
-INVITE_ROUTE_CODES = frozenset({"invite_recipient_privacy", "invite_recipient_unresolvable"})
+INVITE_ROUTE_CODES = frozenset({"invite_recipient_unresolvable"})
+INVITE_UNCERTAIN_CODES = ("invite_delivery_unconfirmed", "recipient_identity_mismatch")
 INVITE_RECIPIENT_SKIP_CODES = frozenset(
     {
         "invite_recipient_limit",
         "invite_recipient_unavailable",
-        "recipient_identity_mismatch",
+        "invite_recipient_privacy",
+        "invite_recipient_contact_required",
+        "invite_recipient_privacy_premium_pm",
+        "invite_sender_requires_premium",
+        "invite_recipient_kicked",
+        "invite_recipient_segment_changed",
     }
 )
 INVITE_GLOBAL_DESTINATION_CODES = frozenset(
     {
         "invite_destination_invalid",
         "invite_destination_full",
+        "invite_destination_changed",
+        "invite_destination_unverified",
+        "invite_destination_link_invalid",
     }
 )
 INVITE_LAUNCH_ACCOUNT_DESTINATION_CODES = frozenset(
     {"invite_destination_rights", "invite_destination_unavailable"}
 )
+
+# A destination check is read-only, and each account has its own Telegram
+# client lock.  A small bound keeps a large selected pool responsive without
+# producing a burst of RPCs from every account at once.
+INVITE_PREFLIGHT_CONCURRENCY = 3
+InvitePreflightProgress = Callable[[int, int, int, int], Awaitable[None]]
+InviteAdminSetupProgress = Callable[[int, int, int, int], Awaitable[None]]
+
+
+async def _report_progress(
+    callback: InvitePreflightProgress | None, checked: int, total: int, ready: int, failed: int
+) -> None:
+    if callback is None:
+        return
+    try:
+        async with asyncio.timeout(5):
+            await callback(checked, total, ready, failed)
+    except Exception:  # noqa: BLE001 - a panel edit must not interrupt Telegram work
+        logger.warning("Could not update invitation progress screen", exc_info=True)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriberInviteAdminSetupResult:
+    manager_label: str
+    granted_labels: tuple[str, ...]
+    failed: tuple[tuple[str, str], ...]
 
 
 def normalize_invite_destination_ref(value: str) -> tuple[str, str]:
@@ -105,14 +149,16 @@ def normalize_invite_destination_ref(value: str) -> tuple[str, str]:
         raise ValueError("укажите ссылку или @username канала/супергруппы")
     public_match = re.fullmatch(
         r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:s/)?"
-        r"([A-Za-z0-9_]{5,})(?:/\d+)?/?(?:[?#].*)?",
+        r"([A-Za-z0-9_]{1,32})(?:/\d+)?/?(?:[?#].*)?",
         normalized,
         flags=re.IGNORECASE,
     )
     if public_match:
         normalized = f"@{public_match.group(1)}"
     if normalized.startswith("@"):
-        if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", normalized) is None:
+        # This is lookup, not registration: collectible/legacy names may be
+        # shorter than the minimum for creating a new basic username.
+        if re.fullmatch(r"@[A-Za-z0-9_]{1,32}", normalized) is None:
             raise ValueError("@username канала или супергруппы имеет неверный формат")
         return normalized, normalized.casefold()
     # Private targets can be used only when every selected sender is already
@@ -126,7 +172,7 @@ def normalize_invite_destination_ref(value: str) -> tuple[str, str]:
     if private_match:
         invite_hash = private_match.group(1)
         canonical = f"https://t.me/+{invite_hash}"
-        return canonical, canonical.casefold()
+        return canonical, canonical
     raise ValueError("используйте @username или приватную ссылку t.me/+…")
 
 
@@ -153,6 +199,10 @@ class SubscriberInviteLaunchView:
     failed: int
     skipped: int
     cancelled: int
+    uncertain: int = 0
+    simulated: bool | None = None
+    selected_admin_count: int = 0
+    ready_admin_count: int = 0
     last_error_code: str | None = None
     last_error: str | None = None
     last_error_status: DirectMessageTaskStatus | None = None
@@ -160,6 +210,8 @@ class SubscriberInviteLaunchView:
     last_error_recipient: str | None = None
     issues: tuple[tuple[DirectMessageTaskStatus, str, int], ...] = ()
     next_scheduled_for: datetime | None = None
+    preflight_failures: tuple[tuple[str, str], ...] = ()
+    blocked_admin_count: int = 0
 
     @property
     def active(self) -> int:
@@ -185,6 +237,109 @@ class SubscriberInviteService:
         self._worker_id = worker_id
         self._stop_event = asyncio.Event()
         self._running = False
+
+    async def prepare_invite_admins(
+        self,
+        *,
+        manager_id: int,
+        account_ids: list[int],
+        destination_ref: str,
+        on_progress: InviteAdminSetupProgress | None = None,
+    ) -> SubscriberInviteAdminSetupResult:
+        """Use one explicitly chosen manager to grant invite-only admin rights."""
+
+        normalized_ref, _ = normalize_invite_destination_ref(destination_ref)
+        selected_ids = tuple(dict.fromkeys(int(value) for value in account_ids if int(value) > 0))
+        if not selected_ids:
+            raise ConflictError("сначала выберите аккаунты для приглашений")
+        async with self._session_factory() as session:
+            manager = await session.get(Account, manager_id)
+            accounts = list(
+                await session.scalars(select(Account).where(Account.id.in_(selected_ids)))
+            )
+        if manager is None:
+            raise NotFoundError("главный аккаунт не найден")
+        CampaignRunner._validate_sender(manager, require_live_session=not self._settings.dry_run)
+        by_id = {int(account.id): account for account in accounts if account.id is not None}
+        targets = [by_id[account_id] for account_id in selected_ids if account_id in by_id]
+        if len(targets) != len(selected_ids):
+            raise ConflictError("один из выбранных аккаунтов больше не найден")
+        for account in targets:
+            CampaignRunner._validate_sender(
+                account, require_live_session=not self._settings.dry_run
+            )
+        granted: list[str] = []
+        failed: list[tuple[str, str]] = []
+        total = len(targets)
+        await _report_progress(on_progress, 0, total, 0, 0)
+        manager_failure: str | None = None
+        for checked, account in enumerate(targets, start=1):
+            if not self._settings.dry_run:
+                try:
+                    await self._gateway.preflight_subscriber_invite(
+                        account=account, destination_ref=normalized_ref
+                    )
+                except GatewayError as exc:
+                    code = failure_code(exc, "gateway_error")
+                    if code not in {"invite_destination_rights", "invite_destination_unavailable"}:
+                        if code in ACCOUNT_WIDE_CODES:
+                            await self._runner.handle_external_account_failure(int(account.id), exc)
+                        failed.append((account.label, failure_label(code)))
+                        await _report_progress(
+                            on_progress, checked, total, len(granted), len(failed)
+                        )
+                        continue
+                else:
+                    # Existing permitted admins need no mutation and must not
+                    # consume another manager interval on repeated preparation.
+                    granted.append(account.label)
+                    await _report_progress(on_progress, checked, total, len(granted), len(failed))
+                    continue
+            if manager_failure is not None:
+                failed.append((account.label, manager_failure))
+                await _report_progress(on_progress, checked, total, len(granted), len(failed))
+                continue
+
+            async def grant(target: Account = account) -> None:
+                try:
+                    await self._gateway.grant_subscriber_invite_admin(
+                        manager=manager, account=target, destination_ref=normalized_ref
+                    )
+                except GatewayError as exc:
+                    cause = exc.__cause__ if isinstance(exc.__cause__, GatewayError) else exc
+                    if failure_code(cause, "") in ACCOUNT_WIDE_CODES:
+                        await self._runner.handle_external_account_failure(manager_id, cause)
+                    raise
+
+            try:
+                await self._runner.run_account_send_operation(manager_id, grant)
+            except AccountSendDeferred as exc:
+                manager_failure = "главный аккаунт соблюдает паузу; повторите подготовку после " + (
+                    ensure_utc(exc.resume_at) or utc_now()
+                ).strftime("%d.%m %H:%M UTC")
+                failed.append((account.label, manager_failure))
+            except GatewayError as exc:
+                code = failure_code(exc, "gateway_error")
+                cause = exc.__cause__ if isinstance(exc.__cause__, GatewayError) else exc
+                if failure_code(cause, "") in ACCOUNT_WIDE_CODES:
+                    manager_failure = failure_label(failure_code(cause, "gateway_error"))
+                elif code in {
+                    "invite_admin_manager_rights",
+                    "invite_admin_limit",
+                    "invite_admin_fresh_restriction",
+                }:
+                    manager_failure = failure_label(code)
+                failed.append((account.label, failure_label(code)))
+            except ConflictError as exc:
+                failed.append((account.label, safe_error_message(exc)))
+            else:
+                granted.append(account.label)
+            await _report_progress(on_progress, checked, total, len(granted), len(failed))
+        return SubscriberInviteAdminSetupResult(
+            manager_label=manager.label,
+            granted_labels=tuple(granted),
+            failed=tuple(failed),
+        )
 
     @staticmethod
     def _segment_condition(segment: SubscriberSegment) -> object:
@@ -326,7 +481,7 @@ class SubscriberInviteService:
             SubscriberListMember.subscriber_list_id == campaign.subscriber_list_id,
             Subscriber.do_not_contact.is_(False),
             self._segment_condition(campaign.segment),
-            ~Subscriber.telegram_user_id.in_(select(MentionBlacklistEntry.telegram_user_id)),
+            ~subscriber_blacklisted_condition(),
         ]
         uncertain_delivery = and_(
             Subscriber.last_invited_target_ref.is_not(None),
@@ -364,7 +519,11 @@ class SubscriberInviteService:
         return tuple(int(value or 0) for value in row)  # type: ignore[return-value]
 
     async def launch_campaign(
-        self, campaign_id: int, *, consent_confirmed: bool
+        self,
+        campaign_id: int,
+        *,
+        consent_confirmed: bool,
+        on_preflight_progress: InvitePreflightProgress | None = None,
     ) -> SubscriberInviteLaunch:
         if not consent_confirmed:
             raise ConflictError("нужно подтвердить согласие людей и права на выбранный канал")
@@ -396,10 +555,10 @@ class SubscriberInviteService:
         assert isinstance(campaign, SubscriberInviteCampaign)
         accounts = snapshot["accounts"]
         assert isinstance(accounts, list)
-        ready_accounts: list[Account] = []
-        preflight_failures: list[str] = []
-        destination_title: str | None = None
-        for account in accounts:
+
+        async def check_account(
+            account: Account,
+        ) -> tuple[Account, SubscriberInviteDestination | None, str | None]:
             try:
                 CampaignRunner._validate_sender(
                     account, require_live_session=not self._settings.dry_run
@@ -412,26 +571,104 @@ class SubscriberInviteService:
                 code = failure_code(exc, "gateway_error")
                 if code in ACCOUNT_WIDE_CODES:
                     await self._runner.handle_external_account_failure(int(account.id), exc)
-                preflight_failures.append(f"{account.label}: {failure_label(code)}")
-                continue
+                return account, None, failure_label(code)
             except ConflictError as exc:
-                preflight_failures.append(f"{account.label}: {safe_error_message(exc)}")
-                continue
-            ready_accounts.append(account)
-            destination_title = destination_title or preflight.title
+                return account, None, safe_error_message(exc)
+            if not self._settings.dry_run and not preflight.telegram_chat_id:
+                return account, None, "Telegram не подтвердил ID выбранной цели"
+            return account, preflight, None
+
+        # Do not run preflight for a large account pool all at once.  A few
+        # independent checks in parallel make the launch screen responsive
+        # while preserving Telegram-safe per-account serialization.
+        semaphore = asyncio.Semaphore(min(INVITE_PREFLIGHT_CONCURRENCY, max(1, len(accounts))))
+
+        async def bounded_check(
+            account: Account,
+        ) -> tuple[Account, SubscriberInviteDestination | None, str | None]:
+            async with semaphore:
+                try:
+                    async with asyncio.timeout(float(self._settings.worker_step_timeout_seconds)):
+                        return await check_account(account)
+                except TimeoutError:
+                    return (
+                        account,
+                        None,
+                        "истекло время проверки Telegram; приглашения не отправлены",
+                    )
+
+        ready_accounts: list[Account] = []
+        preflight_failures: list[tuple[str, str]] = []
+        destination_title: str | None = None
+        destination_id: int | None = None
+        checked = 0
+        total_accounts = len(accounts)
+        await _report_progress(on_preflight_progress, 0, total_accounts, 0, 0)
+        checks = [asyncio.create_task(bounded_check(account)) for account in accounts]
+        try:
+            for result in asyncio.as_completed(checks):
+                account, destination, failure = await result
+                checked += 1
+                if failure:
+                    preflight_failures.append((account.label, failure))
+                else:
+                    assert destination is not None
+                    if (
+                        destination_id is not None
+                        and destination.telegram_chat_id != destination_id
+                    ):
+                        raise ConflictError(
+                            "выбранные аккаунты видят разные цели; проверьте адрес канала"
+                        )
+                    ready_accounts.append(account)
+                    destination_title = destination_title or destination.title
+                    destination_id = destination_id or destination.telegram_chat_id
+                await _report_progress(
+                    on_preflight_progress,
+                    checked,
+                    total_accounts,
+                    len(ready_accounts),
+                    len(preflight_failures),
+                )
+        finally:
+            for check in checks:
+                if not check.done():
+                    check.cancel()
+            await asyncio.gather(*checks, return_exceptions=True)
         if not ready_accounts:
-            diagnostics = "\n".join(f"• {item}" for item in preflight_failures[:8])
+            diagnostics = "\n".join(
+                f"• {label}: {reason}" for label, reason in preflight_failures[:8]
+            )
             suffix = f":\n{diagnostics}" if diagnostics else ""
             raise ConflictError(
                 "ни один выбранный аккаунт не является готовым администратором этой цели" + suffix
             )
 
         now = utc_now()
-        ready_ids = [int(account.id) for account in ready_accounts]
+        ready_ids = sorted(int(account.id) for account in ready_accounts)
+        verified_ref = campaign.destination_ref
+        verified_list_id = campaign.subscriber_list_id
         async with self._session_factory() as session:
             campaign = await session.get(SubscriberInviteCampaign, campaign_id)
             if campaign is None or not campaign.enabled:
                 raise ConflictError("приглашение недоступно")
+            current_account_ids = tuple(
+                int(value)
+                for value in await session.scalars(
+                    select(SubscriberInviteCampaignAccount.account_id)
+                    .where(SubscriberInviteCampaignAccount.campaign_id == campaign.id)
+                    .order_by(SubscriberInviteCampaignAccount.id)
+                )
+            )
+            if (
+                campaign.destination_ref != verified_ref
+                or campaign.subscriber_list_id != verified_list_id
+                or current_account_ids != configured_ids
+            ):
+                raise ConflictError("параметры изменились во время проверки; повторите запуск")
+            subscriber_list = await session.get(SubscriberList, campaign.subscriber_list_id)
+            if subscriber_list is None or subscriber_list.status != SubscriberListStatus.READY:
+                raise ConflictError("база подписчиков больше не готова к запуску")
             cooldown_before = now - timedelta(days=campaign.contact_cooldown_days)
             uncertain_delivery_before = now - timedelta(days=max(1, campaign.contact_cooldown_days))
             uncertain_delivery = and_(
@@ -446,7 +683,7 @@ class SubscriberInviteService:
                 SubscriberListMember.subscriber_list_id == campaign.subscriber_list_id,
                 Subscriber.do_not_contact.is_(False),
                 self._segment_condition(campaign.segment),
-                ~Subscriber.telegram_user_id.in_(select(MentionBlacklistEntry.telegram_user_id)),
+                ~subscriber_blacklisted_condition(),
                 Subscriber.reserved_invite_launch_id.is_(None),
                 ~uncertain_delivery,
             ]
@@ -472,10 +709,16 @@ class SubscriberInviteService:
                 destination_ref_snapshot=campaign.destination_ref,
                 destination_key_snapshot=campaign.destination_key,
                 destination_title_snapshot=destination_title or campaign.destination_title,
+                destination_telegram_id_snapshot=destination_id,
                 segment_snapshot=campaign.segment,
                 recipient_limit_snapshot=campaign.recipient_limit,
                 contact_cooldown_days_snapshot=campaign.contact_cooldown_days,
                 account_ids_snapshot_json=json.dumps(ready_ids, separators=(",", ":")),
+                selected_account_ids_snapshot_json=json.dumps(
+                    configured_ids, separators=(",", ":")
+                ),
+                preflight_failures_snapshot_json=json.dumps(preflight_failures, ensure_ascii=False),
+                simulated_snapshot=self._settings.dry_run,
                 excluded_recent=recent,
                 excluded_reserved=reserved,
                 consent_confirmed_at=now,
@@ -555,6 +798,23 @@ class SubscriberInviteService:
             await session.refresh(launch)
             return launch
 
+    async def list_recipients(
+        self,
+        *,
+        launch_id: int | None = None,
+        page: int = 0,
+        query: str = "",
+        result_filter: RecipientReportFilter = RecipientReportFilter.SUCCESS,
+    ) -> RecipientReportPage:
+        return await list_recipient_report(
+            self._session_factory,
+            kind=RecipientReportKind.INVITE,
+            launch_id=launch_id,
+            page=page,
+            query=query,
+            result_filter=result_filter,
+        )
+
     async def list_launches(
         self, page: int, page_size: int
     ) -> tuple[list[SubscriberInviteLaunchView], int]:
@@ -572,7 +832,7 @@ class SubscriberInviteService:
                     .limit(page_size)
                 )
             )
-            return [await self._launch_view(session, item) for item in launches], total
+            return await self._launch_views(session, launches), total
 
     async def get_launch_view(self, launch_id: int) -> SubscriberInviteLaunchView:
         async with self._session_factory() as session:
@@ -591,135 +851,251 @@ class SubscriberInviteService:
     async def _launch_view(
         session: AsyncSession, launch: SubscriberInviteLaunch
     ) -> SubscriberInviteLaunchView:
-        campaign_name = await session.scalar(
-            select(SubscriberInviteCampaign.name).where(
-                SubscriberInviteCampaign.id == launch.campaign_id
+        return (await SubscriberInviteService._launch_views(session, [launch]))[0]
+
+    @staticmethod
+    async def _launch_views(
+        session: AsyncSession, launches: list[SubscriberInviteLaunch]
+    ) -> list[SubscriberInviteLaunchView]:
+        """Load exact counters and diagnostics for a page with four queries."""
+
+        if not launches:
+            return []
+        ids = [launch.id for launch in launches]
+        selected_admins = (
+            select(func.count(SubscriberInviteCampaignAccount.id))
+            .where(
+                SubscriberInviteCampaignAccount.campaign_id == SubscriberInviteLaunch.campaign_id
             )
+            .correlate(SubscriberInviteLaunch)
+            .scalar_subquery()
         )
-        list_name = await session.scalar(
-            select(SubscriberList.name).where(SubscriberList.id == launch.subscriber_list_id)
-        )
-        counts = dict(
-            (
-                await session.execute(
-                    select(SubscriberInviteTask.status, func.count(SubscriberInviteTask.id))
-                    .where(SubscriberInviteTask.launch_id == launch.id)
-                    .group_by(SubscriberInviteTask.status)
-                )
-            ).all()
-        )
-        already_participant = int(
-            await session.scalar(
-                select(func.count(SubscriberInviteTask.id)).where(
-                    SubscriberInviteTask.launch_id == launch.id,
-                    SubscriberInviteTask.status == DirectMessageTaskStatus.SUCCEEDED,
-                    SubscriberInviteTask.already_participant.is_(True),
-                )
+        blocked_admins = (
+            select(func.count(SubscriberInviteLaunchAccountState.id))
+            .where(
+                SubscriberInviteLaunchAccountState.launch_id == SubscriberInviteLaunch.id,
+                SubscriberInviteLaunchAccountState.send_blocked.is_(True),
             )
-            or 0
+            .correlate(SubscriberInviteLaunch)
+            .scalar_subquery()
         )
-        error = (
-            await session.execute(
-                select(
-                    SubscriberInviteTask.error_code,
-                    SubscriberInviteTask.error,
-                    SubscriberInviteTask.status,
-                    Account.label,
-                    Subscriber.username,
-                    Subscriber.telegram_user_id,
-                )
-                .join(Subscriber, Subscriber.id == SubscriberInviteTask.subscriber_id)
-                .outerjoin(Account, Account.id == SubscriberInviteTask.sender_account_id)
-                .where(
-                    SubscriberInviteTask.launch_id == launch.id,
-                    SubscriberInviteTask.error_code.is_not(None),
-                )
-                .order_by(SubscriberInviteTask.updated_at.desc())
-                .limit(1)
-            )
-        ).first()
-        issue_rows = list(
-            (
+        names = {
+            row.id: row
+            for row in (
                 await session.execute(
                     select(
-                        SubscriberInviteTask.status,
-                        SubscriberInviteTask.error_code,
-                        func.count(SubscriberInviteTask.id),
+                        SubscriberInviteLaunch.id,
+                        SubscriberInviteCampaign.name.label("campaign_name"),
+                        SubscriberList.name.label("list_name"),
+                        selected_admins.label("selected_admins"),
+                        blocked_admins.label("blocked_admins"),
                     )
-                    .where(
-                        SubscriberInviteTask.launch_id == launch.id,
-                        SubscriberInviteTask.status.in_(
-                            (
-                                DirectMessageTaskStatus.QUEUED,
-                                DirectMessageTaskStatus.FAILED,
-                                DirectMessageTaskStatus.SKIPPED,
-                            )
-                        ),
-                        SubscriberInviteTask.error_code.is_not(None),
+                    .outerjoin(
+                        SubscriberInviteCampaign,
+                        SubscriberInviteCampaign.id == SubscriberInviteLaunch.campaign_id,
                     )
-                    .group_by(SubscriberInviteTask.status, SubscriberInviteTask.error_code)
-                    .order_by(
+                    .outerjoin(
+                        SubscriberList,
+                        SubscriberList.id == SubscriberInviteLaunch.subscriber_list_id,
+                    )
+                    .where(SubscriberInviteLaunch.id.in_(ids))
+                )
+            ).all()
+        }
+        counts_by_launch: dict[int, dict[DirectMessageTaskStatus, int]] = {id_: {} for id_ in ids}
+        already_by_launch: dict[int, int] = {}
+        uncertain_by_launch: dict[int, int] = {}
+        next_by_launch: dict[int, datetime | None] = {}
+        rows = (
+            await session.execute(
+                select(
+                    SubscriberInviteTask.launch_id,
+                    SubscriberInviteTask.status,
+                    func.count(SubscriberInviteTask.id),
+                    func.sum(
+                        case((SubscriberInviteTask.already_participant.is_(True), 1), else_=0)
+                    ),
+                    func.sum(
+                        case(
+                            (SubscriberInviteTask.error_code.in_(INVITE_UNCERTAIN_CODES), 1),
+                            else_=0,
+                        )
+                    ),
+                    func.min(SubscriberInviteTask.scheduled_for),
+                )
+                .where(SubscriberInviteTask.launch_id.in_(ids))
+                .group_by(SubscriberInviteTask.launch_id, SubscriberInviteTask.status)
+            )
+        ).all()
+        for launch_id, status, count, already, uncertain, scheduled in rows:
+            status = DirectMessageTaskStatus(status)
+            counts_by_launch[launch_id][status] = int(count)
+            if status == DirectMessageTaskStatus.SUCCEEDED:
+                already_by_launch[launch_id] = int(already or 0)
+            if status == DirectMessageTaskStatus.FAILED:
+                uncertain_by_launch[launch_id] = int(uncertain or 0)
+            if status == DirectMessageTaskStatus.QUEUED:
+                next_by_launch[launch_id] = scheduled
+        # Rank in SQL so a page never loads an unbounded task history.
+        errors = (
+            select(
+                SubscriberInviteTask.launch_id,
+                SubscriberInviteTask.error_code,
+                SubscriberInviteTask.error,
+                SubscriberInviteTask.status,
+                Account.label,
+                Subscriber.username,
+                Subscriber.telegram_user_id,
+                func.row_number()
+                .over(
+                    partition_by=SubscriberInviteTask.launch_id,
+                    order_by=(
+                        SubscriberInviteTask.updated_at.desc(),
+                        SubscriberInviteTask.id.desc(),
+                    ),
+                )
+                .label("position"),
+            )
+            .join(Subscriber, Subscriber.id == SubscriberInviteTask.subscriber_id)
+            .outerjoin(Account, Account.id == SubscriberInviteTask.sender_account_id)
+            .where(
+                SubscriberInviteTask.launch_id.in_(ids),
+                SubscriberInviteTask.error_code.is_not(None),
+                SubscriberInviteTask.status != DirectMessageTaskStatus.SUCCEEDED,
+            )
+            .subquery()
+        )
+        errors_by_launch = {
+            row.launch_id: row
+            for row in (await session.execute(select(errors).where(errors.c.position == 1))).all()
+        }
+        issues = (
+            select(
+                SubscriberInviteTask.launch_id,
+                SubscriberInviteTask.status,
+                SubscriberInviteTask.error_code,
+                func.count(SubscriberInviteTask.id).label("count"),
+                func.row_number()
+                .over(
+                    partition_by=SubscriberInviteTask.launch_id,
+                    order_by=(
                         func.count(SubscriberInviteTask.id).desc(),
                         SubscriberInviteTask.status,
                         SubscriberInviteTask.error_code,
-                    )
-                    .limit(3)
+                    ),
                 )
-            ).all()
-        )
-        next_scheduled_for = await session.scalar(
-            select(func.min(SubscriberInviteTask.scheduled_for)).where(
-                SubscriberInviteTask.launch_id == launch.id,
-                SubscriberInviteTask.status == DirectMessageTaskStatus.QUEUED,
+                .label("position"),
             )
+            .where(
+                SubscriberInviteTask.launch_id.in_(ids),
+                SubscriberInviteTask.status.in_(
+                    (
+                        DirectMessageTaskStatus.QUEUED,
+                        DirectMessageTaskStatus.FAILED,
+                        DirectMessageTaskStatus.SKIPPED,
+                    )
+                ),
+                SubscriberInviteTask.error_code.is_not(None),
+            )
+            .group_by(
+                SubscriberInviteTask.launch_id,
+                SubscriberInviteTask.status,
+                SubscriberInviteTask.error_code,
+            )
+            .subquery()
         )
-        return SubscriberInviteLaunchView(
-            launch=launch,
-            campaign_name=str(campaign_name or f"Приглашение #{launch.campaign_id}"),
-            list_name=str(list_name or f"База #{launch.subscriber_list_id}"),
-            queued=int(counts.get(DirectMessageTaskStatus.QUEUED, 0)),
-            running=int(counts.get(DirectMessageTaskStatus.RUNNING, 0)),
-            invited=max(
-                0,
-                int(counts.get(DirectMessageTaskStatus.SUCCEEDED, 0)) - already_participant,
-            ),
-            already_participant=already_participant,
-            failed=int(counts.get(DirectMessageTaskStatus.FAILED, 0)),
-            skipped=int(counts.get(DirectMessageTaskStatus.SKIPPED, 0)),
-            cancelled=int(counts.get(DirectMessageTaskStatus.CANCELLED, 0)),
-            last_error_code=(
-                launch.failure_code
-                or (str(error.error_code) if error and error.error_code else None)
-            ),
-            last_error=launch.failure or (str(error.error) if error and error.error else None),
-            last_error_status=(
-                DirectMessageTaskStatus(error.status)
-                if not launch.failure and error and error.status
-                else None
-            ),
-            last_error_account_label=(
-                str(error.label) if not launch.failure and error and error.label else None
-            ),
-            last_error_recipient=(
-                f"@{error.username}"
-                if not launch.failure and error and error.username
-                else (
-                    f"ID {error.telegram_user_id}"
-                    if not launch.failure and error and error.telegram_user_id is not None
-                    else None
+        issues_by_launch: dict[int, list] = {id_: [] for id_ in ids}
+        for row in (
+            await session.execute(
+                select(issues)
+                .where(issues.c.position <= 3)
+                .order_by(issues.c.launch_id, issues.c.position)
+            )
+        ).all():
+            issues_by_launch[row.launch_id].append(row)
+        views: list[SubscriberInviteLaunchView] = []
+        for launch in launches:
+            name = names[launch.id]
+            campaign_name, list_name = name.campaign_name, name.list_name
+            selected_admin_count = int(name.selected_admins or 0)
+            if launch.selected_account_ids_snapshot_json is not None:
+                selected_admin_count = len(
+                    SubscriberInviteService._account_ids(launch.selected_account_ids_snapshot_json)
                 )
-            ),
-            issues=tuple(
-                (
-                    DirectMessageTaskStatus(row.status),
-                    str(row.error_code),
-                    int(row[2]),
+            try:
+                preflight_failures = tuple(
+                    (str(label), str(reason))
+                    for label, reason in json.loads(launch.preflight_failures_snapshot_json or "[]")
                 )
-                for row in issue_rows
-                if row.error_code
-            ),
-            next_scheduled_for=ensure_utc(next_scheduled_for),
-        )
+            except (TypeError, ValueError):
+                preflight_failures = ()
+            try:
+                ready_admin_count = len(json.loads(launch.account_ids_snapshot_json or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                ready_admin_count = 0
+            counts = counts_by_launch[launch.id]
+            already_participant = already_by_launch.get(launch.id, 0)
+            uncertain = uncertain_by_launch.get(launch.id, 0)
+            error = errors_by_launch.get(launch.id)
+            issue_rows = issues_by_launch[launch.id]
+            next_scheduled_for = next_by_launch.get(launch.id)
+            views.append(
+                SubscriberInviteLaunchView(
+                    launch=launch,
+                    campaign_name=str(campaign_name or f"Приглашение #{launch.campaign_id}"),
+                    list_name=str(list_name or f"База #{launch.subscriber_list_id}"),
+                    queued=int(counts.get(DirectMessageTaskStatus.QUEUED, 0)),
+                    running=int(counts.get(DirectMessageTaskStatus.RUNNING, 0)),
+                    invited=max(
+                        0,
+                        int(counts.get(DirectMessageTaskStatus.SUCCEEDED, 0)) - already_participant,
+                    ),
+                    already_participant=already_participant,
+                    failed=int(counts.get(DirectMessageTaskStatus.FAILED, 0)),
+                    uncertain=uncertain,
+                    simulated=launch.simulated_snapshot,
+                    skipped=int(counts.get(DirectMessageTaskStatus.SKIPPED, 0)),
+                    cancelled=int(counts.get(DirectMessageTaskStatus.CANCELLED, 0)),
+                    selected_admin_count=selected_admin_count,
+                    ready_admin_count=ready_admin_count,
+                    preflight_failures=preflight_failures,
+                    blocked_admin_count=int(name.blocked_admins or 0),
+                    last_error_code=(
+                        launch.failure_code
+                        or (str(error.error_code) if error and error.error_code else None)
+                    ),
+                    last_error=launch.failure
+                    or (str(error.error) if error and error.error else None),
+                    last_error_status=(
+                        DirectMessageTaskStatus(error.status)
+                        if not launch.failure and error and error.status
+                        else None
+                    ),
+                    last_error_account_label=(
+                        str(error.label) if not launch.failure and error and error.label else None
+                    ),
+                    last_error_recipient=(
+                        f"@{error.username}"
+                        if not launch.failure and error and error.username
+                        else (
+                            f"ID {error.telegram_user_id}"
+                            if not launch.failure and error and error.telegram_user_id is not None
+                            else None
+                        )
+                    ),
+                    issues=tuple(
+                        (
+                            DirectMessageTaskStatus(row.status),
+                            str(row.error_code),
+                            int(row._mapping["count"]),
+                        )
+                        for row in issue_rows
+                        if row.error_code
+                    ),
+                    next_scheduled_for=ensure_utc(next_scheduled_for),
+                )
+            )
+        return views
 
     async def cancel_launch(self, launch_id: int) -> int:
         now = utc_now()
@@ -795,33 +1171,64 @@ class SubscriberInviteService:
             async with asyncio.timeout(float(self._settings.worker_step_timeout_seconds)):
                 return await self._process_claimed(task.id, token)
         except TimeoutError:
-            return await self._finish_task(
-                task.id,
-                token,
-                status=DirectMessageTaskStatus.FAILED,
-                error_code="invite_delivery_unconfirmed",
-                error="приглашение не завершилось вовремя; автоматический повтор запрещён",
-                conservative=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - worker must not die on one record
+            return await self._handle_interrupted_task(task.id, token, "step_timeout")
+        except Exception:  # noqa: BLE001 - worker must not die on one record
             logger.exception("Subscriber invite task %s failed unexpectedly", task.id)
-            return await self._finish_task(
-                task.id,
-                token,
-                status=DirectMessageTaskStatus.FAILED,
-                error_code="unhandled_execution_error",
-                error=safe_error_message(exc),
-                conservative=True,
-            )
+            return await self._handle_interrupted_task(task.id, token, "unhandled_execution_error")
         finally:
             heartbeat_stop.set()
             await heartbeat
+
+    async def _handle_interrupted_task(
+        self, task_id: int, token: str, code: str
+    ) -> SubscriberInviteTask:
+        async with self._session_factory() as session:
+            task = await session.get(SubscriberInviteTask, task_id)
+            if task is None:
+                raise NotFoundError("задача приглашения не найдена")
+            if task.status in INVITE_TERMINAL_STATUSES or task.lease_token != token:
+                return task
+            attempted = task.delivery_attempted_at is not None
+            sender_account_id = task.sender_account_id
+            exhausted = task.attempt_count + 1 >= task.max_attempts
+        if not attempted and not exhausted:
+            return await self._reschedule_task(
+                task_id,
+                token,
+                scheduled_for=utc_now()
+                + timedelta(seconds=self._settings.worker_retry_base_seconds),
+                error_code=code,
+                error="сбой до приглашения; задача будет повторена",
+                increment_attempt=True,
+            )
+        if attempted and sender_account_id is not None:
+            try:
+                await self._runner.record_external_account_send(
+                    int(sender_account_id), operation_key=f"subscriber-invite:{task_id}"
+                )
+            except Exception:  # noqa: BLE001 - preserve unknown Telegram outcome
+                logger.exception("Could not reserve quota for interrupted invite task %s", task_id)
+        return await self._finish_task(
+            task_id,
+            token,
+            status=DirectMessageTaskStatus.FAILED,
+            error_code="invite_delivery_unconfirmed" if attempted else code,
+            error=(
+                f"приглашение прервалось ({code}); результат Telegram неизвестен, повтор запрещён"
+                if attempted
+                else "исчерпаны попытки подготовки приглашения"
+            ),
+            sender_account_id=sender_account_id,
+            record_attempt=attempted,
+            conservative=attempted,
+        )
 
     async def _claim_next(self) -> SubscriberInviteTask | None:
         now = utc_now()
         token = uuid4().hex
         lease_until = now + timedelta(seconds=max(30, self._settings.worker_lease_seconds))
         recovered_launch_ids: set[int] = set()
+        recovered_send_attempts: list[tuple[int, int]] = []
         async with self._session_factory() as session:
             # These tasks have not reached the non-idempotent Telegram RPC yet,
             # so a cancelled launch can safely terminalise them.  Without this
@@ -898,6 +1305,10 @@ class SubscriberInviteService:
                     )
                 )
                 recovered_launch_ids.add(int(uncertain.launch_id))
+                if uncertain.sender_account_id is not None:
+                    recovered_send_attempts.append(
+                        (int(uncertain.sender_account_id), int(uncertain.id))
+                    )
             await session.execute(
                 update(SubscriberInviteTask)
                 .where(
@@ -951,7 +1362,42 @@ class SubscriberInviteService:
                 .returning(SubscriberInviteTask.id)
             )
             task_id = claimed.scalar_one_or_none()
+            if task_id is None:
+                # A result may have committed before a later summary update
+                # failed. Repair completed batches without replaying their RPCs.
+                recovered_launch_ids.update(
+                    int(value)
+                    for value in await session.scalars(
+                        select(SubscriberInviteLaunch.id)
+                        .where(
+                            SubscriberInviteLaunch.status.in_(
+                                (DirectLaunchStatus.QUEUED, DirectLaunchStatus.RUNNING)
+                            ),
+                            ~select(SubscriberInviteTask.id)
+                            .where(
+                                SubscriberInviteTask.launch_id == SubscriberInviteLaunch.id,
+                                SubscriberInviteTask.status.in_(
+                                    (
+                                        DirectMessageTaskStatus.QUEUED,
+                                        DirectMessageTaskStatus.RUNNING,
+                                    )
+                                ),
+                            )
+                            .exists(),
+                        )
+                        .limit(50)
+                    )
+                )
             await session.commit()
+        for account_id, recovered_task_id in recovered_send_attempts:
+            try:
+                await self._runner.record_external_account_send(
+                    account_id, operation_key=f"subscriber-invite:{recovered_task_id}"
+                )
+            except Exception:  # noqa: BLE001 - unknown invitation remains terminal
+                logger.exception(
+                    "Could not reserve quota for recovered invite task %s", recovered_task_id
+                )
         for launch_id in recovered_launch_ids:
             await self._refresh_launch(launch_id)
         if task_id is None:
@@ -982,6 +1428,23 @@ class SubscriberInviteService:
                     error="запуск остановлен оператором",
                     record_attempt=False,
                 )
+            if (
+                launch.simulated_snapshot is not None
+                and launch.simulated_snapshot != self._settings.dry_run
+            ):
+                return await self._fail_launch_for_destination(
+                    task_id,
+                    token,
+                    "launch_mode_changed",
+                    "режим симуляции изменился после создания запуска",
+                )
+            if not self._settings.dry_run and launch.destination_telegram_id_snapshot is None:
+                return await self._fail_launch_for_destination(
+                    task_id,
+                    token,
+                    "invite_destination_unverified",
+                    "в старом запуске не сохранён Telegram ID цели; создайте новый запуск",
+                )
             if subscriber.do_not_contact:
                 return await self._finish_task(
                     task_id,
@@ -991,7 +1454,7 @@ class SubscriberInviteService:
                     error="получатель находится в списке «не писать»",
                     record_attempt=False,
                 )
-            if await session.get(MentionBlacklistEntry, subscriber.telegram_user_id) is not None:
+            if await user_is_blacklisted(session, subscriber.telegram_user_id, subscriber.username):
                 return await self._finish_task(
                     task_id,
                     token,
@@ -1033,21 +1496,36 @@ class SubscriberInviteService:
             }
 
         candidates: list[tuple[datetime | None, Account, SubscriberInviteAccountRoute | None]] = []
+        launch_created_at = ensure_utc(launch.created_at) or utc_now()
+        valid_sender_count = 0
         for account in accounts:
-            route = routes.get(int(account.id))
-            launch_account_state = launch_account_states.get(int(account.id))
-            if (route is not None and route.invite_blocked) or (
-                launch_account_state is not None and launch_account_state.send_blocked
-            ):
-                continue
             try:
                 CampaignRunner._validate_sender(
                     account, require_live_session=not self._settings.dry_run
                 )
             except ConflictError:
                 continue
+            valid_sender_count += 1
+            route = routes.get(int(account.id))
+            launch_account_state = launch_account_states.get(int(account.id))
+            route_blocked_this_launch = (
+                route is not None
+                and route.invite_blocked
+                and (ensure_utc(route.updated_at) or launch_created_at) >= launch_created_at
+            )
+            if route_blocked_this_launch or (
+                launch_account_state is not None and launch_account_state.send_blocked
+            ):
+                continue
             candidates.append((self._sender_ready_at(account), account, route))
         if not candidates:
+            if not valid_sender_count:
+                return await self._fail_launch_for_destination(
+                    task_id,
+                    token,
+                    "sender_unavailable",
+                    "все выбранные аккаунты выключены или их сессии больше не действительны",
+                )
             blocked_states = [
                 state
                 for state in launch_account_states.values()
@@ -1082,35 +1560,80 @@ class SubscriberInviteService:
             access_hash=route.access_hash if route is not None else None,
         )
 
-        async def invite() -> SubscriberInviteDelivery:
+        async def invite() -> SubscriberInviteTask:
+            async def before_invite() -> None:
+                stop = await self._pre_invite_stop_code(
+                    task_id,
+                    token,
+                    launch_id=launch.id,
+                    subscriber_id=subscriber.id,
+                    telegram_user_id=subscriber.telegram_user_id,
+                    account_id=int(account.id),
+                )
+                if stop is not None:
+                    raise PermanentGatewayError(
+                        "приглашение отменено повторной проверкой", code=stop
+                    )
+                await self._mark_delivery_attempted(task_id, token, account_id=int(account.id))
+
             stop = await self._pre_invite_stop_code(
                 task_id,
                 token,
                 launch_id=launch.id,
                 subscriber_id=subscriber.id,
                 telegram_user_id=subscriber.telegram_user_id,
+                account_id=int(account.id),
             )
             if stop is not None:
                 raise PermanentGatewayError("приглашение отменено повторной проверкой", code=stop)
-            await self._mark_delivery_attempted(task_id, token)
-            delivery = await self._gateway.invite_subscriber(
-                account=account,
-                destination_ref=launch.destination_ref_snapshot,
-                recipient=recipient,
-            )
             try:
-                await self._runner.record_external_account_send(
-                    int(account.id), operation_key=f"subscriber-invite:{task_id}"
+                delivery = await self._gateway.invite_subscriber(
+                    account=account,
+                    destination_ref=launch.destination_ref_snapshot,
+                    recipient=recipient,
+                    expected_destination_id=launch.destination_telegram_id_snapshot,
+                    require_premium=(
+                        None
+                        if launch.segment_snapshot == SubscriberSegment.ALL
+                        else launch.segment_snapshot == SubscriberSegment.PREMIUM
+                    ),
+                    before_invite=before_invite,
                 )
-            except Exception as exc:  # Telegram may already have added the person.
-                raise PermanentGatewayError(
-                    "Telegram принял приглашение, но локальная фиксация лимита не подтверждена",
-                    code="invite_delivery_unconfirmed",
-                ) from exc
-            return delivery
+            except GatewayError as exc:
+                return await self._handle_gateway_failure(
+                    task_id, token, subscriber_id=subscriber.id, account_id=int(account.id), exc=exc
+                )
+            if not delivery.already_participant:
+                try:
+                    await self._runner.record_external_account_send(
+                        int(account.id), operation_key=f"subscriber-invite:{task_id}"
+                    )
+                except Exception as exc:  # Telegram may already have added the person.
+                    raise PermanentGatewayError(
+                        "Telegram принял приглашение, но локальная фиксация лимита не подтверждена",
+                        code="invite_delivery_unconfirmed",
+                    ) from exc
+            if delivery.telegram_user_id != subscriber.telegram_user_id:
+                return await self._finish_task(
+                    task_id,
+                    token,
+                    status=DirectMessageTaskStatus.FAILED,
+                    error_code="recipient_identity_mismatch",
+                    error="шлюз вернул другой Telegram ID; повтор запрещён",
+                    sender_account_id=int(account.id),
+                    conservative=True,
+                )
+            return await self._record_success(
+                task_id,
+                token,
+                subscriber_id=subscriber.id,
+                account_id=int(account.id),
+                target_ref=launch.destination_key_snapshot,
+                delivery=delivery,
+            )
 
         try:
-            delivery = await self._runner.run_account_send_operation(int(account.id), invite)
+            return await self._runner.run_account_send_operation(int(account.id), invite)
         except AccountSendDeferred as exc:
             return await self._reschedule_task(
                 task_id,
@@ -1128,24 +1651,6 @@ class SubscriberInviteService:
                 account_id=int(account.id),
                 exc=exc,
             )
-        if delivery.telegram_user_id != subscriber.telegram_user_id:
-            return await self._finish_task(
-                task_id,
-                token,
-                status=DirectMessageTaskStatus.FAILED,
-                error_code="recipient_identity_mismatch",
-                error="шлюз вернул другой Telegram ID; повтор запрещён",
-                sender_account_id=int(account.id),
-                conservative=True,
-            )
-        return await self._record_success(
-            task_id,
-            token,
-            subscriber_id=subscriber.id,
-            account_id=int(account.id),
-            target_ref=launch.destination_key_snapshot,
-            delivery=delivery,
-        )
 
     async def _handle_gateway_failure(
         self,
@@ -1158,11 +1663,30 @@ class SubscriberInviteService:
     ) -> SubscriberInviteTask:
         code = failure_code(exc, "gateway_error")
         message = safe_error_message(exc)[:500]
+        if (
+            isinstance(exc.__cause__, GatewayError)
+            and failure_code(exc.__cause__, "") in ACCOUNT_WIDE_CODES
+        ):
+            await self._runner.handle_external_account_failure(account_id, exc.__cause__)
         if code in ACCOUNT_WIDE_CODES:
             await self._runner.handle_external_account_failure(account_id, exc)
+        if code in {"account_restricted", "peer_flood"} and (
+            self._settings.account_restriction_cooldown_hours == 0
+        ):
+            await self._block_launch_account(
+                task_id, token, account_id=account_id, code=code, error=message
+            )
+            return await self._finish_task(
+                task_id,
+                token,
+                status=DirectMessageTaskStatus.FAILED,
+                error_code=code,
+                error=message,
+                sender_account_id=account_id,
+            )
         if code in INVITE_GLOBAL_DESTINATION_CODES:
             return await self._fail_launch_for_destination(task_id, token, code, message)
-        if code in ACCOUNT_FATAL_CODES:
+        if code in ACCOUNT_FATAL_CODES or code == "sender_unavailable":
             launch_id, all_selected_admins_blocked = await self._block_launch_account(
                 task_id,
                 token,
@@ -1232,6 +1756,20 @@ class SubscriberInviteService:
                 sender_account_id=account_id,
                 record_attempt=False,
             )
+        if code == "recipient_identity_mismatch":
+            async with self._session_factory() as session:
+                task = await self._require_task(session, task_id, token)
+                attempted = task.delivery_attempted_at is not None
+            if not attempted:
+                return await self._finish_task(
+                    task_id,
+                    token,
+                    status=DirectMessageTaskStatus.SKIPPED,
+                    error_code=code,
+                    error=message,
+                    sender_account_id=account_id,
+                    record_attempt=False,
+                )
         if code in INVITE_RECIPIENT_SKIP_CODES:
             return await self._finish_task(
                 task_id,
@@ -1241,7 +1779,13 @@ class SubscriberInviteService:
                 error=message,
                 sender_account_id=account_id,
             )
-        if code == "invite_delivery_unconfirmed":
+        if code in INVITE_UNCERTAIN_CODES:
+            try:
+                await self._runner.record_external_account_send(
+                    account_id, operation_key=f"subscriber-invite:{task_id}"
+                )
+            except Exception:  # noqa: BLE001 - preserve the unknown Telegram outcome
+                logger.exception("Could not reserve quota for uncertain invite task %s", task_id)
             return await self._finish_task(
                 task_id,
                 token,
@@ -1263,6 +1807,7 @@ class SubscriberInviteService:
             # They therefore cannot mean the recipient was already invited.
             "account_operation_busy",
             "proxy_unavailable",
+            "invite_preflight_unavailable",
         }:
             if next_attempt >= task.max_attempts:
                 return await self._finish_task(
@@ -1289,9 +1834,26 @@ class SubscriberInviteService:
                 increment_attempt=True,
                 sender_account_id=account_id,
             )
+        if isinstance(exc, PermanentGatewayError):
+            # A definite Telegram/local refusal is a known failure, not an
+            # ambiguous invitation. Keep the unrecognized RPC detail for review.
+            return await self._finish_task(
+                task_id,
+                token,
+                status=DirectMessageTaskStatus.FAILED,
+                error_code=code,
+                error=message,
+                sender_account_id=account_id,
+            )
         # No idempotency key exists for InviteToChannel. A network/RPC outcome
         # may have added the person before the reply was lost, so retrying it
         # would be less safe than surfacing an explicit unknown result.
+        try:
+            await self._runner.record_external_account_send(
+                account_id, operation_key=f"subscriber-invite:{task_id}"
+            )
+        except Exception:  # noqa: BLE001 - preserve the unknown Telegram outcome
+            logger.exception("Could not reserve quota for uncertain invite task %s", task_id)
         return await self._finish_task(
             task_id,
             token,
@@ -1310,6 +1872,7 @@ class SubscriberInviteService:
         launch_id: int,
         subscriber_id: int,
         telegram_user_id: int,
+        account_id: int | None = None,
     ) -> str | None:
         async with self._session_factory() as session:
             task = await self._require_task(session, task_id, token)
@@ -1323,11 +1886,29 @@ class SubscriberInviteService:
                 return "invite_reservation_lost"
             if subscriber.do_not_contact:
                 return "recipient_opted_out"
-            if await session.get(MentionBlacklistEntry, telegram_user_id) is not None:
+            if await user_is_blacklisted(session, telegram_user_id, subscriber.username):
                 return "recipient_blacklisted"
+            if account_id is not None:
+                if account_id not in self._account_ids(launch.account_ids_snapshot_json):
+                    return "sender_unavailable"
+                account = await session.get(Account, account_id)
+                try:
+                    CampaignRunner._validate_sender(
+                        account, require_live_session=not self._settings.dry_run
+                    )
+                except ConflictError:
+                    return "sender_unavailable"
+                state = await session.scalar(
+                    select(SubscriberInviteLaunchAccountState).where(
+                        SubscriberInviteLaunchAccountState.launch_id == launch_id,
+                        SubscriberInviteLaunchAccountState.account_id == account_id,
+                    )
+                )
+                if state is not None and state.send_blocked:
+                    return "sender_unavailable"
         return None
 
-    async def _mark_delivery_attempted(self, task_id: int, token: str) -> None:
+    async def _mark_delivery_attempted(self, task_id: int, token: str, *, account_id: int) -> None:
         """Persist the non-idempotent RPC boundary before calling Telegram.
 
         A successful RPC reply is not enough to reconstruct a crash in the
@@ -1338,9 +1919,47 @@ class SubscriberInviteService:
         now = utc_now()
         async with self._session_factory() as session:
             task = await self._require_task(session, task_id, token)
-            task.delivery_attempted_at = now
-            task.updated_at = now
+            launch_id, subscriber_id = task.launch_id, task.subscriber_id
+            marked = await session.scalar(
+                update(SubscriberInviteTask)
+                .where(
+                    SubscriberInviteTask.id == task_id,
+                    SubscriberInviteTask.status == DirectMessageTaskStatus.RUNNING,
+                    SubscriberInviteTask.lease_token == token,
+                    select(SubscriberInviteLaunch.id)
+                    .where(
+                        SubscriberInviteLaunch.id == launch_id,
+                        SubscriberInviteLaunch.cancel_requested.is_(False),
+                    )
+                    .exists(),
+                    select(Subscriber.id)
+                    .where(
+                        Subscriber.id == subscriber_id,
+                        Subscriber.reserved_invite_launch_id == launch_id,
+                        Subscriber.do_not_contact.is_(False),
+                        ~subscriber_blacklisted_condition(),
+                    )
+                    .exists(),
+                )
+                .values(delivery_attempted_at=now, sender_account_id=account_id, updated_at=now)
+                .returning(SubscriberInviteTask.id)
+            )
             await session.commit()
+        if marked is None:
+            async with self._session_factory() as session:
+                subscriber = await session.get(Subscriber, subscriber_id)
+            stop = await self._pre_invite_stop_code(
+                task_id,
+                token,
+                launch_id=launch_id,
+                subscriber_id=subscriber_id,
+                telegram_user_id=subscriber.telegram_user_id if subscriber else 0,
+                account_id=account_id,
+            )
+            raise PermanentGatewayError(
+                "приглашение остановлено на границе запроса",
+                code=stop or "invite_reservation_lost",
+            )
 
     async def _block_launch_account(
         self,
@@ -1454,9 +2073,10 @@ class SubscriberInviteService:
             task.finished_at = now
             self._release_task_lease(task)
             subscriber.last_invite_attempt_at = now
-            subscriber.last_invited_at = now
-            subscriber.last_invited_target_ref = target_ref
-            subscriber.invite_count += 0 if delivery.already_participant else 1
+            if not delivery.already_participant:
+                subscriber.last_invited_at = now
+                subscriber.last_invited_target_ref = target_ref
+                subscriber.invite_count += 1
             subscriber.reserved_invite_launch_id = None
             subscriber.last_error_code = None
             subscriber.last_error = None
@@ -1765,6 +2385,15 @@ class SubscriberInviteService:
                 task = await self.process_next()
             except asyncio.CancelledError:
                 raise
+            except OperationalError as exc:
+                if is_transient_sqlite_lock(exc):
+                    logger.warning("Subscriber-invite worker waits for a busy SQLite writer")
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.exception("Subscriber-invite worker iteration failed")
+                if reporter is not None:
+                    await reporter(exc)
+                task = None
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Subscriber-invite worker iteration failed")
                 if reporter is not None:

@@ -31,6 +31,7 @@ from proxima_traffic.models import (
     CampaignAccount,
     CampaignMode,
     CampaignRun,
+    ChannelCommentMessage,
     ChannelCommentReactionAccountState,
     ChannelCommentRule,
     ChannelCommentRun,
@@ -275,11 +276,18 @@ class ReactionWorker:
             target: Target | None = None
             comment_run: ChannelCommentRun | None = None
             comment_rule: ChannelCommentRule | None = None
+            comment_message: ChannelCommentMessage | None = None
             is_comment = task.channel_comment_run_id is not None
             if is_comment:
                 comment_run = await session.get(ChannelCommentRun, task.channel_comment_run_id)
                 if comment_run is not None:
                     comment_rule = await session.get(ChannelCommentRule, comment_run.rule_id)
+                    comment_message = await session.scalar(
+                        select(ChannelCommentMessage).where(
+                            ChannelCommentMessage.run_id == comment_run.id,
+                            ChannelCommentMessage.message_id == task.message_id,
+                        )
+                    )
             else:
                 campaign = await session.get(Campaign, task.campaign_id)
                 target = await session.get(Target, task.target_id)
@@ -304,6 +312,14 @@ class ReactionWorker:
                     ReactionTaskStatus.SKIPPED,
                     "context is missing",
                     "reaction_context_missing",
+                )
+            elif is_comment and (
+                comment_message is not None and comment_message.status == "missing"
+            ):
+                terminal = (
+                    ReactionTaskStatus.SKIPPED,
+                    "source comment is confirmed missing",
+                    "comment_missing",
                 )
             elif is_comment and (
                 not comment_rule.enabled
@@ -385,6 +401,18 @@ class ReactionWorker:
                     channel_post_id=int(comment_run.source_post_id),
                     message_id=task.message_id,
                     emoji=task.emoji,
+                    **(
+                        {
+                            "expected_discussion_peer_id": (
+                                comment_message.discussion_peer_id
+                                if comment_message is not None
+                                else None
+                            ),
+                            "expected_thread_root_message_id": comment_run.thread_root_message_id,
+                        }
+                        if getattr(self._gateway, "supports_channel_comment_dispatch_hook", False)
+                        else {}
+                    ),
                 )
             else:
                 assert target is not None

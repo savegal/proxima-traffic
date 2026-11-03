@@ -4412,6 +4412,21 @@ async def confirm_mtproto_feed_sync(
             answer=False,
         )
         return
+    except Exception as exc:  # noqa: BLE001 - show a safe error, not secret-bearing traces
+        logger.warning("MTProto feed sync failed (%s)", type(exc).__name__)
+        await _edit_callback(
+            callback,
+            "<b>× Не удалось обновить MTProto-пул.</b>\n\n"
+            "Внутренняя ошибка проверки. Существующие назначения сохранены. "
+            "Повторите позже или проверьте журнал сервиса.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="‹ К прокси", callback_data="menu:proxies:0")]
+                ]
+            ),
+            answer=False,
+        )
+        return
     page = await proxy_service.list_proxies(0, PAGE_SIZE)
     report = (
         f"✓ <b>Проверка канала завершена.</b>\n"

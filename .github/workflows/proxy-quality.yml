@@ -47,3 +47,7 @@ jobs:
           pytest -q tests/test_proxy_management.py
           tests/test_proxy_paste.py
           tests/test_proxy_reliability.py
+      - name: Related Telegram gateway transport safety checks
+        run: |
+          pytest -q tests/test_telegram_safety.py \
+            -k "required_proxy_outage_is_retryable or cached_client_rechecks_its_proxy_before_reuse_when_due or client_connect_rpc_failure_is_normalized_and_client_is_closed"

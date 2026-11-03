@@ -26,7 +26,7 @@ In the bot open **Прокси → Свежие из канала → Подкл
 - The operator explicitly confirms the action before any account joins `@ProxyMTProto`.
 - One already-authorised, owned, active Telegram account with a **working assigned proxy** is selected. The bot does not connect directly to bootstrap itself and does not join using every account.
 - The service checks membership and joins the public channel only when necessary, then reads the most recent messages through the existing account operation locks.
-- Telegram text-link entities are inspected; untrusted prose, duplicate links, unsupported `ee` routes, private IPs and stale messages are excluded.
+- Telegram text-link entities are inspected; untrusted prose, duplicate links, unsupported `ee` routes, private IPs and stale messages are excluded. For hostnames, DNS answers are checked for public/global reachability and a public IP is pinned into the saved route before the probe. This avoids DNS rebinding to internal hosts; feed DNS lookups are local to the server and do not use a Telegram account's proxy.
 - Only a bounded number of candidates are probed. Healthy endpoints are imported into group `MTProto · ProxyMTProto`; existing duplicates are rechecked.
 - Manually disabled endpoints are not re-enabled by channel refresh.
 - The public feed is retained as a bounded backup: keep the newest `PROXIMA_MTPROTO_FEED_POOL_LIMIT` enabled/unassigned entries (default 120). Older unassigned entries are deleted only from the dedicated feed group. Assigned endpoints and manually disabled entries are always preserved.

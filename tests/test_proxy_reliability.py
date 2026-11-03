@@ -1,6 +1,7 @@
 """Proxy failover/MTProto feed regression tests: all network calls are faked."""
 
 import asyncio
+import socket
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -189,7 +190,12 @@ async def test_feed_imports_only_verified_recent_public_mtproto(app, monkeypatch
             None, None if host == "working.example.org" else "offline"
         )
 
+    async def simulate_public_resolution(item):
+        return item
+
     monkeypatch.setattr(source, "_read_recent_messages", fake_messages)
+    # Import workflow is tested separately from live DNS resolution below.
+    monkeypatch.setattr(source, "_resolve_public_candidate", simulate_public_resolution)
     monkeypatch.setattr(service, "_probe_mtproto_proxy", fake_probe)
     first = await source.sync()
     assert first.account_id == 18
@@ -413,3 +419,32 @@ async def test_public_feed_pruning_preserves_assigned_disabled_and_latest(app, m
         ids = set(await session.scalars(select(ProxyEndpoint.id)))
     assert ids == {stored[0], stored[1], stored[3], stored[4]}
     assert await manager._prune_unassigned_feed_proxies(actor="test") == 0
+
+
+@pytest.mark.asyncio
+async def test_public_feed_pins_public_ip_and_rejects_private_dns(app, monkeypatch):
+    service = app.state.proxy_service
+    reader = MTProtoFeedService(
+        app.state.database.session_factory, app.state.account_service,
+        service, service._settings,
+    )
+    url = f"tg://proxy?server=untrusted.example.org&port=443&secret={DD}"
+    candidate = (url, parse_proxy(url))
+    loop = asyncio.get_running_loop()
+
+    async def private_dns(host, port, *, type):
+        assert type == socket.SOCK_STREAM
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.5.0.12", port))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", private_dns)
+    assert await reader._resolve_public_candidate(candidate) is None
+
+    async def public_dns(host, port, *, type):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", public_dns)
+    safe = await reader._resolve_public_candidate(candidate)
+    assert safe is not None
+    assert safe[1].host == "8.8.8.8"
+    assert "untrusted.example.org" not in safe[0]
+    assert "8.8.8.8" in safe[0]

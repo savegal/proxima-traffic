@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import socket
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -129,8 +131,31 @@ class MTProtoFeedService:
                     unsupported += 1
                     continue
                 supported.append((url, parsed))
-            candidates = supported[: self._settings.mtproto_feed_max_candidates]
             semaphore = asyncio.Semaphore(4)
+            # Treat the public channel as untrusted input. Resolve hostnames,
+            # reject any private/non-global answers and pin a public IP before
+            # the transport probe to avoid DNS rebinding between checks.
+            async def resolve_candidate(
+                item: tuple[str, ParsedProxy],
+            ) -> tuple[str, ParsedProxy] | None:
+                async with semaphore:
+                    return await self._resolve_public_candidate(item)
+
+            resolved = await asyncio.gather(
+                *(
+                    resolve_candidate(item)
+                    for item in supported[: self._settings.mtproto_feed_max_candidates * 3]
+                )
+            )
+            candidates: list[tuple[str, ParsedProxy]] = []
+            seen_resolved: set[str] = set()
+            for item in resolved:
+                if item is None or item[1].fingerprint in seen_resolved:
+                    continue
+                seen_resolved.add(item[1].fingerprint)
+                candidates.append(item)
+                if len(candidates) >= self._settings.mtproto_feed_max_candidates:
+                    break
 
             async def check(
                 item: tuple[str, ParsedProxy],
@@ -186,6 +211,38 @@ class MTProtoFeedService:
                 unsupported_fake_tls=unsupported,
                 pruned=pruned,
             )
+
+    async def _resolve_public_candidate(
+        self, item: tuple[str, ParsedProxy],
+    ) -> tuple[str, ParsedProxy] | None:
+        """Pin a global IP so a hostile DNS name cannot rebind to localhost."""
+        _, parsed = item
+        if _unsafe_feed_host(parsed.host):
+            return None
+        try:
+            address = ipaddress.ip_address(parsed.host)
+            addresses = [address]
+        except ValueError:
+            try:
+                answers = await asyncio.wait_for(
+                    asyncio.get_running_loop().getaddrinfo(
+                        parsed.host, parsed.port, type=socket.SOCK_STREAM,
+                    ),
+                    timeout=3,
+                )
+                addresses = [
+                    ipaddress.ip_address(info[4][0]) for info in answers
+                ]
+            except (OSError, ValueError, TimeoutError):
+                return None
+        if not addresses or any(not address.is_global for address in addresses):
+            return None
+        selected = sorted(addresses, key=lambda address: address.version)[0]
+        safe_url = (
+            f"tg://proxy?server={quote(str(selected), safe='')}"
+            f"&port={parsed.port}&secret={parsed.password}"
+        )
+        return safe_url, parse_proxy(safe_url)
 
     async def _prune_unassigned_feed_proxies(self, *, actor: str) -> int:
         """Bound the public feed without deleting assigned or disabled endpoints.

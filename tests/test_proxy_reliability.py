@@ -25,10 +25,7 @@ from proxima_traffic.proxies import (
     mtproto_connection_type,
     parse_proxy,
 )
-from proxima_traffic.proxy_feed import (
-    MTProtoFeedService,
-    _unsafe_feed_host,
-)
+from proxima_traffic.proxy_feed import MTProtoFeedService, _unsafe_feed_host
 from proxima_traffic.services import ConflictError
 
 

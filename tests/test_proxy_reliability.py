@@ -150,6 +150,7 @@ async def test_confirmed_slow_route_can_switch_only_to_faster_verified_route(app
 async def test_feed_imports_only_verified_recent_public_mtproto(app, monkeypatch):
     settings = app.state.proxy_service._settings
     monkeypatch.setattr(settings, "dry_run", False)
+    monkeypatch.setattr(settings, "account_require_proxy", True)
     service = app.state.proxy_service
     source = MTProtoFeedService(
         app.state.database.session_factory, app.state.account_service, service, settings
@@ -210,6 +211,7 @@ async def test_feed_imports_only_verified_recent_public_mtproto(app, monkeypatch
 async def test_feed_refuses_to_open_direct_connection(app, monkeypatch):
     settings = app.state.proxy_service._settings
     monkeypatch.setattr(settings, "dry_run", False)
+    monkeypatch.setattr(settings, "account_require_proxy", True)
     feed = MTProtoFeedService(
         app.state.database.session_factory, app.state.account_service,
         app.state.proxy_service, settings,

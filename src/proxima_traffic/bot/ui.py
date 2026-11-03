@@ -34,6 +34,13 @@ _EXACT_BUTTON_LABELS = {
     "⏮": "«",
     "⏭": "»",
     "‹": "‹",
+    "📖 Теггинг в историях": "◇ Теггинг историй",
+    "👀 Просмотр и реакции": "◉ Просмотр историй",
+    "📋 Список кампаний": "≡ Список кампаний",
+    "🗑 Удалить": "× Удалить",
+    "❌ Отмена": "× Отменить",
+    "✅ Подтвердить": "✓ Подтвердить",
+    "⏸ Приостановить": "Ⅱ Приостановить",
     "›": "›",
 }
 
@@ -139,7 +146,7 @@ def _button_style(button: InlineKeyboardButton) -> str | None:
 def screen_title(title: str, subtitle: str | None = None) -> str:
     """Show a clear heading and supporting copy; inputs are trusted HTML."""
 
-    heading = f"<b>{title}</b>"
+    heading = f"<b>▸ {title}</b>"
     return f"{heading}\n{subtitle}" if subtitle else heading
 
 
@@ -164,7 +171,7 @@ def page_summary(total: int, page: int, page_size: int) -> str:
 def section(title: str) -> str:
     """Make information groups scannable without decorative separators."""
 
-    return f"<b>{title}</b>"
+    return f"<b>▫ {title}</b>"
 
 
 def profile_symbol(key: str) -> str:

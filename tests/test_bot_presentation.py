@@ -3,10 +3,22 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from proxima_traffic.bot.channel_comment_ui import channel_comment_details_text
-from proxima_traffic.bot.keyboards import main_menu, order_engagement_menu
-from proxima_traffic.bot.ui import polish_markup
+from proxima_traffic.bot.keyboards import account_details_menu, main_menu, order_engagement_menu
+from proxima_traffic.bot.story_tagging_ui import story_home_keyboard
+from proxima_traffic.bot.story_viewer_ui import (
+    story_viewer_emoji_keyboard,
+    story_viewer_home_keyboard,
+    story_viewer_reaction_keyboard,
+)
+from proxima_traffic.bot.ui import polish_markup, screen_title, section
 from proxima_traffic.channel_comments import ChannelCommentRuleView
-from proxima_traffic.models import ChannelCommentMode, ChannelCommentRule
+from proxima_traffic.models import (
+    Account,
+    AccountSessionSource,
+    AccountStatus,
+    ChannelCommentMode,
+    ChannelCommentRule,
+)
 
 
 def test_main_menu_exposes_every_workflow_without_decorative_buttons() -> None:
@@ -35,8 +47,8 @@ def test_main_menu_exposes_every_workflow_without_decorative_buttons() -> None:
     assert all(len(row) <= 2 for row in menu.inline_keyboard)
     assert menu.inline_keyboard[0][0].text == "＋ Новая рассылка в чаты"
     story_labels = {
-        "story:home": "📖 Теггинг в историях",
-        "story_view:home": "👀 Просмотр и реакции",
+        "story:home": "◇ Теггинг историй",
+        "story_view:home": "◉ Просмотр историй",
     }
     assert {
         button.callback_data: button.text
@@ -48,7 +60,6 @@ def test_main_menu_exposes_every_workflow_without_decorative_buttons() -> None:
         ord(character) >= 0x1F300
         for row in menu.inline_keyboard
         for button in row
-        if button.callback_data not in story_labels
         for character in button.text
     )
 
@@ -176,3 +187,47 @@ def test_navigation_detection_does_not_merge_named_actions() -> None:
     assert [button.callback_data for row in rendered.inline_keyboard for button in row] == [
         button.callback_data for button in source.inline_keyboard[0]
     ]
+
+
+def test_headings_and_sections_share_the_same_quiet_visual_hierarchy() -> None:
+    assert screen_title("Proxima Traffic") == "<b>▸ Proxima Traffic</b>"
+    assert screen_title("Аккаунты", "Все").splitlines() == ["<b>▸ Аккаунты</b>", "Все"]
+    assert section("Профиль Telegram") == "<b>▫ Профиль Telegram</b>"
+
+
+def test_story_menus_use_symbols_but_keep_real_reaction_choices() -> None:
+    for menu in (
+        story_home_keyboard(),
+        story_viewer_home_keyboard(),
+        story_viewer_reaction_keyboard(),
+    ):
+        assert not any(
+            ord(char) >= 0x1F300
+            for row in menu.inline_keyboard
+            for button in row
+            for char in button.text
+        )
+
+    reactions = {
+        button.callback_data: button.text
+        for row in story_viewer_emoji_keyboard().inline_keyboard
+        for button in row
+    }
+    assert "🔥" in reactions["story_view:emoji:🔥"]
+    assert "👍" in reactions["story_view:emoji:👍"]
+    assert "🎉" in reactions["story_view:emoji:🎉"]
+
+
+def test_account_profile_fields_form_clear_edit_groups() -> None:
+    account = Account(
+        id=42,
+        label="Example",
+        status=AccountStatus.ACTIVE,
+        session_source=AccountSessionSource.SESSION_STRING,
+    )
+    rows = [
+        [button.callback_data for button in row]
+        for row in account_details_menu(account, 0, has_proxy=False).inline_keyboard
+    ]
+    assert ["account:name:edit:42:0", "account:username:edit:42:0"] in rows
+    assert ["account:avatar:menu:42:0", "account:about:edit:42:0"] in rows

@@ -93,8 +93,8 @@ def test_account_menu_visually_separates_navigation_checks_profile_and_import() 
 
     assert not any(button.callback_data == "noop" for row in menu.inline_keyboard for button in row)
     assert ["Все", "Группы"] in rows
-    assert ["⇄ Имена", "Описания"] in rows
-    assert ["↓ Импорт", "＋ Без сессии"] in rows
+    assert ["⇄ Имена", "✎ Описания"] in rows
+    assert ["⇣ Импорт", "＋ Без сессии"] in rows
 
 
 def test_account_group_member_picker_and_details_have_safe_callbacks() -> None:

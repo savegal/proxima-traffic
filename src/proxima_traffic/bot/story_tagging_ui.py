@@ -67,7 +67,7 @@ def story_tagging_home_text(dashboard: StoryTaggingDashboard) -> str:
     )
     lines = [
         screen_title(
-            "📖 Теггинг в историях Telegram",
+            "◇ Теггинг в историях Telegram",
             "Публикация историй с отметками людей из базы подписчиков",
         ),
         "",
@@ -96,7 +96,7 @@ def story_home_keyboard() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text="📋 Список кампаний",
+            text="≡ Список кампаний",
             callback_data="story:list:0",
         )
     )
@@ -114,16 +114,16 @@ def story_list_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for camp in campaigns:
-        status_emoji = (
-            "🟢"
+        status_symbol = (
+            "●"
             if camp.status == StoryCampaignStatus.ACTIVE
-            else "⏸"
+            else "Ⅱ"
             if camp.status == StoryCampaignStatus.PAUSED
-            else "🏁"
+            else "✓"
         )
         builder.row(
             InlineKeyboardButton(
-                text=f"{status_emoji} {camp.name} ({camp.succeeded_tasks} историй)",
+                text=f"{status_symbol} {camp.name} ({camp.succeeded_tasks} историй)",
                 callback_data=f"story:view:{camp.id}",
             )
         )
@@ -150,15 +150,15 @@ def story_list_keyboard(
 
 def story_campaign_text(campaign: StoryTaggingCampaignView) -> str:
     status_ru = {
-        StoryCampaignStatus.ACTIVE: "🟢 Активна (публикуется)",
-        StoryCampaignStatus.PAUSED: "⏸ Приостановлена",
-        StoryCampaignStatus.COMPLETED: "🏁 Завершена",
-        StoryCampaignStatus.DRAFT: "📝 Черновик",
+        StoryCampaignStatus.ACTIVE: "● Активна (публикуется)",
+        StoryCampaignStatus.PAUSED: "Ⅱ Приостановлена",
+        StoryCampaignStatus.COMPLETED: "✓ Завершена",
+        StoryCampaignStatus.DRAFT: "✎ Черновик",
     }.get(campaign.status, str(campaign.status))
 
     lines = [
         screen_title(
-            f"Кампания: {campaign.name}",
+            f"Кампания: {escape(campaign.name)}",
             f"Статус: {status_ru}",
         ),
         "",
@@ -193,7 +193,7 @@ def story_campaign_text(campaign: StoryTaggingCampaignView) -> str:
         lines.extend(["", section("Текст / подпись"), f"<i>{escape(preview)}</i>"])
 
     if campaign.last_story_url:
-        lines.extend(["", f"🔗 Последняя история: {campaign.last_story_url}"])
+        lines.extend(["", f"↗ Последняя история: {campaign.last_story_url}"])
 
     return "\n".join(lines)
 
@@ -204,7 +204,7 @@ def story_campaign_keyboard(campaign: StoryTaggingCampaignView) -> InlineKeyboar
     if campaign.status == StoryCampaignStatus.ACTIVE:
         builder.row(
             InlineKeyboardButton(
-                text="⏸ Приостановить",
+                text="Ⅱ Приостановить",
                 callback_data=f"story:pause:{campaign.id}",
             )
         )
@@ -217,8 +217,8 @@ def story_campaign_keyboard(campaign: StoryTaggingCampaignView) -> InlineKeyboar
         )
 
     builder.row(
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"story:view:{campaign.id}"),
-        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"story:delete:{campaign.id}"),
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"story:view:{campaign.id}"),
+        InlineKeyboardButton(text="× Удалить", callback_data=f"story:delete:{campaign.id}"),
     )
     builder.row(
         InlineKeyboardButton(text="« К списку кампаний", callback_data="story:list:0"),
@@ -233,7 +233,7 @@ def story_select_list_keyboard(
     for sub_list in lists[:20]:
         builder.row(
             InlineKeyboardButton(
-                text=f"📁 {sub_list.name} ({sub_list.member_count:,} чел.)",
+                text=f"▤ {sub_list.name} ({sub_list.member_count:,} чел.)",
                 callback_data=f"story:set_list:{sub_list.id}",
             )
         )
@@ -277,11 +277,11 @@ def story_confirm_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="🚀 Запустить теггинг",
+            text="▶ Запустить теггинг",
             callback_data="story:confirm:launch",
         )
     )
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="story:cancel"))
+    builder.row(InlineKeyboardButton(text="× Отмена", callback_data="story:cancel"))
     return polish_markup(builder.as_markup())
 
 
@@ -450,7 +450,7 @@ async def handle_story_list(
     dashboard = await story_tagging.get_dashboard()
 
     lines = [
-        screen_title("📋 Кампании теггинга в историях"),
+        screen_title("≡ Кампании теггинга в историях"),
         "",
         f"Всего кампаний: <b>{dashboard.campaign_count}</b>"
         f" (активных: {dashboard.active_campaign_count})",
@@ -490,7 +490,7 @@ async def handle_story_pause(
     campaign_id = int(callback.data.split(":")[-1])
     success = await story_tagging.pause_campaign(campaign_id)
     await _safe_callback_answer(
-        callback, "Кампания приостановлена ⏸" if success else "Кампания уже не активна"
+        callback, "Кампания приостановлена Ⅱ" if success else "Кампания уже не активна"
     )
     campaign = await story_tagging.get_campaign(campaign_id)
     if campaign is not None:
@@ -527,11 +527,11 @@ async def handle_story_delete(
     except ValueError as exc:
         await _safe_callback_answer(callback, str(exc), show_alert=True)
         return
-    await _safe_callback_answer(callback, "Кампания удалена 🗑")
+    await _safe_callback_answer(callback, "Кампания удалена ×")
     # Redirect to list
     campaigns = await story_tagging.list_campaigns(limit=PAGE_SIZE, offset=0)
     dashboard = await story_tagging.get_dashboard()
-    text = "📋 <b>Кампании теггинга</b>\n\nКампания успешно удалена."
+    text = "≡ <b>Кампании теггинга</b>\n\nКампания успешно удалена."
     keyboard = story_list_keyboard(campaigns, 0, dashboard.campaign_count)
     await _edit_screen(callback, text, keyboard)
 
@@ -733,7 +733,7 @@ async def process_story_total_choice(
     stories_needed = max(1, (total_tags + tags_per_story - 1) // tags_per_story)
 
     lines = [
-        screen_title("🚀 Подтверждение запуска теггинга"),
+        screen_title("▶ Подтверждение запуска теггинга"),
         "",
         f"• Название: <b>{escape(data.get('name', 'Теггинг'))}</b>",
         f"• База: <b>{escape(data.get('list_name', ''))}</b>",
@@ -781,13 +781,13 @@ async def process_story_launch(
         await _safe_callback_answer(callback, "Ошибка при создании")
         await _edit_screen(
             callback,
-            f"❌ <b>Не удалось создать кампанию</b>: {escape(str(exc))}",
+            f"× <b>Не удалось создать кампанию</b>: {escape(str(exc))}",
             story_home_keyboard(),
         )
         return
 
     await state.clear()
-    await _safe_callback_answer(callback, "Кампания успешно запущена! 🚀")
-    text = f"✅ <b>Кампания теггинга запущена!</b>\n\n{story_campaign_text(campaign)}"
+    await _safe_callback_answer(callback, "Кампания успешно запущена! ▶")
+    text = f"✓ <b>Кампания теггинга запущена!</b>\n\n{story_campaign_text(campaign)}"
     keyboard = story_campaign_keyboard(campaign)
     await _edit_screen(callback, text, keyboard)

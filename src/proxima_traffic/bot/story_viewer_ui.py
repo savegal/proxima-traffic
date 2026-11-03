@@ -71,13 +71,13 @@ def story_viewer_home_text(dashboard: StoryViewerDashboard) -> str:
     )
     lines = [
         screen_title(
-            "👀 Просмотр и реакции на истории",
+            "◉ Просмотр и реакции на истории",
             "Массовый просмотр историй и реакции из базы подписчиков",
         ),
         "",
-        "Просмотр активных историй из базы с настраиваемыми задержками и реакциями. "
-        "Уведомления о реакциях зависят от настроек Telegram получателя. "
-        "что привлекает целевой трафик на ваш профиль.",
+        "Просмотр историй пользователей из выбранной базы с настраиваемыми "
+        "интервалами и реакциями. Доступ к историям и уведомления "
+        "зависят от настроек приватности Telegram.",
         "",
         section("Статистика просмотров"),
         f"• Активных кампаний: <b>{dashboard.active_campaign_count}</b>"
@@ -102,7 +102,7 @@ def story_viewer_home_keyboard() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text="📋 Список кампаний",
+            text="≡ Список кампаний",
             callback_data="story_view:list:0",
         )
     )
@@ -120,17 +120,17 @@ def story_viewer_list_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for camp in campaigns:
-        status_emoji = (
-            "🟢"
+        status_symbol = (
+            "●"
             if camp.status == StoryViewerCampaignStatus.ACTIVE
-            else "⏸"
+            else "Ⅱ"
             if camp.status == StoryViewerCampaignStatus.PAUSED
-            else "🏁"
+            else "✓"
         )
         builder.row(
             InlineKeyboardButton(
                 text=(
-                    f"{status_emoji} {camp.name} ({camp.stories_viewed} 👀, "
+                    f"{status_symbol} {camp.name} ({camp.stories_viewed} просм., "
                     f"{camp.reactions_sent} {camp.reaction_emoji})"
                 ),
                 callback_data=f"story_view:view:{camp.id}",
@@ -160,15 +160,15 @@ def story_viewer_campaign_text(campaign: StoryViewerCampaignView) -> str:
     reaction = f"Да ({escape(campaign.reaction_emoji)})" if campaign.send_reaction else "Нет"
     checked = campaign.succeeded_tasks + campaign.skipped_tasks + campaign.failed_tasks
     status_ru = {
-        StoryViewerCampaignStatus.ACTIVE: "🟢 Активна (просматривается)",
-        StoryViewerCampaignStatus.PAUSED: "⏸ Приостановлена",
-        StoryViewerCampaignStatus.COMPLETED: "🏁 Завершена",
-        StoryViewerCampaignStatus.DRAFT: "📝 Черновик",
+        StoryViewerCampaignStatus.ACTIVE: "● Активна (просматривается)",
+        StoryViewerCampaignStatus.PAUSED: "Ⅱ Приостановлена",
+        StoryViewerCampaignStatus.COMPLETED: "✓ Завершена",
+        StoryViewerCampaignStatus.DRAFT: "✎ Черновик",
     }.get(campaign.status, str(campaign.status))
 
     lines = [
         screen_title(
-            f"Кампания: {campaign.name}",
+            f"Кампания: {escape(campaign.name)}",
             f"Статус: {status_ru}",
         ),
         "",
@@ -201,7 +201,7 @@ def story_viewer_campaign_text(campaign: StoryViewerCampaignView) -> str:
         lines.append(section(f"Аккаунты в кампании ({len(campaign.accounts)} шт.)"))
         now = utc_now()
         for a in campaign.accounts[:12]:
-            badge = "🔴" if a.is_paused else ("⏸" if not a.enabled else "🟢")
+            badge = "×" if a.is_paused else ("Ⅱ" if not a.enabled else "●")
             label = a.label or a.phone
             cooldown = ""
             until = ensure_utc(a.cooldown_until)
@@ -209,8 +209,8 @@ def story_viewer_campaign_text(campaign: StoryViewerCampaignView) -> str:
                 mins = int((until - now).total_seconds() // 60) + 1
                 cooldown = f" <i>(пауза {mins} мин)</i>"
             lines.append(
-                f"• {badge} <b>{escape(label)}</b>: {a.views_today} 👀"
-                f" / {a.reactions_today} ❤️{cooldown}"
+                f"• {badge} <b>{escape(label)}</b>: {a.views_today} просм."
+                f" / {a.reactions_today} реакц.{cooldown}"
             )
         if len(campaign.accounts) > 12:
             lines.append(f"<i>...и ещё {len(campaign.accounts) - 12} аккаунтов</i>")
@@ -224,7 +224,7 @@ def story_viewer_campaign_keyboard(campaign: StoryViewerCampaignView) -> InlineK
     if campaign.status == StoryViewerCampaignStatus.ACTIVE:
         builder.row(
             InlineKeyboardButton(
-                text="⏸ Приостановить",
+                text="Ⅱ Приостановить",
                 callback_data=f"story_view:pause:{campaign.id}",
             )
         )
@@ -238,13 +238,13 @@ def story_viewer_campaign_keyboard(campaign: StoryViewerCampaignView) -> InlineK
 
     builder.row(
         InlineKeyboardButton(
-            text="👥 Аккаунты", callback_data=f"story_view:manage_accs:{campaign.id}"
+            text="≡ Аккаунты", callback_data=f"story_view:manage_accs:{campaign.id}"
         ),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"story_view:view:{campaign.id}"),
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"story_view:view:{campaign.id}"),
     )
     builder.row(
         InlineKeyboardButton(
-            text="🗑 Удалить кампанию", callback_data=f"story_view:delete:{campaign.id}"
+            text="× Удалить кампанию", callback_data=f"story_view:delete:{campaign.id}"
         ),
     )
     builder.row(
@@ -258,11 +258,11 @@ def story_viewer_manage_accs_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for acc in accounts[page * 20 : (page + 1) * 20]:
-        badge = "🟢" if acc.enabled else "⚪"
+        badge = "●" if acc.enabled else "○"
         label = acc.label or acc.phone
         builder.row(
             InlineKeyboardButton(
-                text=f"{badge} {label} ({acc.views_today} 👀)",
+                text=f"{badge} {label} ({acc.views_today} просм.)",
                 callback_data=f"story_view:toggle_acc:{campaign_id}:{acc.account_id}:{page}",
             )
         )
@@ -282,7 +282,7 @@ def story_viewer_select_list_keyboard(
     for sub_list in lists[:20]:
         builder.row(
             InlineKeyboardButton(
-                text=f"📁 {sub_list.name} ({sub_list.member_count:,} чел.)",
+                text=f"▤ {sub_list.name} ({sub_list.member_count:,} чел.)",
                 callback_data=f"story_view:set_list:{sub_list.id}",
             )
         )
@@ -297,13 +297,13 @@ def story_viewer_reaction_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="🔥 Просмотр + Реакция (Рекомендуется)",
+            text="◇ Просмотр + реакция · рекомендуем",
             callback_data="story_view:reaction:yes",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="👀 Только просмотр историй",
+            text="◉ Только просмотр историй",
             callback_data="story_view:reaction:no",
         )
     )
@@ -316,18 +316,18 @@ def story_viewer_reaction_keyboard() -> InlineKeyboardMarkup:
 def story_viewer_emoji_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="🔥 Огонь", callback_data="story_view:emoji:🔥"),
-        InlineKeyboardButton(text="❤️ Сердце", callback_data="story_view:emoji:❤️"),
-        InlineKeyboardButton(text="👍 Лайк", callback_data="story_view:emoji:👍"),
+        InlineKeyboardButton(text="Огонь · 🔥", callback_data="story_view:emoji:🔥"),
+        InlineKeyboardButton(text="Сердце · ❤️", callback_data="story_view:emoji:❤️"),
+        InlineKeyboardButton(text="Лайк · 👍", callback_data="story_view:emoji:👍"),
     )
     builder.row(
-        InlineKeyboardButton(text="⚡ Молния", callback_data="story_view:emoji:⚡"),
-        InlineKeyboardButton(text="🎉 Праздник", callback_data="story_view:emoji:🎉"),
-        InlineKeyboardButton(text="😍 Влюблён", callback_data="story_view:emoji:😍"),
+        InlineKeyboardButton(text="Молния · ⚡", callback_data="story_view:emoji:⚡"),
+        InlineKeyboardButton(text="Праздник · 🎉", callback_data="story_view:emoji:🎉"),
+        InlineKeyboardButton(text="Влюблён · 😍", callback_data="story_view:emoji:😍"),
     )
     builder.row(
         InlineKeyboardButton(
-            text="🎲 Случайная из набора",
+            text="∿ Случайная из набора",
             callback_data="story_view:emoji:random",
         )
     )
@@ -341,25 +341,25 @@ def story_viewer_delays_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="⚡ 3 – 8 сек. (Быстрый)",
+            text="↗ 3–8 сек. · быстрый",
             callback_data="story_view:delay:3:8",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="⚡ 5 – 15 сек. (Оптимальный - Рекомендуется)",
+            text="≈ 5–15 сек. · рекомендуем",
             callback_data="story_view:delay:5:15",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="🛡 10 – 25 сек. (Безопасный)",
+            text="○ 10–25 сек. · плавно",
             callback_data="story_view:delay:10:25",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="🛡 20 – 45 сек. (Максимально плавный)",
+            text="○ 20–45 сек. · плавно+",
             callback_data="story_view:delay:20:45",
         )
     )
@@ -414,13 +414,13 @@ def story_viewer_accounts_pick_keyboard(
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text=f"🚀 Все активные аккаунты ({len(accounts)} шт.)",
+            text=f"▶ Все активные аккаунты ({len(accounts)} шт.)",
             callback_data="story_view:acc:all",
         )
     )
     for acc in accounts[page * 20 : (page + 1) * 20]:
         is_sel = acc.id in selected_ids
-        icon = "🔘" if is_sel else "⚪"
+        icon = "✓" if is_sel else "○"
         label = acc.label or acc.phone
         builder.row(
             InlineKeyboardButton(
@@ -432,7 +432,7 @@ def story_viewer_accounts_pick_keyboard(
     if selected_ids:
         builder.row(
             InlineKeyboardButton(
-                text=f"✅ Подтвердить выбранные ({len(selected_ids)} шт.) »",
+                text=f"✓ Подтвердить выбранные ({len(selected_ids)} шт.) »",
                 callback_data="story_view:acc:done",
             )
         )
@@ -446,7 +446,7 @@ def story_viewer_confirm_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="🚀 Запустить просмотр историй",
+            text="▶ Запустить просмотр историй",
             callback_data="story_view:launch",
         )
     )
@@ -554,7 +554,7 @@ async def handle_story_viewer_list(
     dashboard = await story_viewer.get_dashboard()
 
     lines = [
-        screen_title("📋 Кампании просмотра историй", f"Страница {page + 1}"),
+        screen_title("≡ Кампании просмотра историй", f"Страница {page + 1}"),
         "",
         f"Всего кампаний: <b>{dashboard.campaign_count}</b>"
         f" (активных: {dashboard.active_campaign_count})",
@@ -607,9 +607,9 @@ async def handle_story_viewer_manage_accs(
     accounts = await story_viewer.list_accounts_for_campaign(camp_id)
     page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
     text = (
-        screen_title("👥 Управление аккаунтами кампании")
+        screen_title("≡ Управление аккаунтами кампании")
         + "\n\n"
-        + "Нажмите на аккаунт для включения (🟢) или отключения (⚪):"
+        + "Нажмите на аккаунт для включения (●) или отключения (○):"
     )
     await _edit_screen(callback, text, story_viewer_manage_accs_keyboard(camp_id, accounts, page))
 
@@ -629,9 +629,9 @@ async def handle_story_viewer_toggle_acc(
     await _safe_callback_answer(callback, "Включён" if enabled else "Отключён")
     accounts = await story_viewer.list_accounts_for_campaign(camp_id)
     text = (
-        screen_title("👥 Управление аккаунтами кампании")
+        screen_title("≡ Управление аккаунтами кампании")
         + "\n\n"
-        + "Нажмите на аккаунт для включения (🟢) или отключения (⚪):"
+        + "Нажмите на аккаунт для включения (●) или отключения (○):"
     )
     await _edit_screen(callback, text, story_viewer_manage_accs_keyboard(camp_id, accounts, page))
 
@@ -695,7 +695,7 @@ async def handle_story_viewer_delete(
     campaigns = await story_viewer.list_campaigns(limit=PAGE_SIZE, offset=0)
     dashboard = await story_viewer.get_dashboard()
     lines = [
-        screen_title("📋 Кампании просмотра историй", "Страница 1"),
+        screen_title("≡ Кампании просмотра историй", "Страница 1"),
         "",
         "Кампания успешно удалена.",
     ]
@@ -1160,7 +1160,7 @@ async def handle_story_viewer_launch(
 
     await state.clear()
     text = (
-        screen_title("🚀 Кампания успешно запущена!")
+        screen_title("▶ Кампания успешно запущена!")
         + "\n\n"
         + story_viewer_campaign_text(campaign)
     )

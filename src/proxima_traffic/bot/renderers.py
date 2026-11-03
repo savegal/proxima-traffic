@@ -308,10 +308,16 @@ def dashboard_text(
         operation_state = "Нужно закончить настройку"
     else:
         operation_state = "Всё готово к отправке"
+    operation_symbol = {
+        "Всё готово к отправке": "✓",
+        "Задания выполняются": "↻",
+        "Задания в очереди": "◷",
+        "Очередь выключена · задания не исполняются": "Ⅱ",
+    }.get(operation_state, "!")
     lines = [
         screen_title("Proxima Traffic", mode),
         "",
-        f"<b>{operation_state}</b>",
+        f"{operation_symbol} <b>{operation_state}</b>",
         "",
         section("Сейчас"),
         f"В очереди: <b>{queued}</b> · выполняется: <b>{running}</b>",
@@ -1146,6 +1152,7 @@ def account_details_text(
     if _account_source(account) != "none":
         auth = "авторизован" if getattr(account, "authorized", False) else "не подтверждён"
         lines.append(f"Сессия: <b>{auth}</b>")
+        lines.extend(["", section("Профиль Telegram")])
         full_name = " ".join(
             value
             for value in [

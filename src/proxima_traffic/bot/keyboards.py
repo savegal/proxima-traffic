@@ -48,37 +48,37 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="Запуски в чатах",
+                    text="◷ Запуски",
                     callback_data="menu:runs:0",
                 ),
-                InlineKeyboardButton(text="Рассылки в чатах", callback_data="menu:campaigns:0"),
+                InlineKeyboardButton(text="≡ Рассылки", callback_data="menu:campaigns:0"),
             ],
             [
-                InlineKeyboardButton(text="Автокомментарии", callback_data="comments:home:0"),
-                InlineKeyboardButton(text="Реакции участникам", callback_data="pr:home:0"),
+                InlineKeyboardButton(text="✎ Автокомментарии", callback_data="comments:home:0"),
+                InlineKeyboardButton(text="♡ Реакции участникам", callback_data="pr:home:0"),
             ],
             [
-                InlineKeyboardButton(text="ЛС-рассылки", callback_data="dm:home"),
-                InlineKeyboardButton(text="Приглашения", callback_data="inv:home"),
+                InlineKeyboardButton(text="✉ ЛС-рассылки", callback_data="dm:home"),
+                InlineKeyboardButton(text="⇥ Приглашения", callback_data="inv:home"),
             ],
             [
-                InlineKeyboardButton(text="📖 Теггинг в историях", callback_data="story:home"),
-                InlineKeyboardButton(text="👀 Просмотр и реакции", callback_data="story_view:home"),
+                InlineKeyboardButton(text="◇ Теггинг историй", callback_data="story:home"),
+                InlineKeyboardButton(text="◉ Просмотр историй", callback_data="story_view:home"),
             ],
             [
-                InlineKeyboardButton(text="Чаты и списки", callback_data="audiences:home"),
-                InlineKeyboardButton(text="База подписчиков", callback_data="dm:lists:0"),
+                InlineKeyboardButton(text="☷ Чаты и списки", callback_data="audiences:home"),
+                InlineKeyboardButton(text="▤ База подписчиков", callback_data="dm:lists:0"),
             ],
             [
-                InlineKeyboardButton(text="Аккаунты", callback_data="menu:accounts:0"),
-                InlineKeyboardButton(text="Прокси", callback_data="menu:proxies:0"),
+                InlineKeyboardButton(text="◉ Аккаунты", callback_data="menu:accounts:0"),
+                InlineKeyboardButton(text="⇄ Прокси", callback_data="menu:proxies:0"),
             ],
             [
-                InlineKeyboardButton(text="Шаблоны", callback_data="menu:templates:0"),
-                InlineKeyboardButton(text="Сервис и настройки", callback_data="menu:settings"),
+                InlineKeyboardButton(text="▣ Шаблоны", callback_data="menu:templates:0"),
+                InlineKeyboardButton(text="⚙ Сервис и настройки", callback_data="menu:settings"),
             ],
             [
-                InlineKeyboardButton(text="Как начать", callback_data="menu:guide"),
+                InlineKeyboardButton(text="ℹ Как начать", callback_data="menu:guide"),
                 InlineKeyboardButton(text="↻ Обновить", callback_data="menu:home"),
             ],
         ]
@@ -1467,7 +1467,7 @@ def accounts_menu(
             ),
         ),
         InlineKeyboardButton(
-            text="Группы",
+            text="≡ Группы",
             callback_data=(
                 f"account:groups:{account_filter_callback_code(normalized_filter)}:"
                 f"{scope}:{page.page}"
@@ -1480,7 +1480,7 @@ def accounts_menu(
             callback_data=f"account:check:all:{page.page}",
         ),
         InlineKeyboardButton(
-            text="Проверить @SpamBot",
+            text="⌕ Проверить @SpamBot",
             callback_data=f"account:spambot:all:{page.page}",
         ),
     )
@@ -1490,19 +1490,19 @@ def accounts_menu(
             callback_data="account:names:menu",
         ),
         InlineKeyboardButton(
-            text="Описания",
+            text="✎ Описания",
             callback_data="account:about:bulk",
         ),
     )
     builder.row(
         InlineKeyboardButton(
-            text="Аватары",
+            text="▣ Аватары",
             callback_data="account:avatars:bulk",
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="↓ Импорт",
+            text="⇣ Импорт",
             callback_data=f"account:import:menu:{page.page}",
         ),
         InlineKeyboardButton(text="＋ Без сессии", callback_data="account:add"),
@@ -2051,21 +2051,21 @@ def account_details_menu(
     )
     builder.row(
         InlineKeyboardButton(
-            text="Название в панели",
+            text="✎ Название в панели",
             callback_data=f"account:label:edit:{account.id}:{page}",
         )
     )
     if groups_callback is not None:
         builder.row(
             InlineKeyboardButton(
-                text="Группы аккаунта",
+                text="≡ Группы аккаунта",
                 callback_data=groups_callback,
             )
         )
     if has_session:
         builder.row(
             InlineKeyboardButton(
-                text="Проверить сессию и SpamBot",
+                text="⌕ Сессия и SpamBot",
                 callback_data=f"account:check:{account.id}:{page}",
             )
         )
@@ -2075,25 +2075,25 @@ def account_details_menu(
                 callback_data=f"account:name:edit:{account.id}:{page}",
             ),
             InlineKeyboardButton(
-                text="Имя из базы",
-                callback_data=f"account:name:catalog:{account.id}:{page}",
+                text="✎ @Username",
+                callback_data=f"account:username:edit:{account.id}:{page}",
             ),
         )
         builder.row(
             InlineKeyboardButton(
-                text="Аватар Telegram",
+                text="⇄ Имя из базы",
+                callback_data=f"account:name:catalog:{account.id}:{page}",
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="▣ Аватар",
                 callback_data=f"account:avatar:menu:{account.id}:{page}",
             ),
             InlineKeyboardButton(
-                text="Описание",
+                text="✎ Описание",
                 callback_data=f"account:about:edit:{account.id}:{page}",
             ),
-        )
-        builder.row(
-            InlineKeyboardButton(
-                text="✎ @Username",
-                callback_data=f"account:username:edit:{account.id}:{page}",
-            )
         )
     if has_session:
         proxy_button = InlineKeyboardButton(

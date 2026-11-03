@@ -17,7 +17,6 @@ from proxima_traffic.models import (
     ProxyStatus,
     utc_now,
 )
-from proxima_traffic.proxy_feed import MTProtoFeedService, _unsafe_feed_host
 from proxima_traffic.proxies import (
     ProxyInputError,
     ProxyNetworkRoute,
@@ -26,8 +25,8 @@ from proxima_traffic.proxies import (
     mtproto_connection_type,
     parse_proxy,
 )
+from proxima_traffic.proxy_feed import MTProtoFeedService, _unsafe_feed_host
 from proxima_traffic.services import ConflictError
-
 
 DD = "dd0123456789abcdef0123456789abcdef"
 EE = "ee0123456789abcdef0123456789abcdef6578616d706c652e6f7267"

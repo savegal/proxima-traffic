@@ -506,3 +506,31 @@ async def test_route_recovery_probes_are_bounded_and_reserve_public_backup(
             )
         )
     assert len(public_selected) == 8
+
+
+@pytest.mark.asyncio
+async def test_empty_public_feed_still_prunes_excess_unassigned_entries(
+    app, monkeypatch
+) -> None:
+    settings = app.state.proxy_service._settings
+    monkeypatch.setattr(settings, "dry_run", False)
+    monkeypatch.setattr(settings, "account_require_proxy", True)
+    source = MTProtoFeedService(
+        app.state.database.session_factory, app.state.account_service,
+        app.state.proxy_service, settings,
+    )
+    called = []
+
+    async def messages():
+        return 42, []
+
+    async def prune(*, actor):
+        called.append(actor)
+        return 3
+
+    monkeypatch.setattr(source, "_read_recent_messages", messages)
+    monkeypatch.setattr(source, "_prune_unassigned_feed_proxies", prune)
+    result = await source.sync(actor="audit-test")
+    assert result.responsive == 0
+    assert result.pruned == 3
+    assert called == ["audit-test"]

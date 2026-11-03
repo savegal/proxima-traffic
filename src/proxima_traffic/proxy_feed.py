@@ -170,9 +170,12 @@ class MTProtoFeedService:
             responses = await asyncio.gather(*(check(item) for item in candidates))
             responsive = [item for item in responses if item is not None]
             if not responsive:
+                # An all-dead feed still needs its retention policy enforced.
+                # Otherwise stale public entries accumulate indefinitely.
+                pruned = await self._prune_unassigned_feed_proxies(actor=actor)
                 return ProxyFeedResult(
                     account_id, len(messages), len(links), len(candidates),
-                    0, 0, 0, 0, unsupported,
+                    0, 0, 0, 0, unsupported, pruned=pruned,
                 )
 
             imported = await self._proxies.import_proxies(

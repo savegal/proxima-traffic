@@ -1744,6 +1744,13 @@ class ProxyService:
                 client.connect(),
                 timeout=self._settings.proxy_check_timeout_seconds,
             )
+            if not client.is_connected():
+                return _ProxyProbeResult(
+                    healthy=False,
+                    latency_ms=None,
+                    observed_ip=None,
+                    error="MTProto-транспорт не подтвердил соединение с Telegram",
+                )
             return _ProxyProbeResult(
                 healthy=True,
                 latency_ms=round((time.perf_counter() - started) * 1000),

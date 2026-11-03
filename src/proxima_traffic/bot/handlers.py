@@ -4422,7 +4422,8 @@ async def confirm_mtproto_feed_sync(
         f"Ответили при предварительной проверке: <b>{result.responsive}</b>\n"
         f"Добавлено: <b>{result.added}</b> · существующих: <b>{result.reused}</b>\n"
         f"Подтверждено в пуле: <b>{result.healthy_after_save}</b>\n"
-        f"Fake-TLS пропущено: <b>{result.unsupported_fake_tls}</b>\n\n"
+        f"Fake-TLS пропущено: <b>{result.unsupported_fake_tls}</b>\n"
+        f"Старых свободных адресов очищено: <b>{result.pruned}</b>\n\n"
     )
     await _edit_callback(
         callback, report + proxies_text(page), proxies_menu(page), answer=False

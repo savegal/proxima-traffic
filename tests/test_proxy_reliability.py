@@ -383,3 +383,33 @@ async def test_default_pool_prefers_owned_proxy_over_public_feed(app, monkeypatc
         "test-public-slot", group_name=PUBLIC_MTPROTO_GROUP
     )
     assert explicitly_public.proxy.id == public.proxy.id
+
+
+@pytest.mark.asyncio
+async def test_public_feed_pruning_preserves_assigned_disabled_and_latest(app, monkeypatch):
+    service = app.state.proxy_service
+    monkeypatch.setattr(service._settings, "mtproto_feed_pool_limit", 2)
+
+    async def good_proxy(host, port, secret):
+        return _ProxyProbeResult(True, 30, None, None)
+
+    monkeypatch.setattr(service, "_probe_mtproto_proxy", good_proxy)
+    stored = []
+    for n in range(5):
+        entry = await service.add_proxy(
+            f"tg://proxy?server=feed-proxy-{n}.example.org&port=443&secret={DD}",
+            group_name=PUBLIC_MTPROTO_GROUP,
+        )
+        stored.append(entry.proxy.id)
+    await service.assign_proxy(stored[0], "reserved-feed-slot")
+    await service.toggle_proxy(stored[1])
+
+    manager = MTProtoFeedService(
+        app.state.database.session_factory, app.state.account_service,
+        service, service._settings,
+    )
+    assert await manager._prune_unassigned_feed_proxies(actor="test") == 1
+    async with app.state.database.session_factory() as session:
+        ids = set(await session.scalars(select(ProxyEndpoint.id)))
+    assert ids == {stored[0], stored[1], stored[3], stored[4]}
+    assert await manager._prune_unassigned_feed_proxies(actor="test") == 0

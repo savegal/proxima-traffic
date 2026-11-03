@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     mtproto_feed_interval_seconds: int = 3600
     mtproto_feed_max_messages: int = 60
     mtproto_feed_max_candidates: int = 20
+    mtproto_feed_pool_limit: int = 120
     account_encryption_key: SecretStr | None = None
     telegram_api_id: int | None = None
     telegram_api_hash: SecretStr | None = None
@@ -472,6 +473,8 @@ class Settings(BaseSettings):
             raise ValueError("PROXIMA_MTPROTO_FEED_MAX_MESSAGES must be 5..100")
         if not 1 <= self.mtproto_feed_max_candidates <= 40:
             raise ValueError("PROXIMA_MTPROTO_FEED_MAX_CANDIDATES must be 1..40")
+        if not 20 <= self.mtproto_feed_pool_limit <= 1000:
+            raise ValueError("PROXIMA_MTPROTO_FEED_POOL_LIMIT must be 20..1000")
         if self.channel_comments_poll_seconds <= 0:
             raise ValueError("PROXIMA_CHANNEL_COMMENTS_POLL_SECONDS must be positive")
         if not 15 <= self.channel_comments_scan_interval_seconds <= 3600:

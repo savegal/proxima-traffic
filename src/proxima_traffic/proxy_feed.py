@@ -14,14 +14,16 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxima_traffic.models import (
     Account,
     AccountSessionSource,
     AccountStatus,
+    ProxyAssignment,
     ProxyEndpoint,
+    ProxyGroup,
     ProxyProtocol,
     ProxyStatus,
     ensure_utc,
@@ -35,7 +37,7 @@ from proxima_traffic.proxies import (
     parse_proxy,
     proxy_import_values,
 )
-from proxima_traffic.services import ConflictError
+from proxima_traffic.services import ConflictError, add_audit_event
 
 if TYPE_CHECKING:
     from proxima_traffic.accounts import AccountService
@@ -58,6 +60,7 @@ class ProxyFeedResult:
     reused: int
     healthy_after_save: int
     unsupported_fake_tls: int
+    pruned: int = 0
 
 
 class MTProtoFeedService:
@@ -170,6 +173,7 @@ class MTProtoFeedService:
                         return False
 
             checked = await asyncio.gather(*(record(int(pid)) for pid in ids))
+            pruned = await self._prune_unassigned_feed_proxies(actor=actor)
             return ProxyFeedResult(
                 account_id=account_id,
                 messages_read=len(messages),
@@ -180,7 +184,77 @@ class MTProtoFeedService:
                 reused=imported.skipped,
                 healthy_after_save=sum(checked),
                 unsupported_fake_tls=unsupported,
+                pruned=pruned,
             )
+
+    async def _prune_unassigned_feed_proxies(self, *, actor: str) -> int:
+        """Bound the public feed without deleting assigned or disabled endpoints.
+
+        This group is reserved for auto-imported feed entries. Other proxy
+        groups, account slots and manually disabled addresses are untouched.
+        The final DELETE checks assignments again to avoid a concurrent bind.
+        """
+        async with self._session_factory() as session:
+            group = await session.scalar(
+                select(ProxyGroup).where(ProxyGroup.name == GROUP)
+            )
+            if group is None:
+                return 0
+            rows = list(
+                (
+                    await session.execute(
+                        select(ProxyEndpoint.id, ProxyEndpoint.enabled)
+                        .where(ProxyEndpoint.group_id == group.id)
+                        .order_by(ProxyEndpoint.created_at.desc(), ProxyEndpoint.id.desc())
+                    )
+                ).all()
+            )
+            assigned_ids = set(
+                await session.scalars(
+                    select(ProxyAssignment.proxy_id)
+                    .join(ProxyEndpoint, ProxyEndpoint.id == ProxyAssignment.proxy_id)
+                    .where(ProxyEndpoint.group_id == group.id)
+                )
+            )
+            # Retain the newest N *usable/unassigned* entries. Assigned routes
+            # and disabled entries are outside the quota and are never deleted.
+            available = [
+                int(proxy_id) for proxy_id, enabled in rows
+                if enabled and proxy_id not in assigned_ids
+            ]
+            removable = available[self._settings.mtproto_feed_pool_limit:]
+            if not removable:
+                return 0
+            removed = 0
+            # Small batches avoid SQLite's parameter limit on big old pools.
+            for start in range(0, len(removable), 400):
+                batch = removable[start:start + 400]
+                result = await session.execute(
+                    delete(ProxyEndpoint)
+                    .where(
+                        ProxyEndpoint.id.in_(batch),
+                        ProxyEndpoint.group_id == group.id,
+                        ProxyEndpoint.enabled.is_(True),
+                        ~exists().where(
+                            ProxyAssignment.proxy_id == ProxyEndpoint.id
+                        ),
+                    )
+                )
+                removed += int(result.rowcount or 0)
+            if removed:
+                add_audit_event(
+                    session,
+                    event_type="proxy.feed_pruned",
+                    entity_type="proxy_group",
+                    entity_id=group.id,
+                    details={
+                        "removed": removed,
+                        "retention_limit": self._settings.mtproto_feed_pool_limit,
+                    },
+                    actor=actor,
+                )
+                await session.commit()
+            return removed
 
     async def _read_recent_messages(self) -> tuple[int, list[object]]:
         """Only select authorised active accounts with a known healthy proxy."""

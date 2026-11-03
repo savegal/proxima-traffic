@@ -29,6 +29,7 @@ In the bot open **Прокси → Свежие из канала → Подкл
 - Telegram text-link entities are inspected; untrusted prose, duplicate links, unsupported `ee` routes, private IPs and stale messages are excluded.
 - Only a bounded number of candidates are probed. Healthy endpoints are imported into group `MTProto · ProxyMTProto`; existing duplicates are rechecked.
 - Manually disabled endpoints are not re-enabled by channel refresh.
+- The public feed is retained as a bounded backup: keep the newest `PROXIMA_MTPROTO_FEED_POOL_LIMIT` enabled/unassigned entries (default 120). Older unassigned entries are deleted only from the dedicated feed group. Assigned endpoints and manually disabled entries are always preserved.
 - If no working reader-account proxy exists, feed refresh fails safely. Keep at least one independent reliable bootstrap proxy.
 
 To enable **periodic** refresh, configure:
@@ -38,6 +39,7 @@ PROXIMA_MTPROTO_FEED_ENABLED=true
 PROXIMA_MTPROTO_FEED_INTERVAL_SECONDS=3600
 PROXIMA_MTPROTO_FEED_MAX_MESSAGES=60
 PROXIMA_MTPROTO_FEED_MAX_CANDIDATES=20
+PROXIMA_MTPROTO_FEED_POOL_LIMIT=120
 PROXIMA_ACCOUNT_REQUIRE_PROXY=true
 ```
 

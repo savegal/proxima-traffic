@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'src/proxima_traffic/proxies.py'
+      - 'src/proxima_traffic/accounts.py'
       - 'src/proxima_traffic/proxy_feed.py'
       - 'src/proxima_traffic/config.py'
       - 'src/proxima_traffic/bot_main.py'
@@ -30,6 +31,7 @@ jobs:
         run: >
           ruff check
           src/proxima_traffic/proxies.py
+          src/proxima_traffic/accounts.py
           src/proxima_traffic/proxy_feed.py
           src/proxima_traffic/config.py
           src/proxima_traffic/bot_main.py
@@ -37,6 +39,7 @@ jobs:
           src/proxima_traffic/bot/keyboards.py
           tests/conftest.py
           tests/test_proxy_reliability.py
+          tests/test_proxy_management.py
       - name: Run offline proxy regressions (model-only database schema)
         env:
           PROXIMA_PROXY_MODEL_SCHEMA_ONLY: '1'

@@ -11,7 +11,7 @@ Proxy secrets and passwords stay encrypted at rest. A proxy operator can still o
 ## Automatic route recovery
 
 1. The currently assigned endpoint is checked before use.
-2. If it is unhealthy, the system tests enabled alternatives with at most eight network probes at the same time.
+2. If it is unhealthy, the system probes at most 24 high-priority alternatives per attempt, with at most eight network connections at once. It favours recently healthy endpoints and reserves up to eight slots for the public channel pool when available, so a large collection cannot exhaust the account operation timeout.
 3. Only a freshly verified, enabled endpoint can replace the current assignment.
 4. The account's connection generation is incremented; cached Telegram clients reconnect using the new route.
 5. When no alternative works, the account **does not fall back to direct networking**.

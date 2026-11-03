@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1018,7 +1018,7 @@ class ProxyService:
                 return await self.require_account_route(account_id)
 
             raise ProxyRouteUnavailable(
-                "назначенный прокси не работает; проверены все включённые прокси, "
+                "назначенный прокси не работает; проверены приоритетные резервные прокси, "
                 "но рабочего не найдено. Добавьте рабочий HTTP(S)/SOCKS5/MTProto-прокси."
             )
 
@@ -1078,20 +1078,54 @@ class ProxyService:
         excluded_proxy_id: int,
         actor: str,
     ) -> tuple[int, ...]:
-        """Probe every enabled alternative and return only healthy endpoint IDs."""
+        """Probe a bounded, recently healthy mix of owned and public alternatives.
 
+        Recovery must finish within an account operation timeout even when the
+        stored feed has hundreds of dead endpoints. Reserve public fallbacks
+        rather than starving them behind a large privately owned pool.
+        """
         async with self._session_factory() as session:
-            candidate_ids = tuple(
-                int(value)
-                for value in await session.scalars(
-                    select(ProxyEndpoint.id)
-                    .where(
-                        ProxyEndpoint.enabled.is_(True),
-                        ProxyEndpoint.id != excluded_proxy_id,
-                    )
-                    .order_by(ProxyEndpoint.id)
+            ordered = (
+                select(ProxyEndpoint.id)
+                .outerjoin(ProxyGroup, ProxyGroup.id == ProxyEndpoint.group_id)
+                .where(
+                    ProxyEndpoint.enabled.is_(True),
+                    ProxyEndpoint.id != excluded_proxy_id,
+                )
+                .order_by(
+                    case(
+                        (ProxyEndpoint.status == ProxyStatus.HEALTHY, 0),
+                        else_=1,
+                    ),
+                    ProxyEndpoint.last_checked_at.is_(None),
+                    ProxyEndpoint.last_checked_at.desc(),
+                    ProxyEndpoint.latency_ms.is_(None),
+                    ProxyEndpoint.latency_ms,
+                    ProxyEndpoint.id.desc(),
                 )
             )
+            owned = list(
+                await session.scalars(
+                    ordered.where(
+                        or_(
+                            ProxyGroup.name != PUBLIC_MTPROTO_GROUP,
+                            ProxyGroup.id.is_(None),
+                        )
+                    ).limit(24)
+                )
+            )
+            community = list(
+                await session.scalars(
+                    ordered.where(ProxyGroup.name == PUBLIC_MTPROTO_GROUP).limit(24)
+                )
+            )
+        primary = owned[:16] + community[:8]
+        additional = owned[16:] + community[8:]
+        candidate_ids = tuple(
+            int(proxy_id) for proxy_id in (
+                primary + additional[: max(0, 24 - len(primary))]
+            )
+        )
         if not candidate_ids:
             return ()
 

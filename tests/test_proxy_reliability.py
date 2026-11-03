@@ -20,6 +20,7 @@ from proxima_traffic.models import (
 )
 from proxima_traffic.proxies import (
     PUBLIC_MTPROTO_GROUP,
+    ProxyCheckResult,
     ProxyInputError,
     ProxyNetworkRoute,
     _ProxyProbeResult,
@@ -448,3 +449,60 @@ async def test_public_feed_pins_public_ip_and_rejects_private_dns(app, monkeypat
     assert safe[1].host == "8.8.8.8"
     assert "untrusted.example.org" not in safe[0]
     assert "8.8.8.8" in safe[0]
+
+
+@pytest.mark.asyncio
+async def test_route_recovery_probes_are_bounded_and_reserve_public_backup(
+    app, monkeypatch
+):
+    service = app.state.proxy_service
+    own_group = await service.create_group("Owned for recovery")
+    public_group = await service.create_group(PUBLIC_MTPROTO_GROUP)
+    async with app.state.database.session_factory() as session:
+        for n in range(80):
+            session.add(
+                ProxyEndpoint(
+                    label=f"candidate-{n}",
+                    group_id=own_group.id if n < 40 else public_group.id,
+                    protocol=ProxyProtocol.HTTP,
+                    host=f"candidate-{n}.example.org",
+                    port=8080,
+                    fingerprint=f"{n + 1:064x}",
+                    status=ProxyStatus.HEALTHY,
+                    enabled=True,
+                    latency_ms=20,
+                )
+            )
+        await session.commit()
+
+    active = 0
+    peak = 0
+    checked: list[int] = []
+
+    async def fake_check(proxy_id, *, actor):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        checked.append(proxy_id)
+        await asyncio.sleep(0.005)
+        active -= 1
+        return ProxyCheckResult(
+            proxy_id, True, ProxyStatus.HEALTHY, 20, "198.51.100.1", None
+        )
+
+    monkeypatch.setattr(service, "_check_proxy_for_route", fake_check)
+    result = await service._verify_replacement_candidates(
+        excluded_proxy_id=999999, actor="test"
+    )
+    assert len(checked) == len(result) == 24
+    assert peak <= 8
+    async with app.state.database.session_factory() as session:
+        public_selected = list(
+            await session.scalars(
+                select(ProxyEndpoint.id).where(
+                    ProxyEndpoint.id.in_(result),
+                    ProxyEndpoint.group_id == public_group.id,
+                )
+            )
+        )
+    assert len(public_selected) == 8

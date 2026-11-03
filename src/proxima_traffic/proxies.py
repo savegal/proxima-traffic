@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -36,6 +36,7 @@ from proxima_traffic.models import (
 from proxima_traffic.services import ConflictError, NotFoundError, add_audit_event
 
 SUPPORTED_SCHEMES = {item.value for item in ProxyProtocol}
+PUBLIC_MTPROTO_GROUP = "MTProto · ProxyMTProto"
 
 
 class ProxyFilter(StrEnum):
@@ -393,23 +394,18 @@ def _parse_telegram_mtproto_link(raw: str) -> ParsedProxy | None:
 
 
 def _validate_mtproto_secret(value: str) -> str:
-    """Canonicalise MTProxy hex/base64, rejecting malformed or truncated keys."""
+    """Normalize a valid legacy, dd, or Fake-TLS MTProxy secret.
+
+    A *16-byte* legacy key may itself begin with dd/ee. Prefix meaning is
+    determined by decoded length and the additional protocol bytes, not by
+    string.startswith().
+    """
     secret = value.strip()
     if not secret or len(secret) > 512:
         raise ProxyInputError("secret MTProto имеет неверный формат")
-
-    # Base64 may *coincidentally* start with ee/dd. Decode the entire token
-    # before interpreting prefixes, except for genuine hex-encoded secrets.
-    is_hex = re.fullmatch(r"[0-9a-fA-F]+", secret) is not None
-    if is_hex:
-        prefix = (
-            secret[:2].lower()
-            if len(secret) > 32 and secret[:2].lower() in {"dd", "ee"}
-            else ""
-        )
-        body = secret[2:] if prefix else secret
+    if re.fullmatch(r"[0-9a-fA-F]+", secret):
         try:
-            raw = bytes.fromhex(body)
+            raw = bytes.fromhex(secret)
         except ValueError as exc:
             raise ProxyInputError("secret MTProto должен быть hex или base64") from exc
     else:
@@ -419,14 +415,54 @@ def _validate_mtproto_secret(value: str) -> str:
             )
         except (ValueError, base64.binascii.Error) as exc:
             raise ProxyInputError("secret MTProto должен быть hex или base64") from exc
-        prefix = ""
 
-    if prefix == "ee":
-        if not 17 <= len(raw) <= 255:
-            raise ProxyInputError("Fake-TLS secret должен содержать ключ и домен")
-    elif len(raw) != 16:
-        raise ProxyInputError("MTProto secret должен содержать ровно 16 байт ключа")
-    return prefix + raw.hex()
+    if len(raw) == 16:
+        return raw.hex()  # legacy, even when its first byte is dd or ee
+    if len(raw) == 17 and raw[0] == 0xDD:
+        return raw.hex()  # randomized intermediate
+    if 18 <= len(raw) <= 256 and raw[0] == 0xEE:
+        domain = raw[17:]
+        try:
+            name = domain.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ProxyInputError("Fake-TLS secret содержит некорректный домен") from exc
+        if (
+            not 1 <= len(name) <= 253
+            or name.startswith(".")
+            or name.endswith(".")
+            or any(
+                not re.fullmatch(r"[a-zA-Z0-9-]{1,63}", label)
+                or label.startswith("-")
+                or label.endswith("-")
+                for label in name.split(".")
+            )
+        ):
+            raise ProxyInputError("Fake-TLS secret содержит некорректный домен")
+        return raw.hex()
+    raise ProxyInputError("MTProto secret должен содержать корректный ключ и тип соединения")
+
+
+def mtproto_secret_kind(secret: str) -> str:
+    """Return transport kind from validated bytes, never text prefix alone."""
+    raw = bytes.fromhex(_validate_mtproto_secret(secret))
+    if len(raw) == 17 and raw[0] == 0xDD:
+        return "dd"
+    if len(raw) >= 18 and raw[0] == 0xEE:
+        return "ee"
+    return "legacy"
+
+def mtproto_telethon_secret(secret: str) -> str:
+    """Avoid Telethon 1.44 wrongly stripping dd/ee from a bare 16-byte key.
+
+    Telethon's normalize_secret checks the *text* prefix before decoding,
+    whereas the transport type must be inferred from the decoded length.
+    Hex is case-insensitive, but its prefix check is case-sensitive.
+    """
+    normalized = _validate_mtproto_secret(secret)
+    if mtproto_secret_kind(normalized) == "legacy" and normalized[:2] in {"dd", "ee"}:
+        return normalized[:2].upper() + normalized[2:]
+    return normalized
+
 
 def mtproto_connection_type(secret: str) -> object:
     """Choose Telethon's MTProxy transport from the secret prefix.
@@ -441,15 +477,15 @@ def mtproto_connection_type(secret: str) -> object:
         ConnectionTcpMTProxyRandomizedIntermediate,
     )
 
-    prefix = secret.lower()[:2]
-    if prefix == "ee":
+    kind = mtproto_secret_kind(secret)
+    if kind == "ee":
         # Telethon 1.44 does not implement the Fake-TLS negotiation for
         # ee links. Never silently treat it as ordinary intermediate.
         raise ProxyInputError(
             "MTProto Fake-TLS (ee) не поддерживается текущим Telethon; "
             "используйте dd/обычный MTProto или совместимый клиент"
         )
-    if prefix == "dd":
+    if kind == "dd":
         return ConnectionTcpMTProxyRandomizedIntermediate
     return ConnectionTcpMTProxyAbridged
 
@@ -495,7 +531,9 @@ class ProxyService:
         # Several accounts may deliberately share a proxy.  Keep one fresh
         # probe per endpoint for a short recovery/check wave rather than
         # issuing the same HTTP check once per account.
-        self._route_probe_cache: dict[int, tuple[float, ProxyCheckResult]] = {}
+        self._route_probe_cache: dict[
+            int, tuple[float, ProxyCheckResult, tuple[object, ...]]
+        ] = {}
         self._route_probe_tasks: dict[int, asyncio.Task[ProxyCheckResult]] = {}
         self._route_probe_lock = asyncio.Lock()
         # A provider rotation is a stateful external operation.  Do not let a
@@ -777,12 +815,14 @@ class ProxyService:
             statement = (
                 select(ProxyEndpoint)
                 .outerjoin(ProxyAssignment, ProxyAssignment.proxy_id == ProxyEndpoint.id)
+                .outerjoin(ProxyGroup, ProxyGroup.id == ProxyEndpoint.group_id)
                 .where(
                     ProxyEndpoint.enabled.is_(True),
                     ProxyEndpoint.status == ProxyStatus.HEALTHY,
                 )
                 .group_by(ProxyEndpoint.id)
                 .order_by(
+                    case((ProxyGroup.name == PUBLIC_MTPROTO_GROUP, 1), else_=0),
                     assigned_count,
                     ProxyEndpoint.latency_ms.is_(None),
                     ProxyEndpoint.latency_ms,
@@ -790,9 +830,7 @@ class ProxyService:
                 )
             )
             if group_name is not None and group_name.strip():
-                statement = statement.join(
-                    ProxyGroup, ProxyGroup.id == ProxyEndpoint.group_id
-                ).where(ProxyGroup.name == group_name.strip())
+                statement = statement.where(ProxyGroup.name == group_name.strip())
             endpoint = await session.scalar(statement.limit(1))
             if endpoint is None:
                 raise ConflictError("в выбранном пуле нет свободных исправных прокси")
@@ -1074,18 +1112,34 @@ class ProxyService:
             if isinstance(result, ProxyCheckResult) and result.healthy
         )
 
-    async def _check_proxy_for_route(self, proxy_id: int, *, actor: str) -> ProxyCheckResult:
-        """Return one recent health probe for route selection.
+    async def _route_probe_revision(self, proxy_id: int) -> tuple[object, ...] | None:
+        """Token for a *specific* endpoint version and check result.
 
-        This intentionally wraps only automatic account-route recovery.  A
-        manual proxy check remains a fresh operator-requested probe.  Both
-        successful and failed results are briefly cached: a failed shared IP
-        must not trigger a separate full-pool recovery for every account.
+        A cached success for yesterday's credentials must never approve a
+        newly replaced address, even during the short coalescing window.
         """
+        async with self._session_factory() as session:
+            item = await session.get(ProxyEndpoint, proxy_id)
+            if item is None:
+                return None
+            return (
+                item.fingerprint,
+                item.password_encrypted,
+                item.enabled,
+                item.status,
+                ensure_utc(item.updated_at),
+                ensure_utc(item.last_checked_at),
+            )
+
+    async def _check_proxy_for_route(self, proxy_id: int, *, actor: str) -> ProxyCheckResult:
+        """Coalesce concurrent checks and cache only an unchanged endpoint revision."""
+        revision = await self._route_probe_revision(proxy_id)
+        if revision is None:
+            raise NotFoundError("прокси не найден")
         now = time.monotonic()
         async with self._route_probe_lock:
             cached = self._route_probe_cache.get(proxy_id)
-            if cached is not None and now - cached[0] < 8.0:
+            if cached is not None and now - cached[0] < 8.0 and cached[2] == revision:
                 return cached[1]
             task = self._route_probe_tasks.get(proxy_id)
             if task is None:
@@ -1093,13 +1147,32 @@ class ProxyService:
                 self._route_probe_tasks[proxy_id] = task
         try:
             result = await asyncio.shield(task)
-        finally:
+        except BaseException:
+            # A cancelled caller must not cancel the shared network probe.
             if task.done():
                 async with self._route_probe_lock:
                     if self._route_probe_tasks.get(proxy_id) is task:
                         self._route_probe_tasks.pop(proxy_id, None)
+            raise
+
+        stale = bool(result.error and "Результат проверки устарел" in result.error)
+        latest = None if stale else await self._route_probe_revision(proxy_id)
         async with self._route_probe_lock:
-            self._route_probe_cache[proxy_id] = (time.monotonic(), result)
+            # Publish the checked revision BEFORE dropping the in-flight task.
+            # Otherwise another worker can start a duplicate probe in between.
+            if (
+                latest is not None
+                and latest[3] == result.status
+                and latest[5] is not None
+                and (result.healthy == (result.status == ProxyStatus.HEALTHY))
+            ):
+                self._route_probe_cache[proxy_id] = (time.monotonic(), result, latest)
+            if task.done() and self._route_probe_tasks.get(proxy_id) is task:
+                self._route_probe_tasks.pop(proxy_id, None)
+        if stale:
+            # A concurrent edit invalidated this result; recheck the current
+            # endpoint instead of treating the old failed probe as proof.
+            return await self.check_proxy(proxy_id, actor=actor)
         return result
 
     async def _replace_failed_account_route(
@@ -1142,6 +1215,7 @@ class ProxyService:
                 selection = (
                     select(ProxyEndpoint)
                     .outerjoin(ProxyAssignment, ProxyAssignment.proxy_id == ProxyEndpoint.id)
+                    .outerjoin(ProxyGroup, ProxyGroup.id == ProxyEndpoint.group_id)
                     .where(
                         ProxyEndpoint.id.in_(candidate_ids),
                         ProxyEndpoint.enabled.is_(True),
@@ -1156,6 +1230,7 @@ class ProxyService:
                 candidate = await session.scalar(
                     selection.group_by(ProxyEndpoint.id)
                     .order_by(
+                        case((ProxyGroup.name == PUBLIC_MTPROTO_GROUP, 1), else_=0),
                         assigned_count,
                         ProxyEndpoint.latency_ms.is_(None),
                         ProxyEndpoint.latency_ms,
@@ -1592,7 +1667,11 @@ class ProxyService:
         immediately after Telegram accepts the transport.
         """
 
-        if secret.lower().startswith("ee"):
+        try:
+            normalized_secret = mtproto_telethon_secret(secret)
+        except ProxyInputError:
+            return _ProxyProbeResult(False, None, None, "Некорректный MTProto secret")
+        if mtproto_secret_kind(normalized_secret) == "ee":
             return _ProxyProbeResult(
                 healthy=False,
                 latency_ms=None,
@@ -1618,8 +1697,8 @@ class ProxyService:
                 StringSession(),
                 api[0],
                 api[1],
-                connection=mtproto_connection_type(secret),
-                proxy=(host, int(port), secret),
+                connection=mtproto_connection_type(normalized_secret),
+                proxy=(host, int(port), normalized_secret),
                 connection_retries=0,
                 request_retries=0,
                 auto_reconnect=False,

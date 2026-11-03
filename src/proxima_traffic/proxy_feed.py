@@ -27,7 +27,14 @@ from proxima_traffic.models import (
     ensure_utc,
     utc_now,
 )
-from proxima_traffic.proxies import ParsedProxy, ProxyInputError, parse_proxy, proxy_import_values
+from proxima_traffic.proxies import (
+    PUBLIC_MTPROTO_GROUP,
+    ParsedProxy,
+    ProxyInputError,
+    mtproto_secret_kind,
+    parse_proxy,
+    proxy_import_values,
+)
 from proxima_traffic.services import ConflictError
 
 if TYPE_CHECKING:
@@ -37,7 +44,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 CHANNEL = "ProxyMTProto"
-GROUP = "MTProto · ProxyMTProto"
+GROUP = PUBLIC_MTPROTO_GROUP
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +122,7 @@ class MTProtoFeedService:
             for url, parsed in links:
                 if _unsafe_feed_host(parsed.host):
                     continue
-                if str(parsed.password or "").lower().startswith("ee"):
+                if mtproto_secret_kind(parsed.password or "") == "ee":
                     unsupported += 1
                     continue
                 supported.append((url, parsed))
@@ -212,8 +219,20 @@ class MTProtoFeedService:
                 try:
                     await client(GetParticipantRequest(channel=entity, participant="me"))
                 except UserNotParticipantError:
-                    # The operator expressly opted in to fetching this feed.
+                    # Joining a feed is still a Telegram channel join and
+                    # must obey the exact account-wide anti-flood pacing rules.
+                    delay = await self._accounts.join_wait_seconds(
+                        int(account.id),
+                        daily_limit=self._settings.account_join_daily_limit,
+                        min_interval=self._settings.account_join_min_interval_seconds,
+                    )
+                    if delay > 0:
+                        raise ConflictError(
+                            f"Аккаунт #{account.id} не может вступить в канал: "
+                            f"пауза ещё {int(delay) + 1} сек."
+                        )
                     await client(JoinChannelRequest(channel=entity))
+                    await self._accounts.record_join(int(account.id))
                 return list(
                     await client.get_messages(
                         entity, limit=self._settings.mtproto_feed_max_messages

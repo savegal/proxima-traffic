@@ -18,11 +18,14 @@ from proxima_traffic.models import (
     utc_now,
 )
 from proxima_traffic.proxies import (
+    PUBLIC_MTPROTO_GROUP,
     ProxyInputError,
     ProxyNetworkRoute,
     _ProxyProbeResult,
     _validate_mtproto_secret,
     mtproto_connection_type,
+    mtproto_secret_kind,
+    mtproto_telethon_secret,
     parse_proxy,
 )
 from proxima_traffic.proxy_feed import MTProtoFeedService, _unsafe_feed_host
@@ -285,3 +288,98 @@ async def test_https_proxy_needs_telegram_app_to_claim_transport_readiness(app):
     assert await proxy_service._probe_telegram_using_standard_proxy(
         "socks5h://proxy.example.org:1080"
     ) is True
+
+
+def test_mtproxy_legacy_keys_starting_with_dd_ee_use_abridged_transport() -> None:
+    from telethon.network.connection.tcpmtproxy import (
+        ConnectionTcpMTProxyAbridged,
+        TcpMTProxy,
+    )
+
+    for prefix in ("dd", "ee"):
+        raw = prefix + "12" * 15
+        assert mtproto_secret_kind(raw) == "legacy"
+        transport_secret = mtproto_telethon_secret(raw)
+        assert transport_secret.startswith(prefix.upper())
+        # Telethon 1.44 strips lowercase dd/ee text, even for bare 16-byte keys.
+        assert TcpMTProxy.normalize_secret(transport_secret) == bytes.fromhex(raw)
+        route = ProxyNetworkRoute(
+            proxy_id=1, protocol=ProxyProtocol.MTPROTO,
+            host="example.org", port=443, username=None, password=raw,
+        )
+        transport = build_telethon_transport(route)
+        assert transport.connection is ConnectionTcpMTProxyAbridged
+        assert transport.proxy[2] == transport_secret
+
+    assert mtproto_secret_kind(DD) == "dd"
+    assert mtproto_secret_kind(EE) == "ee"
+
+
+@pytest.mark.asyncio
+async def test_route_probe_cache_invalidates_on_proxy_edit(app, monkeypatch):
+    service = app.state.proxy_service
+    checked: list[str] = []
+
+    async def probe(url):
+        checked.append(url)
+        return _ProxyProbeResult(True, 20, "198.51.100.18", None)
+
+    monkeypatch.setattr(service, "_probe_proxy_url", probe)
+    item = await service.add_proxy("http://before.example.org:8080")
+    await service._check_proxy_for_route(item.proxy.id, actor="test")
+    checked.clear()
+    await service.replace_proxy_url(item.proxy.id, "http://after.example.org:8080")
+    result = await service._check_proxy_for_route(item.proxy.id, actor="test")
+    assert result.healthy is True
+    assert len(checked) == 1
+    assert "after.example.org" in checked[0]
+
+
+@pytest.mark.asyncio
+async def test_inflight_stale_route_probe_rechecks_after_edit(app, monkeypatch):
+    service = app.state.proxy_service
+    async def healthy(url):
+        return _ProxyProbeResult(True, 20, "198.51.100.3", None)
+    monkeypatch.setattr(service, "_probe_proxy_url", healthy)
+    item = await service.add_proxy("http://before-edit.example.org:8080")
+    started, resume = asyncio.Event(), asyncio.Event()
+    checked = []
+
+    async def delayed(url):
+        checked.append(url)
+        if "before-edit" in url:
+            started.set()
+            await asyncio.wait_for(resume.wait(), 5)
+        return _ProxyProbeResult(True, 27, "198.51.100.4", None)
+
+    monkeypatch.setattr(service, "_probe_proxy_url", delayed)
+    task = asyncio.create_task(service._check_proxy_for_route(item.proxy.id, actor="test"))
+    await asyncio.wait_for(started.wait(), 5)
+    await service.replace_proxy_url(item.proxy.id, "http://after-edit.example.org:8080")
+    resume.set()
+    result = await asyncio.wait_for(task, 5)
+    assert result.healthy is True
+    assert any("before-edit" in url for url in checked)
+    assert any("after-edit" in url for url in checked)
+
+
+@pytest.mark.asyncio
+async def test_default_pool_prefers_owned_proxy_over_public_feed(app, monkeypatch):
+    service = app.state.proxy_service
+    async def probe(url):
+        return _ProxyProbeResult(
+            True, 5 if "public-" in url else 100, "198.51.100.5", None
+        )
+    monkeypatch.setattr(service, "_probe_proxy_url", probe)
+    public = await service.add_proxy(
+        "http://public-proxy.example.org:8080", group_name=PUBLIC_MTPROTO_GROUP
+    )
+    own = await service.add_proxy(
+        "http://own-proxy.example.org:8080", group_name="Owned"
+    )
+    allocated = await service.allocate_proxy("test-default-slot")
+    assert allocated.proxy.id == own.proxy.id
+    explicitly_public = await service.allocate_proxy(
+        "test-public-slot", group_name=PUBLIC_MTPROTO_GROUP
+    )
+    assert explicitly_public.proxy.id == public.proxy.id

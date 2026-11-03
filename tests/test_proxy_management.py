@@ -412,10 +412,15 @@ async def test_shared_account_route_checks_use_one_inflight_proxy_probe(
         )
 
     service = app.state.proxy_service
+    # Revision-aware coalescing needs a real stored endpoint.
+    item = await service.add_proxy("http://shared-check.example.org:8080")
     monkeypatch.setattr(service, "check_proxy", slow_check)
 
     results = await asyncio.gather(
-        *(service._check_proxy_for_route(77, actor="bulk-session-check") for _ in range(5))
+        *(
+            service._check_proxy_for_route(item.proxy.id, actor="bulk-session-check")
+            for _ in range(5)
+        )
     )
 
     assert calls == 1

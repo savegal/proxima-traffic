@@ -72,6 +72,7 @@ from proxima_traffic.proxies import (
     ProxyRouteUnavailable,
     ProxyService,
     mtproto_connection_type,
+    mtproto_telethon_secret,
 )
 from proxima_traffic.services import (
     ConflictError,
@@ -3025,9 +3026,10 @@ def build_telethon_transport(route: object) -> TelethonTransport:
     protocol = route.protocol
     value = getattr(protocol, "value", str(protocol))
     if value == "mtproto":
-        secret = getattr(route, "password", None)
-        if not isinstance(secret, str) or not secret:
+        raw_secret = getattr(route, "password", None)
+        if not isinstance(raw_secret, str) or not raw_secret:
             raise ProxyRouteUnavailable("у MTProto-прокси отсутствует secret")
+        secret = mtproto_telethon_secret(raw_secret)
         return TelethonTransport(
             proxy=(route.host, int(route.port), secret),
             connection=mtproto_connection_type(secret),

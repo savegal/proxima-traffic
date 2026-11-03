@@ -208,6 +208,8 @@ class MTProtoFeedService:
             ):
                 continue
 
+            selected_account_id = int(account.id)
+
             async def read(client: object) -> list[object]:
                 from telethon.errors import UserNotParticipantError  # noqa: PLC0415
                 from telethon.tl.functions.channels import (  # noqa: PLC0415
@@ -222,17 +224,17 @@ class MTProtoFeedService:
                     # Joining a feed is still a Telegram channel join and
                     # must obey the exact account-wide anti-flood pacing rules.
                     delay = await self._accounts.join_wait_seconds(
-                        int(account.id),
+                        selected_account_id,
                         daily_limit=self._settings.account_join_daily_limit,
                         min_interval=self._settings.account_join_min_interval_seconds,
                     )
                     if delay > 0:
                         raise ConflictError(
-                            f"Аккаунт #{account.id} не может вступить в канал: "
+                            f"Аккаунт #{selected_account_id} не может вступить в канал: "
                             f"пауза ещё {int(delay) + 1} сек."
-                        )
+                        ) from None
                     await client(JoinChannelRequest(channel=entity))
-                    await self._accounts.record_join(int(account.id))
+                    await self._accounts.record_join(selected_account_id)
                 return list(
                     await client.get_messages(
                         entity, limit=self._settings.mtproto_feed_max_messages
@@ -241,9 +243,9 @@ class MTProtoFeedService:
 
             try:
                 _, messages = await self._accounts._run_profile_operation(
-                    int(account.id), read
+                    selected_account_id, read
                 )
-                return int(account.id), list(messages)
+                return selected_account_id, list(messages)
             except Exception as exc:  # noqa: BLE001 - joining may have already succeeded
                 logger.warning(
                     "Feed reader account %d failed (%s); refusing another account",

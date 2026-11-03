@@ -1052,10 +1052,27 @@ def proxies_menu(page: ProxyPage) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Импорт TXT", callback_data="proxy:import"),
         InlineKeyboardButton(text="↻ Обновить", callback_data=f"menu:proxies:{page.page}"),
     )
-    builder.row(InlineKeyboardButton(text="＋ MTProto-ссылки", callback_data="proxy:mtproto"))
+    builder.row(
+        InlineKeyboardButton(text="＋ MTProto-ссылки", callback_data="proxy:mtproto"),
+        InlineKeyboardButton(text="⌕ Свежие из канала", callback_data="proxy:feed:ask"),
+    )
     _proxy_pagination(builder, page)
     builder.row(InlineKeyboardButton(text="⌂ Главная", callback_data="menu:home"))
     return builder.as_markup()
+
+
+def mtproto_feed_confirmation() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✓ Подключиться и проверить",
+                    callback_data="proxy:feed:confirm",
+                )
+            ],
+            [InlineKeyboardButton(text="× Отмена", callback_data="menu:proxies:0")],
+        ]
+    )
 
 
 def proxy_details_menu(item: ProxyView, page: int) -> InlineKeyboardMarkup:
@@ -1638,7 +1655,8 @@ def account_group_details_menu(
                     InlineKeyboardButton(
                         text="✎ Название и описание",
                         callback_data=(
-                            f"account:group:edit:{group_id}:{account_filter_callback_code(normalized)}:"
+                            f"account:group:edit:{group_id}:"
+                            f"{account_filter_callback_code(normalized)}:"
                             f"{scope}:{page}"
                         ),
                     )
@@ -1709,7 +1727,8 @@ def account_group_members_menu(
                 InlineKeyboardButton(
                     text="‹",
                     callback_data=(
-                        f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:"
+                        f"account:group:members:{group_id}:"
+                        f"{account_filter_callback_code(normalized)}:"
                         f"{page.page - 1}"
                     ),
                 )
@@ -1722,7 +1741,8 @@ def account_group_members_menu(
                 InlineKeyboardButton(
                     text="›",
                     callback_data=(
-                        f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:"
+                        f"account:group:members:{group_id}:"
+                        f"{account_filter_callback_code(normalized)}:"
                         f"{page.page + 1}"
                     ),
                 )
@@ -1769,7 +1789,8 @@ def account_group_member_filters_menu(
         InlineKeyboardButton(
             text="‹ К составу",
             callback_data=(
-                f"account:group:members:{group_id}:{account_filter_callback_code(normalized)}:{page}"
+                f"account:group:members:{group_id}:"
+                f"{account_filter_callback_code(normalized)}:{page}"
             ),
         )
     )

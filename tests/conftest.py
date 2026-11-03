@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from proxima_traffic.config import Settings
 from proxima_traffic.db import Database
 from proxima_traffic.main import create_app
+from proxima_traffic.models import Base
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +30,15 @@ def schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     async def create_template() -> None:
         database = Database(f"sqlite+aiosqlite:///{database_path}")
         try:
-            await database.create_schema()
+            if os.environ.get("PROXIMA_PROXY_MODEL_SCHEMA_ONLY") == "1":
+                # The production blacklist migration requires a separately
+                # managed SHA-checked asset absent from public CI checkout.
+                # Proxy unit tests need schema, not sensitive seeded IDs.
+                # This opt-in does NOT validate Alembic migrations.
+                async with database.engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+            else:
+                await database.create_schema()
         finally:
             await database.dispose()
 

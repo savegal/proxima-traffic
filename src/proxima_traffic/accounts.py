@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import sqlite3
 import stat
 import struct
@@ -1467,6 +1468,45 @@ class AccountService:
             me,
             event_type="account.profile_name_updated",
             details={"first_name": normalized_first, "last_name": normalized_last},
+            actor=actor,
+            expected_session_fingerprint=expected_fingerprint,
+        )
+
+    async def update_profile_username(
+        self,
+        account_id: int,
+        *,
+        username: str,
+        actor: str = "control-bot",
+    ) -> Account:
+        """Set or remove the primary Telegram username on the authenticated account."""
+        normalized_username = normalize_telegram_username(username)
+        expected_fingerprint = await self._observation_fingerprint(account_id)
+
+        async def update(client: object) -> object:
+            from telethon.tl.functions.account import UpdateUsernameRequest  # noqa: PLC0415
+
+            return await client(  # type: ignore[operator]
+                UpdateUsernameRequest(username=normalized_username)
+            )
+
+        _, updated_user = await self._run_profile_operation(account_id, update)
+        # updateUsername returns the updated User. The generic client's get_me()
+        # may be cached, so confirm and persist the authoritative RPC result.
+        observed_username = str(getattr(updated_user, "username", None) or "")
+        if observed_username.casefold() != normalized_username.casefold():
+            raise AccountProfileError(
+                "Telegram не подтвердил новый юзернейм. "
+                "Проверьте профиль перед повторением операции"
+            )
+        return await self._record_profile(
+            account_id,
+            updated_user,
+            event_type="account.profile_username_updated",
+            details={
+                "username": observed_username or None,
+                "removed": not bool(observed_username),
+            },
             actor=actor,
             expected_session_fingerprint=expected_fingerprint,
         )
@@ -3170,6 +3210,26 @@ def _require_profile_identity(account: Account, me: object) -> None:
         raise AccountIdentityError("Telegram вернул другой аккаунт. Проверьте загруженную сессию")
 
 
+def normalize_telegram_username(value: str) -> str:
+    """Validate basic username syntax; Telegram is the final availability authority.
+
+    An empty username explicitly removes the current primary username.
+    """
+    normalized = value.strip()
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+        if not normalized:
+            raise AccountProfileError("Укажите юзернейм после @.")
+    if normalized and (
+        not 5 <= len(normalized) <= 32
+        or re.fullmatch(r"[A-Za-z0-9_]+", normalized) is None
+    ):
+        raise AccountProfileError(
+            "Юзернейм должен содержать от 5 до 32 символов: латинские буквы, цифры и _."
+        )
+    return normalized
+
+
 def _validate_telegram_name(value: str, *, required: bool) -> str:
     normalized = value.strip()
     if not normalized and required:
@@ -3216,6 +3276,12 @@ def _safe_account_operation_error(error: BaseException) -> str:
         return f"Telegram просит подождать {seconds} секунд перед изменением профиля"
     messages = {
         "FirstNameInvalidError": "Telegram отклонил это имя",
+        "UsernameOccupiedError": "Этот юзернейм занят. Попробуйте другой.",
+        "UsernameInvalidError": "Telegram отклонил юзернейм. Проверьте его написание.",
+        "UsernamePurchaseAvailableError": (
+            "Этот юзернейм доступен только для покупки через Fragment."
+        ),
+        "UsernameNotModifiedError": "Такой юзернейм уже установлен у аккаунта.",
         "PhotoExtInvalidError": "Telegram принимает для аватара только изображение",
         "PhotoInvalidDimensionsError": "неподходящие размеры изображения",
         "ImageProcessFailedError": "Telegram не смог обработать изображение",
@@ -3226,6 +3292,12 @@ def _safe_account_operation_error(error: BaseException) -> str:
     }
     rpc_message = str(getattr(error, "message", "") or "").upper()
     rpc_messages = {
+        "USERNAME_OCCUPIED": "Этот юзернейм занят. Попробуйте другой.",
+        "USERNAME_INVALID": "Telegram отклонил юзернейм. Проверьте его написание.",
+        "USERNAME_PURCHASE_AVAILABLE": (
+            "Этот юзернейм доступен только для покупки через Fragment."
+        ),
+        "USERNAME_NOT_MODIFIED": "Такой юзернейм уже установлен у аккаунта.",
         "INVITE_SLUG_EMPTY": "в ссылке на папку отсутствует код",
         "INVITE_SLUG_EXPIRED": "ссылка на папку Telegram истекла или отозвана",
         "CHATLISTS_TOO_MUCH": "достигнут лимит подключённых папок Telegram",

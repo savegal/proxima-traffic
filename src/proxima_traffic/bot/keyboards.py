@@ -2089,6 +2089,12 @@ def account_details_menu(
                 callback_data=f"account:about:edit:{account.id}:{page}",
             ),
         )
+        builder.row(
+            InlineKeyboardButton(
+                text="✎ @Username",
+                callback_data=f"account:username:edit:{account.id}:{page}",
+            )
+        )
     if has_session:
         proxy_button = InlineKeyboardButton(
             text="Убрать прокси" if has_proxy else "⇄ Назначить прокси",
@@ -2201,6 +2207,20 @@ def account_name_confirmation(account_id: int, page: int) -> InlineKeyboardMarku
                 InlineKeyboardButton(
                     text="✓ Изменить имя Telegram",
                     callback_data=f"account:name:confirm:{account_id}:{page}",
+                )
+            ],
+            [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],
+        ]
+    )
+
+
+def account_username_confirmation(account_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✓ Изменить @username",
+                    callback_data=f"account:username:confirm:{account_id}:{page}",
                 )
             ],
             [InlineKeyboardButton(text="× Отмена", callback_data="fsm:cancel")],

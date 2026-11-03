@@ -36,6 +36,7 @@ from proxima_traffic.accounts import (
     AccountProfileError,
     AccountService,
     ChatFolderError,
+    normalize_telegram_username,
 )
 from proxima_traffic.blacklist_import import (
     MAX_BLACKLIST_IMPORT_BYTES,
@@ -138,6 +139,7 @@ from proxima_traffic.bot.keyboards import (
     account_membership_menu,
     account_name_catalog_menu,
     account_name_confirmation,
+    account_username_confirmation,
     account_picker,
     account_profile_scope_menu,
     account_session_clear_confirmation,
@@ -341,6 +343,7 @@ from proxima_traffic.bot.states import (
     AccountImportState,
     AccountLabelEditState,
     AccountNameEditState,
+    AccountUsernameEditState,
     CampaignContentEditState,
     CampaignCreateState,
     CampaignEditState,
@@ -7144,6 +7147,139 @@ async def confirm_account_name_edit(
         int(account_id),
         int(page),
         banner="✓ <b>Имя Telegram обновлено.</b>\n\n",
+    )
+
+
+@router.callback_query(F.data.startswith("account:username:edit:"))
+async def begin_account_username_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    account_service: AccountService,
+) -> None:
+    _, _, _, account_id, page = (callback.data or "").split(":")
+    try:
+        account = await account_service.get_account(int(account_id))
+    except NotFoundError as exc:
+        await _safe_callback_answer(callback, callback_error_message(exc), show_alert=True)
+        return
+    if not _profile_name_account_ready(account):
+        await _safe_callback_answer(
+            callback, "У аккаунта нет готовой Telegram-сессии", show_alert=True
+        )
+        return
+    await state.clear()
+    await _remember_origin(callback, state)
+    await state.update_data(profile_account_id=int(account_id), profile_page=int(page))
+    await state.set_state(AccountUsernameEditState.value)
+    current = f"@{escape(account.username)}" if account.username else "не задан"
+    await _edit_callback(
+        callback,
+        wizard_text(
+            "Юзернейм Telegram",
+            1,
+            1,
+            f"Текущий: <b>{current}</b>\n\n"
+            "Введите новый <code>@username</code> (5–32 символа: латинские буквы, "
+            "цифры и подчёркивание).\n"
+            "Чтобы удалить существующий юзернейм, отправьте <code>-</code>.",
+        ),
+        cancel_menu(),
+    )
+
+
+@router.message(AccountUsernameEditState.value)
+async def account_profile_username(message: Message, state: FSMContext, bot: Bot) -> None:
+    raw = (message.text or "").strip()
+    if not raw:
+        await answer_panel_input(
+            message, state, "Введите @username или «-» для удаления юзернейма."
+        )
+        return
+    try:
+        username = "" if raw == "-" else normalize_telegram_username(raw)
+        if not username and raw != "-":
+            raise AccountProfileError("Введите @username или «-» для удаления юзернейма.")
+    except AccountProfileError as exc:
+        await answer_panel_input(message, state, escape(operator_error_message(exc)))
+        return
+    await state.update_data(profile_username=username)
+    await state.set_state(AccountUsernameEditState.confirm)
+    data = await state.get_data()
+    preview = f"@{escape(username)}" if username else "— удалить юзернейм —"
+    await _edit_origin(
+        bot,
+        state,
+        f"<b>Новый юзернейм</b>\n\n<code>{preview}</code>\n\n"
+        "Подтвердить изменение в Telegram?",
+        account_username_confirmation(
+            int(data["profile_account_id"]), int(data["profile_page"])
+        ),
+    )
+
+
+@router.callback_query(
+    AccountUsernameEditState.confirm,
+    F.data.startswith("account:username:confirm:"),
+)
+async def confirm_account_username_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    account_service: AccountService,
+    proxy_service: ProxyService,
+) -> None:
+    _, _, _, account_id, page = (callback.data or "").split(":")
+    data = await _consume_account_draft(
+        state,
+        ("profile_account_id",),
+        account_id=int(account_id),
+        expected_state=AccountUsernameEditState.confirm.state,
+    )
+    if (
+        not data
+        or "profile_username" not in data
+        or int(data.get("profile_page", -1)) != int(page)
+    ):
+        await _safe_callback_answer(
+            callback, "Подтверждение устарело. Откройте аккаунт заново.", show_alert=True
+        )
+        return
+    await _safe_callback_answer(callback, "Изменяю юзернейм в Telegram…")
+    username = str(data["profile_username"])
+    try:
+        await account_service.update_profile_username(int(account_id), username=username)
+    except (NotFoundError, AccountImportError, AccountProfileError, ConflictError) as exc:
+        if await state.get_data() or await state.get_state():
+            if isinstance(callback.message, Message):
+                await callback.message.answer(f"× {escape(operator_error_message(exc))}")
+            return
+        await _show_account_details(
+            callback,
+            account_service,
+            proxy_service,
+            int(account_id),
+            int(page),
+            banner=(
+                "<b>× Не удалось подтвердить изменение юзернейма.</b>\n"
+                f"{escape(operator_error_message(exc))}\n\n"
+                "<i>Перед повторением проверьте текущий профиль Telegram.</i>\n\n"
+            ),
+        )
+        return
+    if await state.get_data() or await state.get_state():
+        if isinstance(callback.message, Message):
+            await callback.message.answer("✓ Юзернейм Telegram изменён.")
+        return
+    await _show_account_details(
+        callback,
+        account_service,
+        proxy_service,
+        int(account_id),
+        int(page),
+        banner=(
+            "✓ <b>Юзернейм Telegram обновлён.</b>\n\n"
+            if username
+            else "✓ <b>Юзернейм Telegram удалён.</b>\n\n"
+        ),
     )
 
 

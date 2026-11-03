@@ -1176,6 +1176,8 @@ def account_details_text(
         lines.append(f"Telegram ID: <code>{account.telegram_user_id}</code>")
     if account.username:
         lines.append(f"Username: <b>@{escape(account.username)}</b>")
+    elif _account_source(account) != "none":
+        lines.append("Username: <i>не задан</i>")
     if account.phone:
         lines.append(f"Телефон: <code>{escape(account.phone)}</code>")
     premium_value = getattr(account, "is_premium", None)

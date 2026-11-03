@@ -34,6 +34,11 @@ class AccountAvatarEditState(StatesGroup):
     photo = State()
 
 
+class AccountUsernameEditState(StatesGroup):
+    value = State()
+    confirm = State()
+
+
 class AccountAboutEditState(StatesGroup):
     text = State()
     confirm = State()

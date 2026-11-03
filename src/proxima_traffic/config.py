@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     proxy_check_timeout_seconds: float = 12.0
     proxy_quarantine_after_failures: int = 3
     proxy_health_recheck_seconds: float = 60.0
+    proxy_slow_failover_enabled: bool = False
+    proxy_slow_failover_latency_ms: int = 6000
+    # Public MTProxy feeds are untrusted; automatic subscription is opt-in.
+    mtproto_feed_enabled: bool = False
+    mtproto_feed_interval_seconds: int = 3600
+    mtproto_feed_max_messages: int = 60
+    mtproto_feed_max_candidates: int = 20
     account_encryption_key: SecretStr | None = None
     telegram_api_id: int | None = None
     telegram_api_hash: SecretStr | None = None
@@ -457,6 +464,14 @@ class Settings(BaseSettings):
             raise ValueError("PROXIMA_PROXY_CHECK_TIMEOUT_SECONDS must be positive")
         if self.proxy_quarantine_after_failures < 1:
             raise ValueError("PROXIMA_PROXY_QUARANTINE_AFTER_FAILURES must be positive")
+        if not 1000 <= self.proxy_slow_failover_latency_ms <= 60000:
+            raise ValueError("PROXIMA_PROXY_SLOW_FAILOVER_LATENCY_MS must be 1000..60000")
+        if not 900 <= self.mtproto_feed_interval_seconds <= 86400:
+            raise ValueError("PROXIMA_MTPROTO_FEED_INTERVAL_SECONDS must be 900..86400")
+        if not 5 <= self.mtproto_feed_max_messages <= 100:
+            raise ValueError("PROXIMA_MTPROTO_FEED_MAX_MESSAGES must be 5..100")
+        if not 1 <= self.mtproto_feed_max_candidates <= 40:
+            raise ValueError("PROXIMA_MTPROTO_FEED_MAX_CANDIDATES must be 1..40")
         if self.channel_comments_poll_seconds <= 0:
             raise ValueError("PROXIMA_CHANNEL_COMMENTS_POLL_SECONDS must be positive")
         if not 15 <= self.channel_comments_scan_interval_seconds <= 3600:

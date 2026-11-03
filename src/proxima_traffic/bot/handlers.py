@@ -187,6 +187,7 @@ from proxima_traffic.bot.keyboards import (
     launch_retry_confirmation,
     launches_menu,
     main_menu,
+    mtproto_feed_confirmation,
     order_activity_check_presets,
     order_advanced_menu,
     order_audience_search_menu,
@@ -461,6 +462,7 @@ from proxima_traffic.proxies import (
     proxy_import_values,
     validate_rotation_url,
 )
+from proxima_traffic.proxy_feed import MTProtoFeedService
 from proxima_traffic.recipient_reports import (
     RecipientReportFilter,
     RecipientReportKind,
@@ -4361,6 +4363,70 @@ def _proxy_draft_url(data: dict[str, object], settings: Settings) -> str:
     if not value:
         raise ProxyInputError("черновик прокси не содержит адрес")
     return value
+
+
+@router.callback_query(F.data == "proxy:feed:ask")
+async def ask_mtproto_feed_sync(callback: CallbackQuery) -> None:
+    await _edit_callback(
+        callback,
+        screen_title("Свежие MTProto из @ProxyMTProto")
+        + "\n\n"
+        + "Будет выбран один ваш активный Telegram-аккаунт с работающим прокси. "
+        + "Если аккаунт ещё не состоит в публичном канале, он вступит в него. "
+        + "Сервис прочитает последние сообщения, проверит MTProto-ссылки "
+        + "подключением к Telegram и добавит только подтверждённые адреса.\n\n"
+        + "Никакого прямого соединения или массового вступления нет. "
+        + "Публичные прокси принадлежат сторонним операторам; "
+        + "для чувствительных аккаунтов используйте свои доверенные прокси. "
+        + "Fake-TLS (ee) пока не поддерживается.",
+        mtproto_feed_confirmation(),
+    )
+
+
+@router.callback_query(F.data == "proxy:feed:confirm")
+async def confirm_mtproto_feed_sync(
+    callback: CallbackQuery,
+    mtproto_feed: MTProtoFeedService,
+    proxy_service: ProxyService,
+) -> None:
+    await _safe_callback_answer(callback, "Проверяю последние прокси из канала…")
+    await _edit_callback(
+        callback,
+        screen_title("MTProto · проверка канала")
+        + "\n\n◷ Читаю сообщения через авторизованный аккаунт и проверяю соединения.",
+        None,
+        answer=False,
+    )
+    try:
+        result = await mtproto_feed.sync(actor="control-bot")
+    except (ConflictError, ProxyInputError, AccountProfileError, AccountImportError) as exc:
+        await _edit_callback(
+            callback,
+            "<b>× Не удалось обновить MTProto-пул.</b>\n\n"
+            + escape(operator_error_message(exc)),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="‹ К прокси", callback_data="menu:proxies:0")]
+                ]
+            ),
+            answer=False,
+        )
+        return
+    page = await proxy_service.list_proxies(0, PAGE_SIZE)
+    report = (
+        f"✓ <b>Проверка канала завершена.</b>\n"
+        f"Аккаунт для чтения: <code>#{result.account_id}</code>\n"
+        f"Прочитано публикаций: <b>{result.messages_read}</b>\n"
+        f"Подходящих ссылок: <b>{result.valid_links}</b>\n"
+        f"Проверено прокси: <b>{result.tested}</b>\n"
+        f"Ответили при предварительной проверке: <b>{result.responsive}</b>\n"
+        f"Добавлено: <b>{result.added}</b> · существующих: <b>{result.reused}</b>\n"
+        f"Подтверждено в пуле: <b>{result.healthy_after_save}</b>\n"
+        f"Fake-TLS пропущено: <b>{result.unsupported_fake_tls}</b>\n\n"
+    )
+    await _edit_callback(
+        callback, report + proxies_text(page), proxies_menu(page), answer=False
+    )
 
 
 @router.callback_query(F.data == "proxy:import")

@@ -393,57 +393,64 @@ def _parse_telegram_mtproto_link(raw: str) -> ParsedProxy | None:
 
 
 def _validate_mtproto_secret(value: str) -> str:
+    """Canonicalise MTProxy hex/base64, rejecting malformed or truncated keys."""
     secret = value.strip()
-    if not 16 <= len(secret) <= 512:
-        raise ProxyInputError("secret MTProto должен содержать от 16 до 512 символов")
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_+/=")
-    if any(character not in allowed for character in secret):
-        raise ProxyInputError("secret MTProto содержит недопустимые символы")
+    if not secret or len(secret) > 512:
+        raise ProxyInputError("secret MTProto имеет неверный формат")
 
-    # If already a valid hex string (with or without ee/dd prefix):
-    prefix = secret.lower()[:2]
-    hex_body = secret[2:] if prefix in {"ee", "dd"} else secret
-    try:
-        bytes.fromhex(hex_body)
-        return secret
-    except ValueError:
-        pass
+    # Base64 may *coincidentally* start with ee/dd. Decode the entire token
+    # before interpreting prefixes, except for genuine hex-encoded secrets.
+    is_hex = re.fullmatch(r"[0-9a-fA-F]+", secret) is not None
+    if is_hex:
+        prefix = (
+            secret[:2].lower()
+            if len(secret) > 32 and secret[:2].lower() in {"dd", "ee"}
+            else ""
+        )
+        body = secret[2:] if prefix else secret
+        try:
+            raw = bytes.fromhex(body)
+        except ValueError as exc:
+            raise ProxyInputError("secret MTProto должен быть hex или base64") from exc
+    else:
+        try:
+            raw = base64.b64decode(
+                secret + "=" * (-len(secret) % 4), altchars=b"-_", validate=True
+            )
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ProxyInputError("secret MTProto должен быть hex или base64") from exc
+        prefix = ""
 
-    # Support base64 and URL-safe base64 secrets (common in Telegram share links)
-    import base64
-    for candidate_body, keep_prefix in [
-        (secret[2:], prefix if prefix in {"ee", "dd"} else ""),
-        (secret, ""),
-    ]:
-        for pad in ["", "=", "==", "==="]:
-            try:
-                decoded = base64.urlsafe_b64decode(candidate_body + pad)
-                if len(decoded) >= 16:
-                    return keep_prefix + decoded.hex()
-            except Exception:
-                pass
-    return secret
-
+    if prefix == "ee":
+        if not 17 <= len(raw) <= 255:
+            raise ProxyInputError("Fake-TLS secret должен содержать ключ и домен")
+    elif len(raw) != 16:
+        raise ProxyInputError("MTProto secret должен содержать ровно 16 байт ключа")
+    return prefix + raw.hex()
 
 def mtproto_connection_type(secret: str) -> object:
     """Choose Telethon's MTProxy transport from the secret prefix.
 
-    ``dd`` routes use randomized intermediate, ``ee`` routes use intermediate;
-    legacy/base64 secrets use abridged.  The secret remains in memory only and
-    is never included in diagnostics.
+    ``dd`` routes use randomized intermediate; legacy/base64 secrets
+    use abridged. Telethon 1.44 lacks Fake-TLS support for ``ee``.
+    The secret remains in memory only and is never included in diagnostics.
     """
 
     from telethon.network.connection.tcpmtproxy import (  # noqa: PLC0415
         ConnectionTcpMTProxyAbridged,
-        ConnectionTcpMTProxyIntermediate,
         ConnectionTcpMTProxyRandomizedIntermediate,
     )
 
     prefix = secret.lower()[:2]
+    if prefix == "ee":
+        # Telethon 1.44 does not implement the Fake-TLS negotiation for
+        # ee links. Never silently treat it as ordinary intermediate.
+        raise ProxyInputError(
+            "MTProto Fake-TLS (ee) не поддерживается текущим Telethon; "
+            "используйте dd/обычный MTProto или совместимый клиент"
+        )
     if prefix == "dd":
         return ConnectionTcpMTProxyRandomizedIntermediate
-    if prefix == "ee":
-        return ConnectionTcpMTProxyIntermediate
     return ConnectionTcpMTProxyAbridged
 
 
@@ -904,7 +911,22 @@ class ProxyService:
                 f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных "
                 "прокси в пуле; добавьте рабочий прокси"
             )
-        if await self._assigned_proxy_is_healthy(assigned, actor=actor):
+        initial_proxy_id = int(assigned.proxy.id)
+        previous_latency = assigned.proxy.latency_ms
+        verified = await self._assigned_proxy_is_healthy(assigned, actor=actor)
+        slow_confirmed = False
+        if (
+            verified
+            and self._settings.proxy_slow_failover_enabled
+            and previous_latency is not None
+            and previous_latency >= self._settings.proxy_slow_failover_latency_ms
+        ):
+            refreshed = await self.get_proxy(int(assigned.proxy.id))
+            slow_confirmed = (
+                refreshed.proxy.latency_ms is not None
+                and refreshed.proxy.latency_ms >= self._settings.proxy_slow_failover_latency_ms
+            )
+        if verified and not slow_confirmed:
             return await self.require_account_route(account_id)
 
         # Normal connection starts can check their own currently assigned
@@ -924,13 +946,21 @@ class ProxyService:
                     f"для аккаунта #{account_id} не назначен прокси и нет свободных исправных "
                     "прокси в пуле; добавьте рабочий прокси"
                 )
+            if slow_confirmed and int(assigned.proxy.id) != initial_proxy_id:
+                return await self.require_account_route(account_id)
             current_is_healthy = assigned.proxy.status == ProxyStatus.HEALTHY
             if not current_is_healthy:
                 current_is_healthy = await self._assigned_proxy_is_healthy(assigned, actor=actor)
-            if current_is_healthy:
+            if current_is_healthy and not slow_confirmed:
                 return await self.require_account_route(account_id)
 
             current_id = int(assigned.proxy.id)
+            max_replacement_latency_ms = None
+            if current_is_healthy and slow_confirmed:
+                max_replacement_latency_ms = min(
+                    self._settings.proxy_slow_failover_latency_ms,
+                    int((assigned.proxy.latency_ms or 0) * 0.65),
+                )
             replacement_ids = await self._verify_replacement_candidates(
                 excluded_proxy_id=current_id,
                 actor=actor,
@@ -940,13 +970,18 @@ class ProxyService:
                 failed_proxy_id=current_id,
                 candidate_ids=replacement_ids,
                 actor=actor,
+                max_latency_ms=max_replacement_latency_ms,
             )
             if replacement is not None:
                 return replacement
+            if current_is_healthy:
+                # Do not sacrifice a working connection just because no
+                # materially faster verified alternative exists.
+                return await self.require_account_route(account_id)
 
             raise ProxyRouteUnavailable(
                 "назначенный прокси не работает; проверены все включённые прокси, "
-                "но рабочего не найдено. Добавьте рабочий HTTP(S)/SOCKS5-прокси."
+                "но рабочего не найдено. Добавьте рабочий HTTP(S)/SOCKS5/MTProto-прокси."
             )
 
     async def auto_assign_healthy_proxies(self, *, actor: str = "runtime") -> int:
@@ -980,7 +1015,7 @@ class ProxyService:
                 .join(ProxyAssignment, ProxyAssignment.proxy_id == ProxyEndpoint.id)
                 .where(ProxyAssignment.assignment_key == f"account:{account_id}")
             )
-        if endpoint is None or not endpoint.enabled:
+        if endpoint is None or not endpoint.enabled or endpoint.status != ProxyStatus.HEALTHY:
             return True
         # SQLite returns persisted DATETIME fields without tzinfo.  Connection
         # startup compares this value with ``utc_now()``, so normalize legacy
@@ -1022,8 +1057,15 @@ class ProxyService:
         if not candidate_ids:
             return ()
 
+        # Bound concurrent outbound connections even for a large imported pool.
+        semaphore = asyncio.Semaphore(8)
+
+        async def probe_candidate(proxy_id: int) -> ProxyCheckResult:
+            async with semaphore:
+                return await self._check_proxy_for_route(proxy_id, actor=actor)
+
         results = await asyncio.gather(
-            *(self._check_proxy_for_route(proxy_id, actor=actor) for proxy_id in candidate_ids),
+            *(probe_candidate(proxy_id) for proxy_id in candidate_ids),
             return_exceptions=True,
         )
         return tuple(
@@ -1067,6 +1109,7 @@ class ProxyService:
         failed_proxy_id: int,
         candidate_ids: tuple[int, ...],
         actor: str,
+        max_latency_ms: int | None = None,
     ) -> ProxyNetworkRoute | None:
         """Atomically point one account slot at the best freshly healthy proxy."""
 
@@ -1096,7 +1139,7 @@ class ProxyService:
 
             if not recovered_by_another_worker:
                 assigned_count = func.count(ProxyAssignment.id)
-                candidate = await session.scalar(
+                selection = (
                     select(ProxyEndpoint)
                     .outerjoin(ProxyAssignment, ProxyAssignment.proxy_id == ProxyEndpoint.id)
                     .where(
@@ -1104,7 +1147,14 @@ class ProxyService:
                         ProxyEndpoint.enabled.is_(True),
                         ProxyEndpoint.status == ProxyStatus.HEALTHY,
                     )
-                    .group_by(ProxyEndpoint.id)
+                )
+                if max_latency_ms is not None:
+                    selection = selection.where(
+                        ProxyEndpoint.latency_ms.is_not(None),
+                        ProxyEndpoint.latency_ms < max_latency_ms,
+                    )
+                candidate = await session.scalar(
+                    selection.group_by(ProxyEndpoint.id)
                     .order_by(
                         assigned_count,
                         ProxyEndpoint.latency_ms.is_(None),
@@ -1447,6 +1497,21 @@ class ProxyService:
                 response = await client.get(self._settings.proxy_check_url)
                 response.raise_for_status()
                 observed_ip = self._extract_ip(response)
+                if observed_ip is None:
+                    return _ProxyProbeResult(
+                        healthy=False,
+                        latency_ms=None,
+                        observed_ip=None,
+                        error="HTTP-проверка через прокси не вернула корректный IP",
+                    )
+                telegram_ok = await self._probe_telegram_using_standard_proxy(proxy_url)
+                if not telegram_ok:
+                    return _ProxyProbeResult(
+                        healthy=False,
+                        latency_ms=None,
+                        observed_ip=observed_ip,
+                        error="Через прокси не удалось подтвердить доступ к Telegram",
+                    )
                 return _ProxyProbeResult(
                     healthy=True,
                     latency_ms=round((time.perf_counter() - started) * 1000),
@@ -1460,6 +1525,58 @@ class ProxyService:
                 observed_ip=None,
                 error=f"{type(exc).__name__}: соединение через прокси не установлено",
             )
+
+    async def _probe_telegram_using_standard_proxy(self, proxy_url: str) -> bool:
+        """Prove the Telegram transport, not just access to an IP-check site.
+
+        If Telegram credentials are unavailable, retain the legacy HTTP/SOCKS
+        check but never claim that a TLS-to-HTTPS proxy is Telethon-ready.
+        """
+        parsed = parse_proxy(proxy_url)
+        api = self._settings.telegram_api
+        if api is None:
+            return parsed.protocol != ProxyProtocol.HTTPS
+
+        from telethon import TelegramClient  # noqa: PLC0415
+        from telethon.sessions import StringSession  # noqa: PLC0415
+
+        from proxima_traffic.accounts import build_telethon_transport  # noqa: PLC0415
+
+        route = ProxyNetworkRoute(
+            proxy_id=0,
+            protocol=parsed.protocol,
+            host=parsed.host,
+            port=parsed.port,
+            username=parsed.username,
+            password=parsed.password,
+        )
+        transport = build_telethon_transport(route)
+        client = None
+        try:
+            client = TelegramClient(
+                StringSession(),
+                api[0],
+                api[1],
+                **transport.client_kwargs(),
+                connection_retries=0,
+                request_retries=0,
+                auto_reconnect=False,
+                receive_updates=False,
+                timeout=max(1, int(self._settings.proxy_check_timeout_seconds)),
+                base_logger=_mtproto_probe_logger(),
+            )
+            await asyncio.wait_for(
+                client.connect(), timeout=self._settings.proxy_check_timeout_seconds,
+            )
+            return bool(client.is_connected())
+        except Exception:  # noqa: BLE001 - untrusted endpoint failures are routine
+            return False
+        finally:
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=2)
+                except (Exception, asyncio.CancelledError):  # pragma: no cover
+                    pass
 
     async def _probe_mtproto_proxy(
         self,
@@ -1475,6 +1592,13 @@ class ProxyService:
         immediately after Telegram accepts the transport.
         """
 
+        if secret.lower().startswith("ee"):
+            return _ProxyProbeResult(
+                healthy=False,
+                latency_ms=None,
+                observed_ip=None,
+                error="MTProto Fake-TLS (ee) пока не поддерживается Telethon 1.44",
+            )
         api = self._settings.telegram_api
         if api is None:
             return _ProxyProbeResult(
@@ -1729,6 +1853,10 @@ class ProxyService:
                 raise NotFoundError("прокси не найден")
             if not endpoint.enabled:
                 raise ConflictError("перед проверкой включите прокси")
+            checked_fingerprint = endpoint.fingerprint
+            checked_secret_encrypted = endpoint.password_encrypted
+            probe_started_at = utc_now()
+            checked_host, checked_port = endpoint.host, endpoint.port
             try:
                 password = self._cipher.decrypt(endpoint.password_encrypted)
                 is_mtproto = endpoint.protocol == ProxyProtocol.MTPROTO
@@ -1738,7 +1866,7 @@ class ProxyService:
                 proxy_url = None
 
         if is_mtproto and password:
-            probe = await self._probe_mtproto_proxy(endpoint.host, endpoint.port, password)
+            probe = await self._probe_mtproto_proxy(checked_host, checked_port, password)
         elif proxy_url is None:
             probe = _ProxyProbeResult(
                 healthy=False,
@@ -1753,6 +1881,23 @@ class ProxyService:
             endpoint = await session.get(ProxyEndpoint, proxy_id)
             if endpoint is None:
                 raise NotFoundError("прокси не найден")
+            latest_check = ensure_utc(endpoint.last_checked_at)
+            if (
+                endpoint.fingerprint != checked_fingerprint
+                or endpoint.password_encrypted != checked_secret_encrypted
+                or not endpoint.enabled
+                or (latest_check is not None and latest_check > probe_started_at)
+                or (
+                    ensure_utc(endpoint.updated_at) is not None
+                    and ensure_utc(endpoint.updated_at) > probe_started_at
+                )
+            ):
+                # The probe observed an old endpoint, disabled endpoint, or
+                # was overtaken by a newer probe. Never overwrite its status.
+                return ProxyCheckResult(
+                    proxy_id, False, endpoint.status, None, None,
+                    "Результат проверки устарел: адрес или состояние прокси изменились",
+                )
             previous_status = endpoint.status
             previous_ip = endpoint.observed_ip
             endpoint.last_checked_at = utc_now()

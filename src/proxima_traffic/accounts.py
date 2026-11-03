@@ -3039,29 +3039,30 @@ def _connection_kwargs(transport: TelethonTransport) -> dict[str, object]:
     return {"connection": transport.connection} if transport.connection is not None else {}
 
 
-def _telethon_proxy(route: object) -> tuple[object, str, int, bool, str | None, str | None]:
-    import socks  # noqa: PLC0415 - PySocks constants for telethon
+def _telethon_proxy(route: object) -> dict[str, object]:
+    """Use Telethon's supported python-socks mapping, not optional PySocks.
 
+    SOCKS DNS resolution stays remote. HTTP CONNECT is a plain HTTP proxy
+    transport: TLS-to-HTTPS proxy URLs must also pass a real Telegram probe.
+    """
     protocol = route.protocol
     value = getattr(protocol, "value", str(protocol))
     if value in {"socks5", "socks5h"}:
-        proxy_type = socks.SOCKS5
-        rdns = True
+        proxy_type = "socks5"
     elif value in {"http", "https"}:
-        proxy_type = socks.HTTP
-        rdns = True
+        proxy_type = "http"
     elif value == "mtproto":
         raise ProxyRouteUnavailable("для MTProto нужен специальный транспорт Telethon")
     else:  # pragma: no cover - defensive
         raise ProxyRouteUnavailable(f"неподдерживаемый протокол прокси: {value}")
-    return (
-        proxy_type,
-        route.host,
-        int(route.port),
-        rdns,
-        getattr(route, "username", None),
-        getattr(route, "password", None),
-    )
+    return {
+        "proxy_type": proxy_type,
+        "addr": route.host,
+        "port": int(route.port),
+        "rdns": True,
+        "username": getattr(route, "username", None),
+        "password": getattr(route, "password", None),
+    }
 
 
 def _safe_account_error(error: BaseException) -> str:

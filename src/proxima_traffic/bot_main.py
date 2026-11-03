@@ -30,6 +30,7 @@ from proxima_traffic.notifications import RunNotifier
 from proxima_traffic.participant_reactions import ParticipantReactionService
 from proxima_traffic.preflight import PreflightService
 from proxima_traffic.proxies import ProxyService
+from proxima_traffic.proxy_feed import MTProtoFeedService
 from proxima_traffic.reactions import ReactionWorker
 from proxima_traffic.services import CampaignRunner, QueueWorker, RunQueue
 from proxima_traffic.spambot_checks import SpamBotCheckService, SpamBotMaintenanceWorker
@@ -292,6 +293,9 @@ async def _run_control_bot(
 
     proxy_service = ProxyService(database.session_factory, settings)
     account_service = AccountService(database.session_factory, settings, proxy_service)
+    mtproto_feed = MTProtoFeedService(
+        database.session_factory, account_service, proxy_service, settings
+    )
     campaign_id_scope = settings.worker_campaign_id_scope
     scoped_worker_concurrency = 1 if campaign_id_scope is not None else settings.worker_concurrency
     gateway = build_gateway(
@@ -442,6 +446,7 @@ async def _run_control_bot(
     subscriber_invites_task: asyncio.Task[None] | None = None
     delayed_delivery_task: asyncio.Task[None] | None = None
     spambot_task: asyncio.Task[None] | None = None
+    mtproto_feed_task: asyncio.Task[None] | None = None
     notifier: RunNotifier | None = None
     notifier_task: asyncio.Task[None] | None = None
     ready_notification_task: asyncio.Task[None] | None = None
@@ -475,6 +480,13 @@ async def _run_control_bot(
         and not settings.dry_run
     ):
         spambot_task = worker_supervisor.start("spambot", spambot_maintenance.run_forever)
+    if (
+        settings.worker_enabled
+        and settings.mtproto_feed_enabled
+        and campaign_id_scope is None
+        and not settings.dry_run
+    ):
+        mtproto_feed_task = worker_supervisor.start("mtproto-feed", mtproto_feed.run_forever)
     if settings.bot_log_chat_id is not None:
 
         async def send_notification(text: str) -> None:
@@ -528,6 +540,7 @@ async def _run_control_bot(
             worker_supervisor=worker_supervisor,
             proxy_service=proxy_service,
             account_service=account_service,
+            mtproto_feed=mtproto_feed,
             spambot_checks=spambot_checks,
             preflight_service=preflight_service,
             gateway=gateway,
@@ -555,6 +568,7 @@ async def _run_control_bot(
         await asyncio.gather(story_tagging.wait_stopped(), story_viewer.wait_stopped())
         delayed_delivery_monitor.stop()
         spambot_maintenance.stop()
+        mtproto_feed.stop()
         if notifier is not None:
             notifier.stop()
         worker_supervisor.stop()
@@ -596,6 +610,11 @@ async def _run_control_bot(
         await _finish_background_task(
             spambot_task,
             name="@SpamBot maintenance",
+            grace_seconds=settings.shutdown_grace_seconds,
+        )
+        await _finish_background_task(
+            mtproto_feed_task,
+            name="MTProto feed",
             grace_seconds=settings.shutdown_grace_seconds,
         )
         await _finish_background_task(
